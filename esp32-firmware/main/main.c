@@ -131,7 +131,10 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_bluedroid_init());
     ESP_ERROR_CHECK(esp_bluedroid_enable());
     ESP_ERROR_CHECK(esp_spp_register_callback(spp_callback));
-    ESP_ERROR_CHECK(esp_spp_init(ESP_SPP_MODE_CB));
+
+    esp_spp_cfg_t spp_cfg = BT_SPP_DEFAULT_CONFIG();
+    spp_cfg.mode = ESP_SPP_MODE_CB;
+    ESP_ERROR_CHECK(esp_spp_enhanced_init(&spp_cfg));
 
     const uint8_t *addr = esp_bt_dev_get_address();
     ESP_LOGI(TAG, "Bluetooth device name: %s", DEVICE_NAME);
