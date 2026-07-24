@@ -49,9 +49,3 @@ ESP32:
 cd esp32-firmware
 .\scripts\build-esp32.ps1
 ```
-
-On this machine, Android debug build has been verified. ESP-IDF source has been
-created for IDF v6.0.1, but the local ESP-IDF/CMake environment currently drops
-the `xtensa-esp32-elf-*` compiler lookup during CMake configure even after the
-compiler is visible from the shell. Re-run the script above after fixing the IDF
-environment.
