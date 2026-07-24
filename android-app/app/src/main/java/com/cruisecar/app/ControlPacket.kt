@@ -1,5 +1,22 @@
 package com.cruisecar.app
 
+sealed class ControlFrame {
+    data class Gamepad(val state: GamepadState) : ControlFrame()
+    data class Mode(val mode: ControlMode) : ControlFrame()
+}
+
+enum class ControlMode(val wireValue: Int, val label: String) {
+    MANUAL(0x00, "手动遥控"),
+    VIDEO_CALL(0x01, "实时视频"),
+    SMART_FOLLOW(0x02, "智能跟随"),
+    PATROL(0x03, "智能巡逻");
+
+    companion object {
+        fun fromWire(value: Int): ControlMode =
+            entries.firstOrNull { it.wireValue == value } ?: MANUAL
+    }
+}
+
 data class GamepadState(
     val lx: Int = 128,
     val ly: Int = 128,
@@ -8,30 +25,69 @@ data class GamepadState(
     val buttons: Int = 0
 ) {
     fun toPacket(): ByteArray {
-        val packet = ByteArray(10)
-        packet[0] = 0xAA.toByte()
-        packet[1] = 0x55
-        packet[2] = 0x01
+        val packet = ByteArray(ControlProtocol.PACKET_SIZE)
+        packet[0] = ControlProtocol.HEADER_0.toByte()
+        packet[1] = ControlProtocol.HEADER_1.toByte()
+        packet[2] = ControlProtocol.TYPE_GAMEPAD.toByte()
         packet[3] = lx.coerceIn(0, 255).toByte()
         packet[4] = ly.coerceIn(0, 255).toByte()
         packet[5] = rx.coerceIn(0, 255).toByte()
         packet[6] = ry.coerceIn(0, 255).toByte()
         packet[7] = (buttons and 0xFF).toByte()
         packet[8] = ((buttons ushr 8) and 0xFF).toByte()
-        packet[9] = checksum(packet)
+        packet[9] = ControlProtocol.checksum(packet)
         return packet
     }
 
-    fun toHexLine(): String = toPacket().joinToString(" ") { "%02X".format(it.toInt() and 0xFF) }
+    fun toHexLine(): String = toPacket().toHexLine()
+}
 
-    companion object {
-        fun checksum(packet: ByteArray): Byte {
-            var sum = 0
-            for (i in 0 until 9) {
-                sum = (sum + (packet[i].toInt() and 0xFF)) and 0xFF
-            }
-            return sum.toByte()
+object ModeCommand {
+    fun packet(mode: ControlMode): ByteArray {
+        val packet = ByteArray(ControlProtocol.PACKET_SIZE)
+        packet[0] = ControlProtocol.HEADER_0.toByte()
+        packet[1] = ControlProtocol.HEADER_1.toByte()
+        packet[2] = ControlProtocol.TYPE_MODE.toByte()
+        packet[3] = mode.wireValue.toByte()
+        packet[9] = ControlProtocol.checksum(packet)
+        return packet
+    }
+}
+
+object ControlProtocol {
+    const val PACKET_SIZE = 10
+    const val HEADER_0 = 0xAA
+    const val HEADER_1 = 0x55
+    const val TYPE_GAMEPAD = 0x01
+    const val TYPE_MODE = 0x02
+
+    fun parse(packet: ByteArray): ControlFrame? {
+        if (packet.size != PACKET_SIZE) return null
+        if ((packet[0].toInt() and 0xFF) != HEADER_0) return null
+        if ((packet[1].toInt() and 0xFF) != HEADER_1) return null
+        if (checksum(packet) != packet[9]) return null
+
+        return when (packet[2].toInt() and 0xFF) {
+            TYPE_GAMEPAD -> ControlFrame.Gamepad(
+                GamepadState(
+                    lx = packet[3].toInt() and 0xFF,
+                    ly = packet[4].toInt() and 0xFF,
+                    rx = packet[5].toInt() and 0xFF,
+                    ry = packet[6].toInt() and 0xFF,
+                    buttons = (packet[7].toInt() and 0xFF) or ((packet[8].toInt() and 0xFF) shl 8)
+                )
+            )
+            TYPE_MODE -> ControlFrame.Mode(ControlMode.fromWire(packet[3].toInt() and 0xFF))
+            else -> null
         }
+    }
+
+    fun checksum(packet: ByteArray): Byte {
+        var sum = 0
+        for (i in 0 until PACKET_SIZE - 1) {
+            sum = (sum + (packet[i].toInt() and 0xFF)) and 0xFF
+        }
+        return sum.toByte()
     }
 }
 
@@ -46,3 +102,4 @@ object GamepadButtons {
     const val R2 = 1 shl 9
 }
 
+fun ByteArray.toHexLine(): String = joinToString(" ") { "%02X".format(it.toInt() and 0xFF) }

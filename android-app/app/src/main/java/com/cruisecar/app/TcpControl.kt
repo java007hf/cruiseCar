@@ -6,7 +6,7 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.atomic.AtomicBoolean
 
-class ControlServer(private val port: Int, private val onPacket: (ByteArray) -> Unit) {
+class ControlServer(private val port: Int, private val onFrame: (ByteArray, ControlFrame) -> Unit) {
     private val running = AtomicBoolean(false)
     private var serverSocket: ServerSocket? = null
 
@@ -30,7 +30,7 @@ class ControlServer(private val port: Int, private val onPacket: (ByteArray) -> 
     private fun readClient(client: Socket, onLog: (String) -> Unit) {
         client.use {
             val input = BufferedInputStream(it.getInputStream())
-            val frame = ByteArray(10)
+            val frame = ByteArray(ControlProtocol.PACKET_SIZE)
             while (running.get()) {
                 var offset = 0
                 while (offset < frame.size) {
@@ -38,7 +38,13 @@ class ControlServer(private val port: Int, private val onPacket: (ByteArray) -> 
                     if (read < 0) return
                     offset += read
                 }
-                onPacket(frame.copyOf())
+                val packet = frame.copyOf()
+                val parsed = ControlProtocol.parse(packet)
+                if (parsed != null) {
+                    onFrame(packet, parsed)
+                } else {
+                    onLog("Dropped invalid control frame: ${packet.toHexLine()}")
+                }
             }
         }
         onLog("Control client disconnected")
@@ -64,6 +70,11 @@ class ControlClient {
 
     fun send(state: GamepadState) {
         output?.write(state.toPacket())
+        output?.flush()
+    }
+
+    fun sendMode(mode: ControlMode) {
+        output?.write(ModeCommand.packet(mode))
         output?.flush()
     }
 
