@@ -67,6 +67,8 @@ class ControlClient {
         output?.flush()
     }
 
+    fun isConnected(): Boolean = socket?.isConnected == true && output != null
+
     fun close() {
         output = null
         socket?.close()

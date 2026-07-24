@@ -17,6 +17,8 @@
 static const char *TAG = "cruise_car";
 static uint8_t rx_buffer[PACKET_SIZE];
 static size_t rx_len;
+static bool have_prev_buttons;
+static uint16_t prev_buttons;
 
 typedef struct {
     uint8_t lx;
@@ -51,12 +53,59 @@ static bool parse_packet(const uint8_t *packet, gamepad_state_t *state)
     return true;
 }
 
+static const char *button_name(int bit)
+{
+    switch (bit) {
+    case 0:
+        return "A";
+    case 1:
+        return "B";
+    case 3:
+        return "X";
+    case 4:
+        return "Y";
+    case 6:
+        return "L1";
+    case 7:
+        return "R1";
+    case 8:
+        return "L2";
+    case 9:
+        return "R2";
+    default:
+        return NULL;
+    }
+}
+
+static void log_button_changes(uint16_t buttons)
+{
+    uint16_t changed = have_prev_buttons ? (uint16_t)(buttons ^ prev_buttons) : buttons;
+
+    for (int bit = 0; bit < 16; bit++) {
+        uint16_t mask = (uint16_t)(1U << bit);
+        if ((changed & mask) == 0) {
+            continue;
+        }
+
+        const char *name = button_name(bit);
+        if (name) {
+            ESP_LOGI(TAG, "button %s %s", name, (buttons & mask) ? "pressed" : "released");
+        } else {
+            ESP_LOGI(TAG, "button B%02d %s", bit, (buttons & mask) ? "pressed" : "released");
+        }
+    }
+
+    prev_buttons = buttons;
+    have_prev_buttons = true;
+}
+
 static void apply_gamepad_state(const gamepad_state_t *state)
 {
     int throttle = 128 - state->ly;
     int steering = state->lx - 128;
     ESP_LOGI(TAG, "lx=%u ly=%u rx=%u ry=%u buttons=0x%04x throttle=%d steering=%d",
              state->lx, state->ly, state->rx, state->ry, state->buttons, throttle, steering);
+    log_button_changes(state->buttons);
 
     /*
      * TODO: map throttle/steering to the actual motor driver GPIO/PWM channels.

@@ -34,6 +34,21 @@ AA 55 01 LX LY RX RY BTN_L BTN_H SUM
 - `BTN_L`, `BTN_H`: 16-bit button bitmask, little-endian
 - `SUM`: low 8 bits of the sum of the first 9 bytes
 
+Button bits are aligned with the current ESP32 HID gamepad demo logs:
+
+```text
+bit 0: A
+bit 1: B
+bit 3: X
+bit 4: Y
+bit 6: L1
+bit 7: R1
+bit 8: L2
+bit 9: R2
+```
+
+The Android sender exposes an on-screen gamepad and sends this same packet to the receiver Android app over TCP. The receiver app transparently forwards each packet to `CruiseCar-ESP32` over Classic Bluetooth SPP.
+
 ## Build
 
 Android:
