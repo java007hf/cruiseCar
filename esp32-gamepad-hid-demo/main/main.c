@@ -2,11 +2,14 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "driver/gpio.h"
+#include "driver/ledc.h"
 #include "esp_bt.h"
 #include "esp_bt_defs.h"
 #include "esp_bt_device.h"
@@ -24,7 +27,162 @@
 #define SCAN_SECONDS 8
 #define RESCAN_DELAY_MS 3000
 
+#define LEFT_PWMA GPIO_NUM_13
+#define LEFT_AIN1 GPIO_NUM_14
+#define LEFT_AIN2 GPIO_NUM_12
+#define RIGHT_PWMB GPIO_NUM_33
+#define RIGHT_BIN1 GPIO_NUM_25
+#define RIGHT_BIN2 GPIO_NUM_26
+#define STBY_PIN GPIO_NUM_27
+
+#define LEFT_PWM_CHANNEL LEDC_CHANNEL_0
+#define RIGHT_PWM_CHANNEL LEDC_CHANNEL_1
+#define MOTOR_PWM_TIMER LEDC_TIMER_0
+#define MOTOR_PWM_MODE LEDC_LOW_SPEED_MODE
+#define MOTOR_PWM_FREQ_HZ 20000
+#define MOTOR_PWM_MAX 255
+#define MOTOR_DEADZONE 10
+#define MOTOR_START_PWM 18
+#define MOTOR_MAX_PWM 210
+
 static const char *TAG = "gamepad_hid_demo";
+
+typedef struct {
+    uint8_t lx;
+    uint8_t ly;
+    uint8_t rx;
+    uint8_t ry;
+    uint32_t buttons;
+} gamepad_state_t;
+
+static int clamp_int(int value, int min_value, int max_value)
+{
+    if (value < min_value) {
+        return min_value;
+    }
+    if (value > max_value) {
+        return max_value;
+    }
+    return value;
+}
+
+static int axis_to_signed(uint8_t axis, bool invert)
+{
+    int value = invert ? (128 - axis) : (axis - 128);
+    if (abs(value) <= MOTOR_DEADZONE) {
+        return 0;
+    }
+    return clamp_int(value, -127, 127);
+}
+
+static int scale_motor_pwm(int value)
+{
+    if (value == 0) {
+        return 0;
+    }
+
+    int sign = value > 0 ? 1 : -1;
+    int magnitude = abs(value);
+    int pwm = MOTOR_START_PWM + (magnitude * (MOTOR_MAX_PWM - MOTOR_START_PWM)) / 127;
+    return sign * clamp_int(pwm, 0, MOTOR_MAX_PWM);
+}
+
+static void motor_write(gpio_num_t pin1, gpio_num_t pin2, ledc_channel_t channel, int pwm)
+{
+    pwm = clamp_int(pwm, -MOTOR_PWM_MAX, MOTOR_PWM_MAX);
+    gpio_set_level(STBY_PIN, 1);
+
+    if (pwm == 0) {
+        gpio_set_level(pin1, 0);
+        gpio_set_level(pin2, 0);
+        ledc_set_duty(MOTOR_PWM_MODE, channel, 0);
+    } else if (pwm > 0) {
+        gpio_set_level(pin1, 1);
+        gpio_set_level(pin2, 0);
+        ledc_set_duty(MOTOR_PWM_MODE, channel, pwm);
+    } else {
+        gpio_set_level(pin1, 0);
+        gpio_set_level(pin2, 1);
+        ledc_set_duty(MOTOR_PWM_MODE, channel, -pwm);
+    }
+
+    ledc_update_duty(MOTOR_PWM_MODE, channel);
+}
+
+static void car_stop(void)
+{
+    motor_write(LEFT_AIN1, LEFT_AIN2, LEFT_PWM_CHANNEL, 0);
+    motor_write(RIGHT_BIN1, RIGHT_BIN2, RIGHT_PWM_CHANNEL, 0);
+}
+
+static void motor_init(void)
+{
+    gpio_config_t motor_gpio_config = {
+        .pin_bit_mask = (1ULL << LEFT_AIN1) | (1ULL << LEFT_AIN2) |
+                        (1ULL << RIGHT_BIN1) | (1ULL << RIGHT_BIN2) |
+                        (1ULL << STBY_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&motor_gpio_config));
+
+    ledc_timer_config_t timer_config = {
+        .speed_mode = MOTOR_PWM_MODE,
+        .duty_resolution = LEDC_TIMER_8_BIT,
+        .timer_num = MOTOR_PWM_TIMER,
+        .freq_hz = MOTOR_PWM_FREQ_HZ,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&timer_config));
+
+    ledc_channel_config_t left_channel = {
+        .gpio_num = LEFT_PWMA,
+        .speed_mode = MOTOR_PWM_MODE,
+        .channel = LEFT_PWM_CHANNEL,
+        .intr_type = LEDC_INTR_DISABLE,
+        .timer_sel = MOTOR_PWM_TIMER,
+        .duty = 0,
+        .hpoint = 0,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&left_channel));
+
+    ledc_channel_config_t right_channel = {
+        .gpio_num = RIGHT_PWMB,
+        .speed_mode = MOTOR_PWM_MODE,
+        .channel = RIGHT_PWM_CHANNEL,
+        .intr_type = LEDC_INTR_DISABLE,
+        .timer_sel = MOTOR_PWM_TIMER,
+        .duty = 0,
+        .hpoint = 0,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&right_channel));
+
+    car_stop();
+    ESP_LOGI(TAG, "TB6612 motor pins: left PWM=%d IN1=%d IN2=%d, right PWM=%d IN1=%d IN2=%d, STBY=%d",
+             LEFT_PWMA, LEFT_AIN1, LEFT_AIN2, RIGHT_PWMB, RIGHT_BIN1, RIGHT_BIN2, STBY_PIN);
+}
+
+static void apply_gamepad_state(const gamepad_state_t *state)
+{
+    int throttle = axis_to_signed(state->ly, true);
+    int steering = axis_to_signed(state->lx, false);
+    int left = clamp_int(throttle + steering, -127, 127);
+    int right = clamp_int(throttle - steering, -127, 127);
+    int left_pwm = scale_motor_pwm(left);
+    int right_pwm = scale_motor_pwm(right);
+
+    /*
+     * The right motor is mounted as the mirror of the left motor on the
+     * reference TB6612 chassis, so its electrical direction is inverted.
+     */
+    motor_write(LEFT_AIN1, LEFT_AIN2, LEFT_PWM_CHANNEL, left_pwm);
+    motor_write(RIGHT_BIN1, RIGHT_BIN2, RIGHT_PWM_CHANNEL, -right_pwm);
+
+    ESP_LOGI(TAG, "drive lx=%u ly=%u throttle=%d steering=%d left=%d right=%d left_pwm=%d right_pwm=%d buttons=0x%06" PRIx32,
+             state->lx, state->ly, throttle, steering, left, right, left_pwm, right_pwm, state->buttons);
+}
 
 static const char *button_name(int bit)
 {
@@ -91,52 +249,52 @@ static bool looks_like_gamepad(esp_hid_scan_result_t *result)
            strstr(name, "DualShock") || strstr(name, "DualSense");
 }
 
-static bool log_xiaomi_gamepad_report(const uint8_t *data, uint16_t len)
+static bool parse_xiaomi_gamepad_report(const uint8_t *data, uint16_t len, gamepad_state_t *state)
 {
     if (len < 20) {
         return false;
     }
 
-    uint32_t buttons = data[0] | ((uint32_t)data[1] << 8) | ((uint32_t)data[2] << 16);
+    state->buttons = data[0] | ((uint32_t)data[1] << 8) | ((uint32_t)data[2] << 16);
     uint8_t hat = data[3] & 0x0F;
-    uint8_t lx = data[4];
-    uint8_t ly = data[5];
-    uint8_t rx = data[6];
-    uint8_t ry = data[7];
+    state->lx = data[4];
+    state->ly = data[5];
+    state->rx = data[6];
+    state->ry = data[7];
     uint8_t l2 = data[8];
     uint8_t r2 = data[9];
     uint8_t battery = data[18];
 
     ESP_LOGI(TAG, "xiaomi/classic buttons=0x%06" PRIx32
              " hat=%u lx=%u ly=%u rx=%u ry=%u l2=%u r2=%u battery=%u%%",
-             buttons, hat, lx, ly, rx, ry, l2, r2, battery);
-    log_button_changes(buttons);
+             state->buttons, hat, state->lx, state->ly, state->rx, state->ry, l2, r2, battery);
     return true;
 }
 
-static void log_common_gamepad_guess(const uint8_t *data, uint16_t len)
+static bool parse_common_gamepad_guess(const uint8_t *data, uint16_t len, gamepad_state_t *state)
 {
-    if (log_xiaomi_gamepad_report(data, len)) {
-        return;
+    if (parse_xiaomi_gamepad_report(data, len, state)) {
+        return true;
     }
 
     if (len < 4) {
-        return;
+        return false;
     }
 
-    uint8_t lx = data[0];
-    uint8_t ly = data[1];
-    uint8_t rx = data[2];
-    uint8_t ry = data[3];
+    state->lx = data[0];
+    state->ly = data[1];
+    state->rx = data[2];
+    state->ry = data[3];
     uint8_t hat = (len > 4) ? (data[4] & 0x0F) : 0x0F;
-    uint32_t buttons = 0;
+    state->buttons = 0;
 
     for (uint16_t i = 4; i < len && i < 8; i++) {
-        buttons |= ((uint32_t)data[i]) << ((i - 4) * 8);
+        state->buttons |= ((uint32_t)data[i]) << ((i - 4) * 8);
     }
 
     ESP_LOGI(TAG, "guess lx=%u ly=%u rx=%u ry=%u hat=%u buttons=0x%08" PRIx32,
-             lx, ly, rx, ry, hat, buttons);
+             state->lx, state->ly, state->rx, state->ry, hat, state->buttons);
+    return true;
 }
 
 static void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id, void *event_data)
@@ -163,7 +321,11 @@ static void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id,
                  param->input.report_id,
                  param->input.length);
         ESP_LOG_BUFFER_HEX(TAG, param->input.data, param->input.length);
-        log_common_gamepad_guess(param->input.data, param->input.length);
+        gamepad_state_t state;
+        if (parse_common_gamepad_guess(param->input.data, param->input.length, &state)) {
+            log_button_changes(state.buttons);
+            apply_gamepad_state(&state);
+        }
         break;
     }
 
@@ -173,6 +335,7 @@ static void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id,
 
     case ESP_HIDH_CLOSE_EVENT:
         ESP_LOGW(TAG, "CLOSE name=%s", esp_hidh_dev_name_get(param->close.dev));
+        car_stop();
         break;
 
     default:
@@ -242,6 +405,7 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     ESP_LOGI(TAG, "Starting ESP32 Bluetooth HID gamepad receiver demo");
+    motor_init();
     ESP_ERROR_CHECK(esp_hid_gap_init(HID_HOST_MODE));
 
 #if CONFIG_BT_BLE_ENABLED
