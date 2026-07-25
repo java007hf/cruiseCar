@@ -20,15 +20,26 @@ Right motor B:
   PWMB: GPIO33
   BIN1: GPIO25
   BIN2: GPIO26
+
+Left encoder:
+  E1A: GPIO22 / D22
+  E1B: GPIO23 / D23
+
+Right encoder:
+  E2A: GPIO21 / D21
+  E2B: GPIO19 / D19
 ```
 
 The right motor direction is inverted in firmware to match the mirrored physical mounting from the reference chassis.
+The encoder inputs use ESP-IDF PCNT quadrature decoding. If a wheel's tick count direction is inverted, the current balancing logic still works because it compares absolute pulse deltas.
+ESP32 GPIO inputs are 3.3 V only. If your encoder board outputs 5 V on `E1A/E1B/E2A/E2B`, use level shifting or power the encoder logic from 3.3 V if the module supports it.
 
 ## Driving
 
 - Left stick up/down controls throttle.
 - Left stick left/right controls steering.
 - The firmware mixes throttle and steering into differential left/right wheel speeds.
+- When the target is straight, the control loop reads `E1A/E1B` and `E2A/E2B` every 50 ms and adjusts PWM so both wheels report similar encoder pulse counts.
 - If the HID controller disconnects, both motors stop.
 - PWM is limited to `210/255` by default for safer first tests. Adjust `MOTOR_MAX_PWM` in `main.c` after verifying direction and wiring.
 
