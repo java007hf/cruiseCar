@@ -59,7 +59,7 @@ class MainActivity : Activity() {
     private fun showRoleScreen() {
         val layout = rootLayout()
         layout.addView(title("CruiseCar $appVersionLabel"))
-        layout.addView(button("---发送端") { showSenderScreen() })
+        layout.addView(button("发送端") { showSenderScreen() })
         layout.addView(button("接收端") { showReceiverScreen() })
         setContentView(withLog(layout))
     }
@@ -423,7 +423,8 @@ class MainActivity : Activity() {
             Manifest.permission.BLUETOOTH,
             Manifest.permission.BLUETOOTH_ADMIN,
             Manifest.permission.CAMERA,
-            Manifest.permission.RECORD_AUDIO
+            Manifest.permission.RECORD_AUDIO,
+            Manifest.permission.MODIFY_AUDIO_SETTINGS
         )
         if (android.os.Build.VERSION.SDK_INT >= 31) {
             permissions.add(Manifest.permission.BLUETOOTH_CONNECT)

@@ -1,6 +1,7 @@
 package com.cruisecar.app
 
 import android.content.Context
+import android.media.AudioManager
 import android.os.Handler
 import android.os.Looper
 import org.json.JSONObject
@@ -51,6 +52,9 @@ class WebRtcCall(
     private var localCapturer: VideoCapturer? = null
     private var localSource: VideoSource? = null
     private var audioSource: AudioSource? = null
+    private var audioManager: AudioManager? = null
+    private var previousAudioMode: Int? = null
+    private var previousSpeakerphoneOn: Boolean? = null
     private val running = AtomicBoolean(false)
 
     init {
@@ -124,6 +128,7 @@ class WebRtcCall(
         audioSource = null
         factory?.dispose()
         factory = null
+        restoreAudioRoute()
     }
 
     fun release() {
@@ -135,6 +140,7 @@ class WebRtcCall(
 
     private fun startPeer(channel: SignalChannel, createOffer: Boolean) {
         onLog("WebRTC startPeer createOffer=$createOffer on ${threadName()}")
+        configureSpeakerRoute()
         signal = channel
         ensureFactory()
         peerConnection = factory?.createPeerConnection(iceServers(), peerObserver())
@@ -182,8 +188,35 @@ class WebRtcCall(
 
         audioSource = factory.createAudioSource(MediaConstraints())
         val audioTrack: AudioTrack = factory.createAudioTrack("audio0", audioSource)
+        audioTrack.setEnabled(true)
         peerConnection?.addTrack(audioTrack, listOf("cruisecar"))
         onLog("WebRTC local audio track added")
+    }
+
+    private fun configureSpeakerRoute() {
+        runOnMainSync {
+            val manager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            if (audioManager == null) {
+                audioManager = manager
+                previousAudioMode = manager.mode
+                previousSpeakerphoneOn = manager.isSpeakerphoneOn
+            }
+            manager.mode = AudioManager.MODE_IN_COMMUNICATION
+            manager.isSpeakerphoneOn = true
+            onLog("WebRTC audio route speaker=${manager.isSpeakerphoneOn} mode=${manager.mode}")
+        }
+    }
+
+    private fun restoreAudioRoute() {
+        runOnMainSync {
+            val manager = audioManager ?: return@runOnMainSync
+            previousSpeakerphoneOn?.let { manager.isSpeakerphoneOn = it }
+            previousAudioMode?.let { manager.mode = it }
+            onLog("WebRTC audio route restored speaker=${manager.isSpeakerphoneOn} mode=${manager.mode}")
+            audioManager = null
+            previousAudioMode = null
+            previousSpeakerphoneOn = null
+        }
     }
 
     private fun createOffer() {
