@@ -9,7 +9,8 @@ enum class ControlMode(val wireValue: Int, val label: String) {
     MANUAL(0x00, "手动遥控"),
     VIDEO_CALL(0x01, "实时视频"),
     SMART_FOLLOW(0x02, "智能跟随"),
-    PATROL(0x03, "智能巡逻");
+    PATROL(0x03, "智能巡逻"),
+    VIDEO_OFF(0x04, "关闭视频");
 
     companion object {
         fun fromWire(value: Int): ControlMode =

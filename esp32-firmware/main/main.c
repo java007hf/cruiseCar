@@ -10,15 +10,20 @@
 #include "esp_spp_api.h"
 #include "nvs_flash.h"
 
+#include "car_control.h"
+
 #define DEVICE_NAME "CruiseCar-ESP32"
 #define SPP_SERVER_NAME "CruiseCar-SPP"
 #define PACKET_SIZE 10
+#define CONTROL_VERBOSE_LOG 0
 
 static const char *TAG = "cruise_car";
 static uint8_t rx_buffer[PACKET_SIZE];
 static size_t rx_len;
+#if CONTROL_VERBOSE_LOG
 static bool have_prev_buttons;
 static uint16_t prev_buttons;
+#endif
 
 typedef struct {
     uint8_t lx;
@@ -53,6 +58,7 @@ static bool parse_packet(const uint8_t *packet, gamepad_state_t *state)
     return true;
 }
 
+#if CONTROL_VERBOSE_LOG
 static const char *button_name(int bit)
 {
     switch (bit) {
@@ -98,20 +104,20 @@ static void log_button_changes(uint16_t buttons)
     prev_buttons = buttons;
     have_prev_buttons = true;
 }
+#endif
 
 static void apply_gamepad_state(const gamepad_state_t *state)
 {
+#if CONTROL_VERBOSE_LOG
     int throttle = 128 - state->ly;
     int steering = state->lx - 128;
     ESP_LOGI(TAG, "lx=%u ly=%u rx=%u ry=%u buttons=0x%04x throttle=%d steering=%d",
              state->lx, state->ly, state->rx, state->ry, state->buttons, throttle, steering);
+#endif
+#if CONTROL_VERBOSE_LOG
     log_button_changes(state->buttons);
-
-    /*
-     * TODO: map throttle/steering to the actual motor driver GPIO/PWM channels.
-     * Keep this function as the single output point so SPP and future HID Host
-     * inputs can share the same car-control behavior.
-     */
+#endif
+    car_control_update(state->lx, state->ly, state->rx, state->ry, state->buttons);
 }
 
 static void feed_bytes(const uint8_t *data, size_t len)
@@ -154,6 +160,7 @@ static void spp_callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
         break;
     case ESP_SPP_CLOSE_EVT:
         ESP_LOGI(TAG, "SPP client disconnected");
+        car_control_stop();
         break;
     case ESP_SPP_DATA_IND_EVT:
         feed_bytes(param->data_ind.data, param->data_ind.len);
@@ -171,6 +178,8 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    ESP_ERROR_CHECK(car_control_init());
 
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_BLE));
 

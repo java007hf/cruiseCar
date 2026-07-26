@@ -1,9 +1,12 @@
 package com.cruisecar.app
 
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import org.json.JSONObject
 import org.webrtc.AudioSource
 import org.webrtc.AudioTrack
+import org.webrtc.Camera1Enumerator
 import org.webrtc.Camera2Enumerator
 import org.webrtc.CameraEnumerator
 import org.webrtc.DataChannel
@@ -27,15 +30,18 @@ import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.net.ServerSocket
 import java.net.Socket
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicBoolean
 
 class WebRtcCall(
     private val context: Context,
     private val role: Role,
     private val renderer: SurfaceViewRenderer,
+    private val cameraFacing: CameraFacing = CameraFacing.BACK,
     private val onLog: (String) -> Unit
 ) {
     enum class Role { CALLER, ANSWERER }
+    enum class CameraFacing { FRONT, BACK }
 
     private val eglBase = EglBase.create()
     private var factory: PeerConnectionFactory? = null
@@ -47,7 +53,12 @@ class WebRtcCall(
     private var audioSource: AudioSource? = null
     private val running = AtomicBoolean(false)
 
+    init {
+        onLog("WebRTC $role created on ${threadName()}")
+    }
+
     fun startServer(port: Int) {
+        onLog("WebRTC startServer on ${threadName()}")
         if (!running.compareAndSet(false, true)) return
         initRenderer()
         Thread {
@@ -56,6 +67,7 @@ class WebRtcCall(
                 onLog("WebRTC signaling server started on $port")
                 val socket = serverSocket?.accept() ?: return@Thread
                 onLog("WebRTC peer connected: ${socket.inetAddress.hostAddress}")
+                Thread.sleep(1000)
                 startPeer(SignalChannel(socket), createOffer = true)
             } catch (e: Exception) {
                 if (running.get()) onLog("WebRTC server failed: ${e.message}")
@@ -64,21 +76,25 @@ class WebRtcCall(
     }
 
     fun connect(host: String, port: Int) {
+        onLog("WebRTC connect requested on ${threadName()}")
         close()
         running.set(true)
         initRenderer()
         Thread {
             var lastError: Exception? = null
             try {
-                repeat(12) { attempt ->
+                Thread.sleep(800)
+                repeat(30) { attempt ->
                     try {
+                        onLog("WebRTC signaling connect attempt ${attempt + 1}: $host:$port")
                         val socket = Socket(host, port)
                         onLog("WebRTC signaling connected: $host:$port")
                         startPeer(SignalChannel(socket), createOffer = false)
                         return@Thread
                     } catch (e: Exception) {
                         lastError = e
-                        Thread.sleep(250L + attempt * 50L)
+                        onLog("WebRTC signaling connect retry: ${e.message}")
+                        Thread.sleep(300L)
                     }
                 }
             } catch (e: Exception) {
@@ -91,6 +107,7 @@ class WebRtcCall(
     }
 
     fun close() {
+        onLog("WebRTC close on ${threadName()}")
         running.set(false)
         signal?.close()
         signal = null
@@ -110,22 +127,25 @@ class WebRtcCall(
     }
 
     fun release() {
+        onLog("WebRTC release on ${threadName()}")
         close()
-        renderer.release()
+        runOnMainSync { renderer.release() }
         eglBase.release()
     }
 
     private fun startPeer(channel: SignalChannel, createOffer: Boolean) {
+        onLog("WebRTC startPeer createOffer=$createOffer on ${threadName()}")
         signal = channel
         ensureFactory()
         peerConnection = factory?.createPeerConnection(iceServers(), peerObserver())
-        if (role == Role.CALLER) addLocalMedia()
+        addLocalMedia()
         channel.listen { message -> handleSignal(message) }
         if (createOffer) createOffer()
     }
 
     private fun ensureFactory() {
         if (factory != null) return
+        onLog("WebRTC ensureFactory on ${threadName()}")
         PeerConnectionFactory.initialize(
             PeerConnectionFactory.InitializationOptions.builder(context.applicationContext)
                 .createInitializationOptions()
@@ -139,25 +159,37 @@ class WebRtcCall(
     }
 
     private fun addLocalMedia() {
+        onLog("WebRTC addLocalMedia on ${threadName()}")
         val factory = factory ?: return
-        localCapturer = createCameraCapturer() ?: return
+        localCapturer = createCameraCapturer()
+        if (localCapturer == null) {
+            onLog("WebRTC camera capturer unavailable")
+            return
+        }
         localSource = factory.createVideoSource(false)
         val textureHelper = SurfaceTextureHelper.create("WebRtcCamera", eglBase.eglBaseContext)
         localCapturer?.initialize(textureHelper, context.applicationContext, localSource?.capturerObserver)
-        localCapturer?.startCapture(640, 480, 24)
+        try {
+            localCapturer?.startCapture(320, 240, 15)
+        } catch (e: Exception) {
+            onLog("WebRTC camera start failed: ${e.message}")
+            return
+        }
 
         val videoTrack = factory.createVideoTrack("video0", localSource)
-        videoTrack.addSink(renderer)
         peerConnection?.addTrack(videoTrack, listOf("cruisecar"))
+        onLog("WebRTC local video track added")
 
         audioSource = factory.createAudioSource(MediaConstraints())
         val audioTrack: AudioTrack = factory.createAudioTrack("audio0", audioSource)
         peerConnection?.addTrack(audioTrack, listOf("cruisecar"))
+        onLog("WebRTC local audio track added")
     }
 
     private fun createOffer() {
         peerConnection?.createOffer(object : SimpleSdpObserver() {
             override fun onCreateSuccess(desc: SessionDescription) {
+                onLog("WebRTC offer created")
                 peerConnection?.setLocalDescription(SimpleSdpObserver(), desc)
                 signal?.sendSdp(desc)
             }
@@ -167,6 +199,7 @@ class WebRtcCall(
     private fun createAnswer() {
         peerConnection?.createAnswer(object : SimpleSdpObserver() {
             override fun onCreateSuccess(desc: SessionDescription) {
+                onLog("WebRTC answer created")
                 peerConnection?.setLocalDescription(SimpleSdpObserver(), desc)
                 signal?.sendSdp(desc)
             }
@@ -176,6 +209,7 @@ class WebRtcCall(
     private fun handleSignal(message: JSONObject) {
         when (message.optString("type")) {
             "offer", "answer" -> {
+                onLog("WebRTC received ${message.optString("type")}")
                 val type = SessionDescription.Type.fromCanonicalForm(message.getString("type"))
                 val sdp = SessionDescription(type, message.getString("sdp"))
                 peerConnection?.setRemoteDescription(object : SimpleSdpObserver() {
@@ -185,6 +219,7 @@ class WebRtcCall(
                 }, sdp)
             }
             "candidate" -> {
+                onLog("WebRTC received ICE candidate")
                 peerConnection?.addIceCandidate(
                     IceCandidate(
                         message.getString("sdpMid"),
@@ -198,17 +233,31 @@ class WebRtcCall(
 
     private fun peerObserver() = object : PeerConnection.Observer {
         override fun onIceCandidate(candidate: IceCandidate) {
+            onLog("WebRTC sending ICE candidate")
             signal?.sendCandidate(candidate)
         }
 
         override fun onTrack(transceiver: org.webrtc.RtpTransceiver) {
             transceiver.receiver.track()?.let { track ->
-                if (track is VideoTrack) track.addSink(renderer)
+                when (track) {
+                    is VideoTrack -> {
+                        onLog("WebRTC remote video track received")
+                        runOnMainSync { track.addSink(renderer) }
+                    }
+                    is AudioTrack -> {
+                        onLog("WebRTC remote audio track received")
+                        track.setEnabled(true)
+                    }
+                    else -> onLog("WebRTC remote track received: ${track.kind()}")
+                }
             }
         }
 
         override fun onAddStream(stream: MediaStream) {
-            stream.videoTracks.firstOrNull()?.addSink(renderer)
+            stream.videoTracks.firstOrNull()?.let { track ->
+                onLog("WebRTC remote stream received")
+                runOnMainSync { track.addSink(renderer) }
+            }
         }
 
         override fun onIceConnectionChange(state: PeerConnection.IceConnectionState) {
@@ -226,17 +275,59 @@ class WebRtcCall(
     }
 
     private fun createCameraCapturer(): VideoCapturer? {
-        val enumerator: CameraEnumerator = Camera2Enumerator(context)
+        return createCameraCapturer(Camera1Enumerator(false), "Camera1")
+            ?: createCameraCapturer(Camera2Enumerator(context), "Camera2")
+    }
+
+    private fun createCameraCapturer(enumerator: CameraEnumerator, label: String): VideoCapturer? {
+        val back = enumerator.deviceNames.firstOrNull { enumerator.isBackFacing(it) }
         val front = enumerator.deviceNames.firstOrNull { enumerator.isFrontFacing(it) }
         val any = enumerator.deviceNames.firstOrNull()
-        return (front ?: any)?.let { enumerator.createCapturer(it, null) }
+        val preferred = if (cameraFacing == CameraFacing.FRONT) front else back
+        val fallback = if (cameraFacing == CameraFacing.FRONT) back else front
+        for (name in listOfNotNull(preferred, fallback, any).distinct()) {
+            val capturer = enumerator.createCapturer(name, null)
+            if (capturer != null) {
+                onLog("WebRTC using $label ${cameraFacing.name.lowercase()} camera: $name")
+                return capturer
+            }
+        }
+        onLog("WebRTC $label camera unavailable")
+        return null
     }
 
     private fun initRenderer() {
-        renderer.init(eglBase.eglBaseContext, null)
-        renderer.setMirror(role == Role.CALLER)
-        renderer.setEnableHardwareScaler(true)
+        onLog("WebRTC initRenderer requested on ${threadName()}")
+        runOnMainSync {
+            onLog("WebRTC initRenderer executing on ${threadName()}")
+            renderer.init(eglBase.eglBaseContext, null)
+            renderer.setMirror(role == Role.CALLER)
+            renderer.setEnableHardwareScaler(true)
+        }
     }
+
+    private fun runOnMainSync(action: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            action()
+            return
+        }
+        val latch = CountDownLatch(1)
+        var failure: Throwable? = null
+        Handler(Looper.getMainLooper()).post {
+            try {
+                action()
+            } catch (t: Throwable) {
+                failure = t
+            } finally {
+                latch.countDown()
+            }
+        }
+        latch.await()
+        failure?.let { throw it }
+    }
+
+    private fun threadName(): String =
+        "${Thread.currentThread().name}/${Thread.currentThread().id}"
 
     private fun iceServers(): List<PeerConnection.IceServer> =
         listOf(PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer())

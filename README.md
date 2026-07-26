@@ -3,7 +3,7 @@
 Smart cruise car project with two subprojects:
 
 - `android-app`: Android 6.0+ Kotlin app. It can run as a sender controller or a receiver mounted on the car.
-- `esp32-firmware`: ESP-IDF firmware. ESP32 exposes a Classic Bluetooth SPP service and parses controller packets.
+- `esp32-firmware`: ESP-IDF firmware. ESP32 exposes a Classic Bluetooth SPP service, parses controller packets, and drives the TB6612 motor controller with encoder feedback.
 
 ## Current Architecture
 
@@ -15,7 +15,8 @@ Receiver Android
   Classic Bluetooth SPP
 ESP32
   packet parser
-  motor-control hook
+  TB6612 motor control
+  E1/E2 encoder feedback
 ```
 
 Android 6.0 cannot act as a Bluetooth HID gamepad through the official Android API, so the first version uses Classic Bluetooth SPP between the receiver phone and ESP32. The packet model is still gamepad-shaped so ESP32 can later add a Bluetooth HID Host input path for real controllers.
@@ -76,6 +77,35 @@ bit 9: R2
 ```
 
 The Android sender exposes an on-screen gamepad and sends this same packet to the receiver Android app over TCP. The receiver app transparently forwards each packet to `CruiseCar-ESP32` over Classic Bluetooth SPP.
+
+## ESP32 Wiring
+
+TB6612 motor driver:
+
+```text
+STBY -> GPIO27
+
+Left motor A:
+  PWMA -> GPIO13
+  AIN1 -> GPIO14
+  AIN2 -> GPIO12
+
+Right motor B:
+  PWMB -> GPIO33
+  BIN1 -> GPIO25
+  BIN2 -> GPIO26
+```
+
+Encoder inputs:
+
+```text
+E1A -> GPIO22 / D22
+E1B -> GPIO23 / D23
+E2A -> GPIO21 / D21
+E2B -> GPIO19 / D19
+```
+
+ESP32 GPIO inputs are 3.3 V only. If the encoder board outputs 5 V, use level shifting or power the encoder logic from 3.3 V if supported.
 
 ## Build
 

@@ -6,9 +6,13 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.net.wifi.WifiManager
 import android.os.Bundle
+import android.util.Log
 import android.view.Gravity
+import android.view.View
+import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -17,6 +21,8 @@ import org.webrtc.SurfaceViewRenderer
 import java.util.concurrent.Executors
 
 class MainActivity : Activity() {
+    private val tag = "CruiseCar"
+    private val appVersionLabel = "v0.1.3-camera-switch"
     private val controlPort = 42101
     private val videoPort = 42102
     private val controlClient = ControlClient()
@@ -25,35 +31,56 @@ class MainActivity : Activity() {
     private var discoveryResponder: DiscoveryResponder? = null
     private var controlServer: ControlServer? = null
     private var cameraPreview: CameraPreviewView? = null
+    private var senderVideoRenderer: SurfaceViewRenderer? = null
+    private var senderVideoArea: FrameLayout? = null
+    private var senderLayout: LinearLayout? = null
+    private var receiverVideoRenderer: SurfaceViewRenderer? = null
+    private var receiverLayout: LinearLayout? = null
     private var smartFollow: SmartFollowController? = null
     private var webRtcCall: WebRtcCall? = null
     private lateinit var logView: TextView
     private var connectedReceiverHost: String? = null
     private var senderMode = ControlMode.MANUAL
     private var receiverMode = ControlMode.MANUAL
+    private var senderVideoEnabled = false
+    private var senderVideoButton: Button? = null
+    private var senderCameraFacing = WebRtcCall.CameraFacing.FRONT
+    private var senderCameraButton: Button? = null
     private var lastSenderState: GamepadState? = null
     private var lastSenderAtMs: Long = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        log("CruiseCar APK debug $appVersionLabel started")
         requestBasePermissions()
         showRoleScreen()
     }
 
     private fun showRoleScreen() {
         val layout = rootLayout()
-        layout.addView(title("CruiseCar"))
-        layout.addView(button("发送端") { showSenderScreen() })
+        layout.addView(title("CruiseCar $appVersionLabel"))
+        layout.addView(button("---发送端") { showSenderScreen() })
         layout.addView(button("接收端") { showReceiverScreen() })
         setContentView(withLog(layout))
     }
 
     private fun showSenderScreen() {
         val layout = rootLayout()
+        senderLayout = layout
         layout.addView(title("发送端多模式控制"))
 
-        val remoteVideo = SurfaceViewRenderer(this)
-        layout.addView(remoteVideo, LinearLayout.LayoutParams(-1, 0, 1.1f))
+        val videoArea = FrameLayout(this)
+        senderVideoArea = videoArea
+        val remoteVideo = createSenderVideoRenderer(videoArea)
+        val gamepad = GamepadView(this).apply {
+            onStateChanged = { state ->
+                if (senderMode == ControlMode.MANUAL) {
+                    sendFromGamepad(state)
+                }
+            }
+        }
+        videoArea.addView(gamepad, FrameLayout.LayoutParams(-1, -1))
+        layout.addView(videoArea, LinearLayout.LayoutParams(-1, 0, 2.4f))
 
         layout.addView(button("扫描接收端并连接") {
             Thread {
@@ -64,7 +91,6 @@ class MainActivity : Activity() {
                         val receiver = receivers.first()
                         connectedReceiverHost = receiver.host
                         controlClient.connect(receiver.host, receiver.port) { log(it) }
-                        sendMode(ControlMode.MANUAL, remoteVideo)
                         sendFromGamepad(GamepadState(), force = true)
                     } else {
                         log("No receiver found")
@@ -76,24 +102,25 @@ class MainActivity : Activity() {
         })
 
         val modeRow = row()
-        modeRow.addView(button("手动遥控") { sendMode(ControlMode.MANUAL, remoteVideo) }, weightParams())
-        modeRow.addView(button("实时视频") { sendMode(ControlMode.VIDEO_CALL, remoteVideo) }, weightParams())
+        modeRow.addView(button("实时视频") { startSenderVideoMode() }, weightParams())
         modeRow.addView(button("智能跟随") { sendMode(ControlMode.SMART_FOLLOW, remoteVideo) }, weightParams())
         modeRow.addView(button("智能巡逻") { sendMode(ControlMode.PATROL, remoteVideo) }, weightParams())
         layout.addView(modeRow)
-
-        val gamepad = GamepadView(this).apply {
-            onStateChanged = { state ->
-                if (senderMode == ControlMode.MANUAL) {
-                    sendFromGamepad(state)
-                }
-            }
-        }
-        layout.addView(gamepad, LinearLayout.LayoutParams(-1, 0, 1.7f))
+        modeRow.visibility = View.GONE
+        val driveModeRow = row()
+        driveModeRow.addView(button("手动遥控") { sendMode(ControlMode.MANUAL, remoteVideo) }, weightParams())
+        driveModeRow.addView(button("智能跟随") { sendMode(ControlMode.SMART_FOLLOW, remoteVideo) }, weightParams())
+        driveModeRow.addView(button("智能巡逻") { sendMode(ControlMode.PATROL, remoteVideo) }, weightParams())
+        layout.addView(driveModeRow)
+        senderVideoButton = button(senderVideoButtonText()) { toggleSenderVideo() }
+        layout.addView(senderVideoButton)
+        senderCameraButton = button(senderCameraButtonText()) { toggleSenderCamera() }
+        layout.addView(senderCameraButton)
         layout.addView(button("停止 / 回中") { sendFromGamepad(GamepadState(), force = true) })
         layout.addView(button("返回") {
-            webRtcCall?.release()
-            webRtcCall = null
+            releaseSenderCall()
+            senderVideoArea = null
+            senderLayout = null
             showRoleScreen()
         })
         setContentView(withLog(layout))
@@ -101,6 +128,7 @@ class MainActivity : Activity() {
 
     private fun showReceiverScreen() {
         val layout = rootLayout()
+        receiverLayout = layout
         layout.addView(title("接收端多模式中转"))
 
         val preview = CameraPreviewView(this)
@@ -121,22 +149,6 @@ class MainActivity : Activity() {
         })
         layout.addView(button("启动接收服务") { startReceiverServices() })
 
-        val localModeRow = row()
-        localModeRow.addView(button("手动") { applyReceiverMode(ControlMode.MANUAL) }, weightParams())
-        localModeRow.addView(button("视频") { applyReceiverMode(ControlMode.VIDEO_CALL) }, weightParams())
-        localModeRow.addView(button("跟随") { applyReceiverMode(ControlMode.SMART_FOLLOW) }, weightParams())
-        localModeRow.addView(button("巡逻") { applyReceiverMode(ControlMode.PATROL) }, weightParams())
-        layout.addView(localModeRow)
-
-        layout.addView(button("停止") {
-            stopReceiverServices()
-            bluetooth.close()
-            log("Receiver stopped")
-        })
-        layout.addView(button("返回") {
-            stopReceiverServices()
-            showRoleScreen()
-        })
         setContentView(withLog(layout))
         preview.start()
     }
@@ -151,7 +163,13 @@ class MainActivity : Activity() {
                         log("Forwarded: ${packet.toHexLine()}")
                     }
                 }
-                is ControlFrame.Mode -> applyReceiverMode(frame.mode)
+                is ControlFrame.Mode -> runOnUiThread {
+                    when (frame.mode) {
+                        ControlMode.VIDEO_CALL -> setReceiverVideoEnabled(true)
+                        ControlMode.VIDEO_OFF -> setReceiverVideoEnabled(false)
+                        else -> applyReceiverDriveMode(frame.mode)
+                    }
+                }
             }
         }.also { it.start { msg -> log(msg) } }
         log("Receiver services ready: control=$controlPort webrtc-signal=$videoPort")
@@ -160,37 +178,28 @@ class MainActivity : Activity() {
     private fun stopReceiverServices() {
         smartFollow?.stop()
         smartFollow = null
-        webRtcCall?.release()
-        webRtcCall = null
         discoveryResponder?.stop()
         controlServer?.stop()
         discoveryResponder = null
         controlServer = null
         cameraPreview?.stop()
+        cameraPreview?.visibility = View.VISIBLE
+        releaseReceiverCall()
+        receiverLayout = null
     }
 
-    private fun applyReceiverMode(mode: ControlMode) {
+    private fun applyReceiverDriveMode(mode: ControlMode) {
         receiverMode = mode
         smartFollow?.stop()
         smartFollow = null
-        log("Receiver mode: ${mode.label}")
+        log("Receiver drive mode: ${mode.label}")
 
         when (mode) {
             ControlMode.MANUAL -> {
-                webRtcCall?.release()
-                webRtcCall = null
                 bluetooth.send(GamepadState().toPacket())
             }
-            ControlMode.VIDEO_CALL -> {
-                cameraPreview?.stop()
-                webRtcCall?.release()
-                val renderer = SurfaceViewRenderer(this)
-                webRtcCall = WebRtcCall(this, WebRtcCall.Role.CALLER, renderer) { msg -> log(msg) }
-                webRtcCall?.startServer(videoPort)
-            }
             ControlMode.SMART_FOLLOW -> {
-                webRtcCall?.release()
-                webRtcCall = null
+                cameraPreview?.visibility = View.VISIBLE
                 cameraPreview?.start()
                 smartFollow = SmartFollowController(
                     frameProvider = { cameraPreview?.snapshot(240, 180) },
@@ -204,39 +213,186 @@ class MainActivity : Activity() {
                 ).also { it.start { msg -> log(msg) } }
             }
             ControlMode.PATROL -> {
-                webRtcCall?.release()
-                webRtcCall = null
                 bluetooth.send(GamepadState().toPacket())
                 log("Patrol mode selected; route planner is reserved for the next phase")
             }
+            ControlMode.VIDEO_CALL, ControlMode.VIDEO_OFF -> Unit
         }
+    }
+
+    private fun setReceiverVideoEnabled(enabled: Boolean) {
+        log("Receiver video ${if (enabled) "enabled" else "disabled"}")
+        if (!enabled) {
+            releaseReceiverCall()
+            if (receiverMode != ControlMode.SMART_FOLLOW) {
+                cameraPreview?.visibility = View.VISIBLE
+                cameraPreview?.start()
+            }
+            return
+        }
+        if (webRtcCall != null) return
+        if (receiverMode != ControlMode.SMART_FOLLOW) {
+            cameraPreview?.stop()
+            cameraPreview?.visibility = View.GONE
+        }
+        val renderer = createReceiverVideoRenderer()
+        webRtcCall = WebRtcCall(
+            this,
+            WebRtcCall.Role.CALLER,
+            renderer,
+            cameraFacing = WebRtcCall.CameraFacing.FRONT
+        ) { msg -> log(msg) }
+        log("Receiver video signaling starting on $videoPort")
+        webRtcCall?.startServer(videoPort)
+    }
+
+    private fun releaseReceiverCall() {
+        webRtcCall?.release()
+        webRtcCall = null
+        receiverVideoRenderer?.let { renderer ->
+            receiverLayout?.removeView(renderer)
+        }
+        receiverVideoRenderer = null
+    }
+
+    private fun createReceiverVideoRenderer(): SurfaceViewRenderer {
+        val renderer = SurfaceViewRenderer(this).apply { visibility = View.VISIBLE }
+        receiverVideoRenderer = renderer
+        receiverLayout?.addView(renderer, LinearLayout.LayoutParams(-1, 0, 1.5f))
+        return renderer
     }
 
     private fun sendMode(mode: ControlMode, remoteVideo: SurfaceViewRenderer? = null) {
         senderMode = mode
         senderExecutor.execute {
             try {
+                log("sendMode ${mode.label} begin on ${threadName()}")
                 if (!controlClient.isConnected()) {
                     log("Not connected: scan and connect receiver first")
                     return@execute
                 }
                 controlClient.sendMode(mode)
                 log("Mode sent: ${mode.label}")
-
-                val host = connectedReceiverHost
-                if (mode == ControlMode.VIDEO_CALL && host != null && remoteVideo != null) {
-                    webRtcCall?.release()
-                    webRtcCall = WebRtcCall(this, WebRtcCall.Role.ANSWERER, remoteVideo) { msg -> log(msg) }
-                    webRtcCall?.connect(host, videoPort)
-                } else if (mode == ControlMode.MANUAL || mode == ControlMode.SMART_FOLLOW || mode == ControlMode.PATROL) {
-                    webRtcCall?.release()
-                    webRtcCall = null
-                }
-            } catch (e: Exception) {
-                log("Mode send failed: ${e.message}")
+                if (mode != ControlMode.MANUAL) sendFromGamepad(GamepadState(), force = true)
+            } catch (e: Throwable) {
+                logError("Mode send failed", e)
             }
         }
     }
+
+    private fun toggleSenderVideo() {
+        if (senderVideoEnabled) {
+            stopSenderVideoMode()
+        } else {
+            startSenderVideoMode()
+        }
+    }
+
+    private fun startSenderVideoMode() {
+        try {
+            log("startSenderVideoMode begin on ${threadName()}")
+            if (android.os.Looper.myLooper() != android.os.Looper.getMainLooper()) {
+                log("startSenderVideoMode repost to UI from ${threadName()}")
+                runOnUiThread { startSenderVideoMode() }
+                return
+            }
+
+            val host = connectedReceiverHost
+            if (!controlClient.isConnected() || host == null) {
+                log("Not connected: scan and connect receiver first")
+                return
+            }
+
+            Thread {
+                try {
+                    log("VIDEO_CALL mode packet send begin on ${threadName()}")
+                    controlClient.sendMode(ControlMode.VIDEO_CALL)
+                    log("Video command sent: ${ControlMode.VIDEO_CALL.label}")
+                } catch (e: Throwable) {
+                    logError("Video command send failed", e)
+                }
+            }.start()
+
+            senderVideoEnabled = true
+            senderVideoButton?.text = senderVideoButtonText()
+            log("Sender video signaling target $host:$videoPort")
+            log("releaseSenderCall before video on ${threadName()}")
+            releaseSenderCall()
+            log("createSenderVideoRenderer before video on ${threadName()}")
+            val renderer = createSenderVideoRenderer()
+            log("create WebRtcCall ANSWERER on ${threadName()}")
+            webRtcCall = WebRtcCall(
+                this,
+                WebRtcCall.Role.ANSWERER,
+                renderer,
+                cameraFacing = senderCameraFacing
+            ) { msg -> log(msg) }
+            log("WebRtcCall connect call on ${threadName()}")
+            webRtcCall?.connect(host, videoPort)
+        } catch (e: Throwable) {
+            logError("startSenderVideoMode failed", e)
+        }
+    }
+
+    private fun releaseSenderCall() {
+        log("releaseSenderCall on ${threadName()}")
+        webRtcCall?.release()
+        webRtcCall = null
+        senderVideoRenderer?.let { renderer ->
+            (renderer.parent as? ViewGroup)?.removeView(renderer)
+        }
+        senderVideoRenderer = null
+    }
+
+    private fun createSenderVideoRenderer(parent: FrameLayout? = null): SurfaceViewRenderer {
+        log("createSenderVideoRenderer on ${threadName()}")
+        val renderer = SurfaceViewRenderer(this)
+        senderVideoRenderer = renderer
+        val target = parent ?: senderVideoArea
+        if (target != null) {
+            target.addView(renderer, 0, FrameLayout.LayoutParams(-1, -1))
+        } else {
+            senderLayout?.addView(renderer, LinearLayout.LayoutParams(-1, 0, 1.1f))
+        }
+        return renderer
+    }
+
+    private fun toggleSenderCamera() {
+        senderCameraFacing = if (senderCameraFacing == WebRtcCall.CameraFacing.FRONT) {
+            WebRtcCall.CameraFacing.BACK
+        } else {
+            WebRtcCall.CameraFacing.FRONT
+        }
+        senderCameraButton?.text = senderCameraButtonText()
+        log("Sender camera switched to ${senderCameraFacing.name.lowercase()}")
+        if (senderVideoEnabled && webRtcCall != null) {
+            startSenderVideoMode()
+        }
+    }
+
+    private fun stopSenderVideoMode() {
+        senderVideoEnabled = false
+        senderVideoButton?.text = senderVideoButtonText()
+        Thread {
+            try {
+                controlClient.sendMode(ControlMode.VIDEO_OFF)
+                log("Video command sent: ${ControlMode.VIDEO_OFF.label}")
+            } catch (e: Throwable) {
+                logError("Video command send failed", e)
+            }
+        }.start()
+        releaseSenderCall()
+    }
+
+    private fun senderVideoButtonText(): String =
+        if (senderVideoEnabled) "视频：开" else "视频：关"
+
+    private fun senderCameraButtonText(): String =
+        if (senderCameraFacing == WebRtcCall.CameraFacing.FRONT) {
+            "发送端摄像头：前置"
+        } else {
+            "发送端摄像头：后置"
+        }
 
     private fun sendFromGamepad(state: GamepadState, force: Boolean = false) {
         val now = System.currentTimeMillis()
@@ -307,6 +463,7 @@ class MainActivity : Activity() {
     }
 
     private fun log(message: String) {
+        Log.i(tag, message)
         runOnUiThread {
             if (::logView.isInitialized) {
                 logView.append("$message\n")
@@ -315,6 +472,14 @@ class MainActivity : Activity() {
             }
         }
     }
+
+    private fun logError(message: String, error: Throwable) {
+        Log.e(tag, "$message on ${threadName()}: ${error.message}", error)
+        log("$message: ${error.message}")
+    }
+
+    private fun threadName(): String =
+        "${Thread.currentThread().name}/${Thread.currentThread().id}"
 
     override fun onDestroy() {
         stopReceiverServices()
