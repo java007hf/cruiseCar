@@ -138,6 +138,9 @@ class MainActivity : Activity() {
         val addressInput = EditText(this)
         addressInput.hint = "ESP32 蓝牙地址，例如 AA:BB:CC:DD:EE:FF"
         layout.addView(addressInput)
+        layout.addView(button("自动扫描并连接 ESP32") {
+            connectEsp32ByScan()
+        })
         layout.addView(button("连接 ESP32 SPP") {
             Thread {
                 try {
@@ -151,6 +154,17 @@ class MainActivity : Activity() {
 
         setContentView(withLog(layout))
         preview.start()
+    }
+
+    private fun connectEsp32ByScan() {
+        Thread {
+            try {
+                bluetooth.connectFirstByName(this, BluetoothSppClient.ESP32_DEVICE_NAME) { log(it) }
+                log("ESP32 auto-connect ready")
+            } catch (e: Exception) {
+                log("ESP32 auto-connect failed: ${e.message}")
+            }
+        }.start()
     }
 
     private fun startReceiverServices() {
@@ -424,10 +438,12 @@ class MainActivity : Activity() {
             Manifest.permission.BLUETOOTH_ADMIN,
             Manifest.permission.CAMERA,
             Manifest.permission.RECORD_AUDIO,
+            Manifest.permission.ACCESS_FINE_LOCATION,
             Manifest.permission.MODIFY_AUDIO_SETTINGS
         )
         if (android.os.Build.VERSION.SDK_INT >= 31) {
             permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
+            permissions.add(Manifest.permission.BLUETOOTH_SCAN)
         }
         val missing = permissions.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
         if (missing.isNotEmpty()) requestPermissions(missing.toTypedArray(), 100)

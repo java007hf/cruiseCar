@@ -13,13 +13,18 @@ Sender Android
   TCP control channel
 Receiver Android
   Classic Bluetooth SPP
+Bluetooth HID Gamepad
+  Classic Bluetooth / BLE HID
 ESP32
-  packet parser
+  SPP packet parser
+  HID Host parser
   TB6612 motor control
   E1/E2 encoder feedback
 ```
 
 Android 6.0 cannot act as a Bluetooth HID gamepad through the official Android API, so the first version uses Classic Bluetooth SPP between the receiver phone and ESP32. The packet model is still gamepad-shaped so ESP32 can later add a Bluetooth HID Host input path for real controllers.
+
+ESP32 now supports both input paths at the same time: the receiver Android app can stay connected over Classic Bluetooth SPP while ESP32 also scans for and connects to a Bluetooth HID gamepad. Both paths are normalized to the same `LX/LY/RX/RY/buttons` gamepad state before reaching the motor controller. The most recent input wins; disconnecting one path only stops the car if no other control path is connected.
 
 ## Android Modes
 
@@ -77,6 +82,8 @@ bit 9: R2
 ```
 
 The Android sender exposes an on-screen gamepad and sends this same packet to the receiver Android app over TCP. The receiver app transparently forwards each packet to `CruiseCar-ESP32` over Classic Bluetooth SPP.
+
+On the receiver app, use `自动扫描并连接 ESP32` to avoid manually entering the Bluetooth address. The app first checks paired Classic Bluetooth devices, then scans for a device named `CruiseCar-ESP32`, and connects over SPP.
 
 ## ESP32 Wiring
 

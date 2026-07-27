@@ -1,28 +1,45 @@
-#include <stdint.h>
+#include <inttypes.h>
 #include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 #include "esp_bt.h"
+#include "esp_bt_defs.h"
 #include "esp_bt_device.h"
-#include "esp_bt_main.h"
+#include "esp_event.h"
+#include "esp_gap_ble_api.h"
 #include "esp_gap_bt_api.h"
+#include "esp_gattc_api.h"
+#include "esp_hid_common.h"
+#include "esp_hidh.h"
+#include "esp_hidh_gattc.h"
 #include "esp_log.h"
 #include "esp_spp_api.h"
 #include "nvs_flash.h"
 
 #include "car_control.h"
+#include "esp_hid_gap.h"
 
 #define DEVICE_NAME "CruiseCar-ESP32"
 #define SPP_SERVER_NAME "CruiseCar-SPP"
 #define PACKET_SIZE 10
+#define SCAN_SECONDS 8
+#define RESCAN_DELAY_MS 3000
 #define CONTROL_VERBOSE_LOG 0
 
 static const char *TAG = "cruise_car";
 static uint8_t rx_buffer[PACKET_SIZE];
 static size_t rx_len;
+static volatile bool spp_connected;
+static volatile bool hidh_opening;
+static volatile bool hidh_connected;
 #if CONTROL_VERBOSE_LOG
 static bool have_prev_buttons;
-static uint16_t prev_buttons;
+static uint32_t prev_buttons;
 #endif
 
 typedef struct {
@@ -30,7 +47,7 @@ typedef struct {
     uint8_t ly;
     uint8_t rx;
     uint8_t ry;
-    uint16_t buttons;
+    uint32_t buttons;
 } gamepad_state_t;
 
 static uint8_t checksum(const uint8_t *packet)
@@ -42,7 +59,7 @@ static uint8_t checksum(const uint8_t *packet)
     return (uint8_t)(sum & 0xFF);
 }
 
-static bool parse_packet(const uint8_t *packet, gamepad_state_t *state)
+static bool parse_spp_packet(const uint8_t *packet, gamepad_state_t *state)
 {
     if (packet[0] != 0xAA || packet[1] != 0x55 || packet[2] != 0x01) {
         return false;
@@ -54,7 +71,59 @@ static bool parse_packet(const uint8_t *packet, gamepad_state_t *state)
     state->ly = packet[4];
     state->rx = packet[5];
     state->ry = packet[6];
-    state->buttons = packet[7] | ((uint16_t)packet[8] << 8);
+    state->buttons = packet[7] | ((uint32_t)packet[8] << 8);
+    return true;
+}
+
+static bool parse_xiaomi_gamepad_report(const uint8_t *data, uint16_t len, gamepad_state_t *state)
+{
+    if (len < 20) {
+        return false;
+    }
+
+    state->buttons = data[0] | ((uint32_t)data[1] << 8) | ((uint32_t)data[2] << 16);
+    uint8_t hat = data[3] & 0x0F;
+    state->lx = data[4];
+    state->ly = data[5];
+    state->rx = data[6];
+    state->ry = data[7];
+
+    if (CONTROL_VERBOSE_LOG) {
+        uint8_t l2 = data[8];
+        uint8_t r2 = data[9];
+        uint8_t battery = data[18];
+        ESP_LOGI(TAG, "xiaomi/classic buttons=0x%06" PRIx32
+                 " hat=%u lx=%u ly=%u rx=%u ry=%u l2=%u r2=%u battery=%u%%",
+                 state->buttons, hat, state->lx, state->ly, state->rx, state->ry, l2, r2, battery);
+    }
+    return true;
+}
+
+static bool parse_hid_gamepad_report(const uint8_t *data, uint16_t len, gamepad_state_t *state)
+{
+    if (parse_xiaomi_gamepad_report(data, len, state)) {
+        return true;
+    }
+
+    if (len < 4) {
+        return false;
+    }
+
+    state->lx = data[0];
+    state->ly = data[1];
+    state->rx = data[2];
+    state->ry = data[3];
+    state->buttons = 0;
+
+    for (uint16_t i = 4; i < len && i < 8; i++) {
+        state->buttons |= ((uint32_t)data[i]) << ((i - 4) * 8);
+    }
+
+    if (CONTROL_VERBOSE_LOG) {
+        uint8_t hat = (len > 4) ? (data[4] & 0x0F) : 0x0F;
+        ESP_LOGI(TAG, "hid guess lx=%u ly=%u rx=%u ry=%u hat=%u buttons=0x%08" PRIx32,
+                 state->lx, state->ly, state->rx, state->ry, hat, state->buttons);
+    }
     return true;
 }
 
@@ -83,12 +152,12 @@ static const char *button_name(int bit)
     }
 }
 
-static void log_button_changes(uint16_t buttons)
+static void log_button_changes(uint32_t buttons)
 {
-    uint16_t changed = have_prev_buttons ? (uint16_t)(buttons ^ prev_buttons) : buttons;
+    uint32_t changed = have_prev_buttons ? (buttons ^ prev_buttons) : buttons;
 
-    for (int bit = 0; bit < 16; bit++) {
-        uint16_t mask = (uint16_t)(1U << bit);
+    for (int bit = 0; bit < 24; bit++) {
+        uint32_t mask = 1UL << bit;
         if ((changed & mask) == 0) {
             continue;
         }
@@ -106,21 +175,45 @@ static void log_button_changes(uint16_t buttons)
 }
 #endif
 
-static void apply_gamepad_state(const gamepad_state_t *state)
+static bool looks_like_gamepad(esp_hid_scan_result_t *result)
 {
-#if CONTROL_VERBOSE_LOG
-    int throttle = 128 - state->ly;
-    int steering = state->lx - 128;
-    ESP_LOGI(TAG, "lx=%u ly=%u rx=%u ry=%u buttons=0x%04x throttle=%d steering=%d",
-             state->lx, state->ly, state->rx, state->ry, state->buttons, throttle, steering);
-#endif
+    if (result->usage == ESP_HID_USAGE_GAMEPAD || result->usage == ESP_HID_USAGE_JOYSTICK) {
+        return true;
+    }
+
+    if (result->name == NULL) {
+        return false;
+    }
+
+    const char *name = result->name;
+    return strstr(name, "Gamepad") || strstr(name, "GAMEPAD") ||
+           strstr(name, "Joystick") || strstr(name, "JOYSTICK") ||
+           strstr(name, "Xbox") || strstr(name, "XBOX") ||
+           strstr(name, "DualShock") || strstr(name, "DualSense");
+}
+
+static void apply_gamepad_state(const char *source, const gamepad_state_t *state)
+{
+    if (CONTROL_VERBOSE_LOG) {
+        int throttle = 128 - state->ly;
+        int steering = state->lx - 128;
+        ESP_LOGI(TAG, "%s lx=%u ly=%u rx=%u ry=%u buttons=0x%08" PRIx32 " throttle=%d steering=%d",
+                 source, state->lx, state->ly, state->rx, state->ry, state->buttons, throttle, steering);
+    }
 #if CONTROL_VERBOSE_LOG
     log_button_changes(state->buttons);
 #endif
     car_control_update(state->lx, state->ly, state->rx, state->ry, state->buttons);
 }
 
-static void feed_bytes(const uint8_t *data, size_t len)
+static void maybe_stop_after_disconnect(void)
+{
+    if (!spp_connected && !hidh_connected && !hidh_opening) {
+        car_control_stop();
+    }
+}
+
+static void feed_spp_bytes(const uint8_t *data, size_t len)
 {
     for (size_t i = 0; i < len; i++) {
         if (rx_len == 0 && data[i] != 0xAA) {
@@ -133,10 +226,10 @@ static void feed_bytes(const uint8_t *data, size_t len)
         rx_buffer[rx_len++] = data[i];
         if (rx_len == PACKET_SIZE) {
             gamepad_state_t state;
-            if (parse_packet(rx_buffer, &state)) {
-                apply_gamepad_state(&state);
+            if (parse_spp_packet(rx_buffer, &state)) {
+                apply_gamepad_state("spp", &state);
             } else {
-                ESP_LOGW(TAG, "invalid control packet");
+                ESP_LOGW(TAG, "invalid SPP control packet");
             }
             rx_len = 0;
         }
@@ -148,26 +241,161 @@ static void spp_callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
     switch (event) {
     case ESP_SPP_INIT_EVT:
         ESP_LOGI(TAG, "SPP initialized");
-        esp_bt_gap_set_device_name(DEVICE_NAME);
-        esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
-        esp_spp_start_srv(ESP_SPP_SEC_NONE, ESP_SPP_ROLE_SLAVE, 0, SPP_SERVER_NAME);
+        ESP_ERROR_CHECK(esp_bt_gap_set_device_name(DEVICE_NAME));
+        ESP_ERROR_CHECK(esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE));
+        ESP_ERROR_CHECK(esp_spp_start_srv(ESP_SPP_SEC_NONE, ESP_SPP_ROLE_SLAVE, 0, SPP_SERVER_NAME));
         break;
     case ESP_SPP_START_EVT:
         ESP_LOGI(TAG, "SPP server started");
         break;
     case ESP_SPP_SRV_OPEN_EVT:
+        spp_connected = true;
         ESP_LOGI(TAG, "SPP client connected");
         break;
     case ESP_SPP_CLOSE_EVT:
+        spp_connected = false;
         ESP_LOGI(TAG, "SPP client disconnected");
-        car_control_stop();
+        maybe_stop_after_disconnect();
         break;
     case ESP_SPP_DATA_IND_EVT:
-        feed_bytes(param->data_ind.data, param->data_ind.len);
+        feed_spp_bytes(param->data_ind.data, param->data_ind.len);
         break;
     default:
         break;
     }
+}
+
+static void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id, void *event_data)
+{
+    (void)handler_args;
+    (void)base;
+    esp_hidh_event_t event = (esp_hidh_event_t)id;
+    esp_hidh_event_data_t *param = (esp_hidh_event_data_t *)event_data;
+
+    switch (event) {
+    case ESP_HIDH_OPEN_EVENT:
+        hidh_opening = false;
+        if (param->open.status == ESP_OK) {
+            hidh_connected = true;
+            const uint8_t *bda = esp_hidh_dev_bda_get(param->open.dev);
+            ESP_LOGI(TAG, "HID open " ESP_BD_ADDR_STR " name=%s",
+                     ESP_BD_ADDR_HEX(bda), esp_hidh_dev_name_get(param->open.dev));
+            esp_hidh_dev_dump(param->open.dev, stdout);
+        } else {
+            hidh_connected = false;
+            ESP_LOGE(TAG, "HID open failed status=%s", esp_err_to_name(param->open.status));
+        }
+        ESP_ERROR_CHECK(esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE));
+        break;
+
+    case ESP_HIDH_INPUT_EVENT: {
+        gamepad_state_t state;
+        if (parse_hid_gamepad_report(param->input.data, param->input.length, &state)) {
+            apply_gamepad_state("hid", &state);
+        }
+        break;
+    }
+
+    case ESP_HIDH_BATTERY_EVENT:
+        ESP_LOGI(TAG, "HID battery level=%d%%", param->battery.level);
+        break;
+
+    case ESP_HIDH_CLOSE_EVENT:
+        hidh_opening = false;
+        hidh_connected = false;
+        ESP_LOGW(TAG, "HID close name=%s", esp_hidh_dev_name_get(param->close.dev));
+        maybe_stop_after_disconnect();
+        break;
+
+    default:
+        ESP_LOGD(TAG, "HID event=%" PRId32, id);
+        break;
+    }
+}
+
+static void scan_and_connect_hid_task(void *arg)
+{
+    (void)arg;
+
+    while (true) {
+        if (hidh_opening || hidh_connected) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        size_t results_len = 0;
+        esp_hid_scan_result_t *results = NULL;
+        esp_hid_scan_result_t *candidate = NULL;
+
+        ESP_LOGI(TAG, "Scanning for Bluetooth HID gamepads for %d seconds...", SCAN_SECONDS);
+        esp_err_t err = esp_hid_scan(SCAN_SECONDS, &results_len, &results);
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE));
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "HID scan failed: %s", esp_err_to_name(err));
+            vTaskDelay(pdMS_TO_TICKS(RESCAN_DELAY_MS));
+            continue;
+        }
+
+        ESP_LOGI(TAG, "HID scan results=%u", (unsigned)results_len);
+        for (esp_hid_scan_result_t *r = results; r; r = r->next) {
+            ESP_LOGI(TAG, "found transport=%s addr=" ESP_BD_ADDR_STR " rssi=%d usage=%s name=%s",
+                     r->transport == ESP_HID_TRANSPORT_BLE ? "BLE" : "BT",
+                     ESP_BD_ADDR_HEX(r->bda),
+                     r->rssi,
+                     esp_hid_usage_str(r->usage),
+                     r->name ? r->name : "");
+
+            if (candidate == NULL && looks_like_gamepad(r)) {
+                candidate = r;
+            }
+        }
+
+        if (candidate == NULL) {
+            candidate = results;
+        }
+
+        if (candidate) {
+            ESP_LOGI(TAG, "opening HID name=%s addr=" ESP_BD_ADDR_STR,
+                     candidate->name ? candidate->name : "",
+                     ESP_BD_ADDR_HEX(candidate->bda));
+            hidh_opening = true;
+            esp_hidh_dev_t *dev = esp_hidh_dev_open(candidate->bda, candidate->transport, candidate->ble.addr_type);
+            if (dev == NULL) {
+                hidh_opening = false;
+                ESP_LOGE(TAG, "failed to start opening HID device");
+            }
+            esp_hid_scan_results_free(results);
+            continue;
+        }
+
+        ESP_LOGW(TAG, "no HID device found, rescanning...");
+        esp_hid_scan_results_free(results);
+        vTaskDelay(pdMS_TO_TICKS(RESCAN_DELAY_MS));
+    }
+}
+
+static void start_spp_server(void)
+{
+    ESP_ERROR_CHECK(esp_spp_register_callback(spp_callback));
+
+    esp_spp_cfg_t spp_cfg = BT_SPP_DEFAULT_CONFIG();
+    spp_cfg.mode = ESP_SPP_MODE_CB;
+    ESP_ERROR_CHECK(esp_spp_enhanced_init(&spp_cfg));
+}
+
+static void start_hid_host(void)
+{
+#if CONFIG_BT_BLE_ENABLED
+    ESP_ERROR_CHECK(esp_ble_gattc_register_callback(esp_hidh_gattc_event_handler));
+#endif
+
+    esp_hidh_config_t config = {
+        .callback = hidh_callback,
+        .event_stack_size = 4096,
+        .callback_arg = NULL,
+    };
+    ESP_ERROR_CHECK(esp_hidh_init(&config));
+    xTaskCreate(scan_and_connect_hid_task, "hid_scan_connect", 6 * 1024, NULL, 2, NULL);
 }
 
 void app_main(void)
@@ -181,18 +409,10 @@ void app_main(void)
 
     ESP_ERROR_CHECK(car_control_init());
 
-    ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_BLE));
-
-    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
-    ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT));
-    ESP_ERROR_CHECK(esp_bluedroid_init());
-    ESP_ERROR_CHECK(esp_bluedroid_enable());
-    ESP_ERROR_CHECK(esp_spp_register_callback(spp_callback));
-
-    esp_spp_cfg_t spp_cfg = BT_SPP_DEFAULT_CONFIG();
-    spp_cfg.mode = ESP_SPP_MODE_CB;
-    ESP_ERROR_CHECK(esp_spp_enhanced_init(&spp_cfg));
+    ESP_LOGI(TAG, "Starting ESP32 SPP + HID gamepad receiver");
+    ESP_ERROR_CHECK(esp_hid_gap_init(HID_HOST_MODE));
+    start_hid_host();
+    start_spp_server();
 
     const uint8_t *addr = esp_bt_dev_get_address();
     ESP_LOGI(TAG, "Bluetooth device name: %s", DEVICE_NAME);
