@@ -37,6 +37,10 @@ class MainActivity : Activity() {
     private var receiverVideoRenderer: SurfaceViewRenderer? = null
     private var receiverLayout: LinearLayout? = null
     private var smartFollow: SmartFollowController? = null
+    private var objectDemoController: ObjectRecognitionDemoController? = null
+    private var objectDemoPreview: CameraPreviewView? = null
+    private var objectDemoOverlay: ObjectRecognitionOverlayView? = null
+    private var objectDemoStatus: TextView? = null
     private var webRtcCall: WebRtcCall? = null
     private lateinit var logView: TextView
     private var connectedReceiverHost: String? = null
@@ -59,9 +63,72 @@ class MainActivity : Activity() {
     private fun showRoleScreen() {
         val layout = rootLayout()
         layout.addView(title("CruiseCar $appVersionLabel"))
+        layout.addView(button("OpenCV 物品识别 Demo") { showObjectRecognitionDemoScreen() })
         layout.addView(button("发送端") { showSenderScreen() })
         layout.addView(button("接收端") { showReceiverScreen() })
         setContentView(withLog(layout))
+    }
+
+    private fun showObjectRecognitionDemoScreen() {
+        releaseObjectRecognitionDemo()
+
+        val layout = rootLayout()
+        layout.addView(title("OpenCV 物品识别 Demo"))
+
+        val previewFrame = FrameLayout(this)
+        val preview = CameraPreviewView(this)
+        val overlay = ObjectRecognitionOverlayView(this)
+        objectDemoPreview = preview
+        objectDemoOverlay = overlay
+        previewFrame.addView(preview, FrameLayout.LayoutParams(-1, -1))
+        previewFrame.addView(overlay, FrameLayout.LayoutParams(-1, -1))
+        layout.addView(previewFrame, LinearLayout.LayoutParams(-1, 0, 2.4f))
+
+        objectDemoStatus = TextView(this).apply {
+            text = "OpenCV demo idle"
+            textSize = 16f
+            gravity = Gravity.CENTER_HORIZONTAL
+        }
+        layout.addView(objectDemoStatus)
+        layout.addView(button("开始识别") { startObjectRecognitionDemo() })
+        layout.addView(button("停止识别") { stopObjectRecognitionDemo() })
+        layout.addView(button("返回") {
+            releaseObjectRecognitionDemo()
+            showRoleScreen()
+        })
+
+        setContentView(withLog(layout))
+        preview.start()
+    }
+
+    private fun startObjectRecognitionDemo() {
+        objectDemoController?.stop()
+        objectDemoController = ObjectRecognitionDemoController(
+            frameProvider = { objectDemoPreview?.snapshot(320, 240) },
+            onDetections = { detections ->
+                runOnUiThread {
+                    objectDemoOverlay?.setDetections(detections)
+                    objectDemoStatus?.text = "Detected ${detections.size} object(s)"
+                }
+            }
+        ).also { controller ->
+            controller.start { msg -> log(msg) }
+        }
+    }
+
+    private fun stopObjectRecognitionDemo() {
+        objectDemoController?.stop()
+        objectDemoController = null
+        objectDemoOverlay?.setDetections(emptyList())
+        objectDemoStatus?.text = "OpenCV demo stopped"
+    }
+
+    private fun releaseObjectRecognitionDemo() {
+        stopObjectRecognitionDemo()
+        objectDemoPreview?.stop()
+        objectDemoPreview = null
+        objectDemoOverlay = null
+        objectDemoStatus = null
     }
 
     private fun showSenderScreen() {
@@ -499,6 +566,7 @@ class MainActivity : Activity() {
         "${Thread.currentThread().name}/${Thread.currentThread().id}"
 
     override fun onDestroy() {
+        releaseObjectRecognitionDemo()
         stopReceiverServices()
         controlClient.close()
         bluetooth.close()

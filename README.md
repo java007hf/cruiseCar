@@ -34,6 +34,7 @@ The sender and receiver apps now share a 10-byte TCP control frame model:
 - Real-time video: sender sends a mode frame, then connects to the receiver WebRTC signaling server on port `42102`. The receiver publishes camera + microphone through WebRTC, and the sender renders the remote media.
 - Smart follow: sender sends a mode frame. The receiver starts camera preview + OpenCV color tracking locally and sends generated gamepad frames directly to ESP32, so the sender does not need to keep driving.
 - Smart patrol: reserved mode frame and UI entry. The receiver stops motion and logs the selected mode until route planning is added.
+- OpenCV object demo: app camera preview feeds frames into an OpenCV analyzer, detection results are rendered as rectangle overlays on top of the camera view. The analyzer consumes a `frameProvider` abstraction so the same camera frame path can later be shared with WebRTC sending.
 
 TCP ports:
 
