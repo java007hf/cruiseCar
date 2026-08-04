@@ -154,7 +154,11 @@ def llm_health_probe(sample_image_path, probe_prompt, expected_schema="boxes"):
         "content": [
             {"type": "text", "text": (
                 "Probe: you MUST reply with ONLY valid JSON following this exact schema, nothing else:\n"
-                f'{{"{expected_schema}": []}}\n'
+                f'{{"{expected_schema}": [[x1, y1, x2, y2], ...]}}\n'
+                "Rules for box elements:\n"
+                "  - Every box MUST be a plain 4-element NUMBER array: [x1, y1, x2, y2].\n"
+                "  - Never wrap a box as an OBJECT with nested keys like bbox / bbox_2d / points.\n"
+                "  - Coordinates are NORMALIZED floats in [0.0, 1.0] from the image top-left corner.\n"
                 f"User prompt: {probe_prompt}.\n"
                 f'If no object is visible reply exactly {{"{expected_schema}": []}} with no commentary.'
             )},
@@ -162,7 +166,7 @@ def llm_health_probe(sample_image_path, probe_prompt, expected_schema="boxes"):
         ],
     }]
     try:
-        raw = llm_chat(messages, temperature=0.0, max_tokens=256)
+        raw = llm_chat(messages, temperature=0.0, max_tokens=1024)
     except Exception as e:
         return False, (
             "🚨 本地 LLM 健康探测请求失败 (HTTP/chat 异常):\n"
@@ -174,12 +178,15 @@ def llm_health_probe(sample_image_path, probe_prompt, expected_schema="boxes"):
     if raw is None:
         return False, (
             "🚨 本地 LLM 健康探测返回 null / None content。\n"
-            "    常见原因: 当前模型是纯文本 gguf，不支持图片输入，但 capabilities 字段被服务端错误地标为了 multimodal。"
+            "    常见原因: 当前模型是纯文本 gguf，不支持图片输入，但 capabilities 字段被服务端错误地标为了 multimodal。\n"
+            "    另一个常见原因是请求的 max_tokens 太小（模型还没输出完就被截断为空），请重试。"
         )
     text = raw.strip()
     if not text:
         return False, _llm_vl_troubleshoot_text(
-            "🚨 本地 LLM 健康探测返回空字符串（没有任何文字输出）。",
+            "🚨 本地 LLM 健康探测返回空字符串（没有任何文字输出）。\n"
+            "    很可能是 max_tokens 太小导致响应被截断；本代码已在健康探测中提高到 1024；\n"
+            "    若仍为空，请检查 llama-server 侧是否有 token generation 报错 / 推理超时。",
             raw_len=0,
         )
     start, end = text.find("{"), text.rfind("}")
@@ -254,6 +261,8 @@ def llm_detect_boxes(image_path, user_description, max_retries=2):
         "- Coordinates are NORMALIZED floats in [0.0, 1.0], measured from the TOP-LEFT image corner. "
         "x is width axis, y is height axis. x1=left, y1=top, x2=right, y2=bottom.\n"
         "- Each box must satisfy 0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1.\n"
+        "- Each box in 'boxes' MUST be a FLAT 4-element NUMBER ARRAY — do NOT wrap a box inside a "
+        "JSON object with keys like 'bbox', 'bbox_2d', 'coords', 'points', 'xyxy', etc.\n"
         "- Box should TIGHTLY enclose the target, exclude unrelated background.\n"
         "- If multiple instances match the description, return all boxes.\n"
         "- If NO matching object is clearly visible, return {\"boxes\": []}.\n"
@@ -278,7 +287,7 @@ def llm_detect_boxes(image_path, user_description, max_retries=2):
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
                 ],
             }]
-            raw = llm_chat(messages, temperature=0.05 if attempt == 0 else 0.0, max_tokens=512)
+            raw = llm_chat(messages, temperature=0.0, max_tokens=1024)
             raw = _normalize_llm_content(raw)
             if raw is None:
                 last_error = f"attempt {attempt+1}: LLM returned None"
@@ -305,12 +314,45 @@ def llm_detect_boxes(image_path, user_description, max_retries=2):
             obj = json.loads(text)
             boxes = []
             for b in obj.get("boxes", []):
-                if not isinstance(b, (list, tuple)) or len(b) < 4:
+                coords = None
+                if isinstance(b, (list, tuple)) and len(b) >= 4:
+                    coords = b[:4]
+                elif isinstance(b, dict):
+                    # LLM sometimes wraps boxes in objects (despite system prompt). Try common keys:
+                    #   bbox_2d, bbox, box, coords, coordinates, points, xyxy
+                    for k in ("bbox_2d", "bbox", "box", "coords", "coordinates", "points", "xyxy"):
+                        v = b.get(k)
+                        if isinstance(v, (list, tuple)) and len(v) >= 4:
+                            coords = v[:4]
+                            break
+                    if coords is None:
+                        # Tolerate dict with plain numeric keys: {"0": x1, "1": y1, ...}
+                        try:
+                            coords = [float(b[str(i)]) for i in range(4)]
+                        except Exception:
+                            coords = None
+                if coords is None:
                     continue
                 try:
-                    x1, y1, x2, y2 = float(b[0]), float(b[1]), float(b[2]), float(b[3])
+                    x1, y1, x2, y2 = float(coords[0]), float(coords[1]), float(coords[2]), float(coords[3])
                 except (ValueError, TypeError):
                     continue
+                # Heuristic: detect pixel coordinates (e.g. the LLM returned 0..image size instead
+                # of 0..1). For a typical extraction-sized image, any coordinate > 1 means pixel scale;
+                # but we don't know the image size here, so we inspect the *distribution*: if any value
+                # exceeds 2 we treat the whole reply as pixel-scale and silently skip (caller will log
+                # last_error because the overall box count drops). For replies that use an intermediate
+                # percent-0..100 range (e.g. 0..99 floats) we also need to normalize.
+                if any(v > 1.5 for v in (x1, y1, x2, y2)):
+                    if all(v <= 100.0 for v in (x1, y1, x2, y2)):
+                        # Treat as 0..100 percent scale → divide by 100
+                        x1, y1, x2, y2 = x1 / 100.0, y1 / 100.0, x2 / 100.0, y2 / 100.0
+                    else:
+                        last_error = (
+                            f"attempt {attempt+1}: rejected box with out-of-range coords "
+                            f"({x1:.3g},{y1:.3g},{x2:.3g},{y2:.3g}); expected 0..1 normalized"
+                        )
+                        continue
                 if not (0.0 <= x1 < x2 <= 1.0 and 0.0 <= y1 < y2 <= 1.0):
                     continue
                 bw, bh = x2 - x1, y2 - y1
