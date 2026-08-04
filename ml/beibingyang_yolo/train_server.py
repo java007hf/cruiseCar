@@ -72,47 +72,142 @@ def llm_chat(messages, temperature=0.3, max_tokens=1024):
     return result["choices"][0]["message"]["content"]
 
 
-def generate_llm_prompts(class_name):
+def generate_llm_prompts(class_name, probe_context=None):
     try:
+        context_note = ""
+        if probe_context:
+            context_note = (
+                "\n\nAdditional visual context from sample frames:\n"
+                f"{probe_context}\n"
+                "Use the visual features above to make your prompts highly specific to this appearance."
+            )
         resp = llm_chat([
-            {"role": "system", "content": "You are a computer vision expert. Generate diverse text prompts for detecting objects in images."},
-            {"role": "user", "content": (
-                f"Generate 5-8 short text prompts (single words or brief phrases) for detecting a '{class_name}' "
-                f"in images. Include variations in naming, materials, shapes, and contexts. "
-                f"Return ONLY a comma-separated list of prompts, no explanation, no numbering."
+            {"role": "system", "content": (
+                "You are a computer vision and open-vocabulary object detection expert. "
+                "You output comma-separated English noun phrases optimized for YOLO-World "
+                "grounding. Produce 15-25 short, visually concrete phrases. Include color, "
+                "material, shape, size, typical contents, and angle variants. Prefer "
+                "individual object nouns, not sentences. If the user writes Chinese you MUST "
+                "translate first into the visual appearance concepts described, then expand. "
+                "Avoid brand names unless visually distinctive. Return comma-separated list "
+                "only. No numbering, no bullets, no sentences."
             )},
-        ], temperature=0.7, max_tokens=128)
-        prompts = [p.strip().rstrip(".") for p in resp.split(",") if p.strip()]
+            {"role": "user", "content": (
+                f"Target to detect (user description):\n---\n{class_name}\n---"
+                f"{context_note}\n\n"
+                "Generate 20 short visually-grounded English phrases that YOLO-World can "
+                "ground on images, comma separated, no other text."
+            )},
+        ], temperature=0.4, max_tokens=512)
+        prompts = [p.strip().rstrip(".") for p in resp.replace("\n", ",").split(",") if p.strip()]
         if prompts:
-            return list(dict.fromkeys(prompts[:8]))
-    except Exception:
-        pass
+            return list(dict.fromkeys(prompts[:25]))
+    except Exception as e:
+        print(f"[LLM] generate_llm_prompts failed: {e}")
     return generate_prompts(class_name)
 
 
-def llm_analyze_image(image_path, class_name):
+def llm_describe_target_in_frames(image_paths, user_description):
+    """LLM sees 2-4 real frames and describes what the target actually looks like.
+    Returns a plain-English visual description string used to refine prompts."""
     try:
-        with open(image_path, "rb") as f:
-            img_data = f.read()
-        b64 = base64.b64encode(img_data).decode("utf-8")
+        parts = []
+        for idx, p in enumerate(image_paths):
+            with open(p, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode("utf-8")
+            parts.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+            })
+            parts.append({"type": "text", "text": f"Frame {idx+1}."})
+        parts.append({"type": "text", "text": (
+            f"The user wants to detect objects matching this description:\n"
+            f"---\n{user_description}\n---\n\n"
+            "Looking at all frames above, identify the common object the user is describing. "
+            "Write a short visual description (80 words max) covering: its overall category "
+            "(can/bottle/box/device/etc), dominant color(s), shape, material, size, typical "
+            "features (lid/cap/labels/handle). If you cannot see it say 'not clearly visible'."
+        )})
+        resp = llm_chat([{"role": "user", "content": parts}], temperature=0.2, max_tokens=384)
+        return resp.strip() if resp else None
+    except Exception as e:
+        print(f"[LLM] describe target failed: {e}")
+        return None
 
-        prompt = (
-            f"Look at this image. Is there a '{class_name}' in the image? "
-            f"If yes, describe its appearance (color, shape, material, position). "
-            f"If no, say 'not present'. Keep answer under 50 words."
-        )
-        resp = llm_chat([
-            {
+
+def llm_detect_boxes(image_path, user_description, max_retries=2):
+    """Ask multimodal LLM directly for normalized 0..1 bounding boxes of the described target.
+
+    Returns list of (x1, y1, x2, y2) tuples (normalized) or empty list if nothing detected.
+    On any failure / parse error returns empty list.
+    """
+    system_prompt = (
+        "You are a precise image annotator. You will be shown an image and a target description. "
+        "Return ONLY a valid JSON object with this exact schema, and nothing else:\n"
+        '{"boxes": [[x1, y1, x2, y2], ...]}\n\n'
+        "Rules:\n"
+        "- Coordinates are NORMALIZED floats in [0.0, 1.0], measured from the TOP-LEFT image corner. "
+        "x is width axis, y is height axis. x1=left, y1=top, x2=right, y2=bottom.\n"
+        "- Each box must satisfy 0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1.\n"
+        "- Box should TIGHTLY enclose the target, exclude unrelated background.\n"
+        "- If multiple instances match the description, return all boxes.\n"
+        "- If NO matching object is clearly visible, return {\"boxes\": []}.\n"
+        "- Do NOT include Markdown fences (```), explanations, text, keys other than 'boxes', or extra whitespace."
+    )
+    user_prompt = (
+        f"Target object description (any language, you must understand semantically):\n"
+        f"---\n{user_description}\n---\n\n"
+        "Return only {\"boxes\": [[x1,y1,x2,y2], ...]} with normalized coordinates for every matching instance. "
+        'If nothing matches reply exactly {"boxes": []}.'
+    )
+
+    for attempt in range(max_retries + 1):
+        try:
+            with open(image_path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode("utf-8")
+            messages = [{
                 "role": "user",
                 "content": [
+                    {"type": "text", "text": system_prompt + "\n\n" + user_prompt},
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                    {"type": "text", "text": prompt},
                 ],
-            }
-        ], temperature=0.1, max_tokens=256)
-        return resp.strip()
-    except Exception:
-        return None
+            }]
+            raw = llm_chat(messages, temperature=0.05 if attempt == 0 else 0.0, max_tokens=512)
+            if raw is None:
+                continue
+            text = raw.strip()
+            # Strip markdown code fences if any
+            if text.startswith("```"):
+                text = text.strip("`")
+                if text.lower().startswith("json"):
+                    text = text[4:]
+                text = text.strip("`").strip()
+            # Try to find JSON object in messy output
+            start = text.find("{")
+            end = text.rfind("}")
+            if start >= 0 and end > start:
+                text = text[start:end + 1]
+            obj = json.loads(text)
+            boxes = []
+            for b in obj.get("boxes", []):
+                if not isinstance(b, (list, tuple)) or len(b) < 4:
+                    continue
+                try:
+                    x1, y1, x2, y2 = float(b[0]), float(b[1]), float(b[2]), float(b[3])
+                except (ValueError, TypeError):
+                    continue
+                if not (0.0 <= x1 < x2 <= 1.0 and 0.0 <= y1 < y2 <= 1.0):
+                    continue
+                bw, bh = x2 - x1, y2 - y1
+                if bw < 0.005 or bh < 0.005:
+                    continue
+                boxes.append((x1, y1, x2, y2))
+            return boxes
+        except Exception as e:
+            if attempt == max_retries:
+                print(f"[LLM] detect_boxes failed after {max_retries+1} tries on {image_path.name}: {e}")
+            continue
+    return []
 
 
 def update_status(step, progress, message="", log=None):
@@ -201,6 +296,65 @@ def generate_prompts(class_name):
     generic = ["object", "item", "thing"]
     for g in generic:
         prompts.append(f"{name} {g}")
+
+    category = _category_keywords(class_name)
+    if category is None and (
+        "can" in class_name.lower()
+        or "罐" in class_name
+        or "bottle" in class_name.lower()
+        or "瓶" in class_name
+    ):
+        if "can" in class_name.lower() or "罐" in class_name:
+            category = "can"
+        elif "bottle" in class_name.lower() or "瓶" in class_name:
+            category = "bottle"
+
+    visual_expansions = set()
+
+    if category == "can":
+        for p in CAN_SPECIFIC:
+            visual_expansions.add(p)
+        for c in ["orange", "red", "yellow", "silver", "gold"]:
+            for base in ["can", "beverage can", "aluminum can"]:
+                visual_expansions.add(f"{c} {base}")
+        for m in ["aluminum", "metal", "tin", "steel"]:
+            visual_expansions.add(f"{m} can")
+        for s in ["cylindrical", "round"]:
+            visual_expansions.add(f"{s} can")
+        visual_expansions.add("canned orange soda")
+        visual_expansions.add("canned drink with red cap")
+        visual_expansions.add("aluminum beverage can with pull tab")
+        visual_expansions.add("sealed beverage can")
+
+    if category == "bottle":
+        for p in BOTTLE_SPECIFIC:
+            visual_expansions.add(p)
+        for c in ["orange", "red", "clear", "transparent", "green", "blue"]:
+            for base in ["bottle", "beverage bottle"]:
+                visual_expansions.add(f"{c} {base}")
+        for m in ["plastic", "glass"]:
+            visual_expansions.add(f"{m} bottle")
+
+    if category == "box":
+        for p in BOX_SPECIFIC:
+            visual_expansions.add(p)
+        for c in ["brown", "white", "red"]:
+            visual_expansions.add(f"{c} cardboard box")
+
+    if category is None:
+        noun_suffix = words[-1] if words else name
+        for c in COMMON_COLORS[:8]:
+            visual_expansions.add(f"{c} {noun_suffix}")
+        for m in COMMON_MATERIALS[:6]:
+            visual_expansions.add(f"{m} {noun_suffix}")
+        for s in COMMON_SHAPES[:6]:
+            visual_expansions.add(f"{s} {noun_suffix}")
+        for g in generic:
+            visual_expansions.add(f"{name} shaped {g}")
+
+    for p in list(visual_expansions):
+        prompts.append(p)
+
     return list(dict.fromkeys(prompts))
 
 
@@ -258,192 +412,70 @@ def _llm_logged_image(label, img_path, class_name):
 
 
 def auto_label_frames(frames_dir, labels_dir, class_name, conf_threshold=0.10, use_llm=False):
-    global yolo_world_model
-    if yolo_world_model is None:
-        update_status("init_model", 5, "Loading YOLO-World model...", "Loading YOLO-World model for auto-labeling")
-        yolo_world_model = YOLOWorld("yolov8s-worldv2.pt")
+    """LLM-direct labeling: each frame is sent to the multimodal LLM together with the user's
+    description (any language). The LLM returns normalized bounding boxes directly, which we
+    convert into YOLO-format (cx, cy, bw, bh) label files. No YOLO-World, no probes, no retries."""
 
     image_files = sorted(frames_dir.glob("*.jpg"))
     total = len(image_files)
 
-    llm_is_on = use_llm and llm_available()
+    if not llm_available():
+        raise RuntimeError(
+            "LLM 服务 http://127.0.0.1:12345 不可用。"
+            "当前版本默认用大模型逐帧标注，请先启动本地 LLM 再试。"
+        )
 
-    if llm_is_on:
-        update_status("init_model", 10, "LLM 已连接，正在生成提示词...", "LLM: 调用 qwen3.5 生成增强提示词")
-        prompts = generate_llm_prompts(class_name)
-        if prompts:
-            update_status("init_model", 15, f"LLM 生成 {len(prompts)} 个提示词", f"LLM prompts: {', '.join(prompts)}")
+    update_status(
+        "init_model",
+        5,
+        f"使用大模型直接标注 (共 {total} 帧)",
+        f"LLM 标注模式: 逐帧发送图片 + 用户描述 '{class_name}' -> LLM 返回 JSON boxes 坐标",
+    )
+
+    labeled = 0
+    total_boxes = 0
+    parse_errors = 0
+    empty_frames = 0
+    t_total_start = time.time()
+
+    for idx, img_path in enumerate(image_files):
+        t0 = time.time()
+        boxes = llm_detect_boxes(str(img_path), class_name, max_retries=2)
+        dt = time.time() - t0
+
+        label_path = labels_dir / f"{img_path.stem}.txt"
+        if boxes:
+            with open(label_path, "w") as f:
+                for x1, y1, x2, y2 in boxes:
+                    cx = (x1 + x2) / 2.0
+                    cy = (y1 + y2) / 2.0
+                    bw = x2 - x1
+                    bh = y2 - y1
+                    f.write(f"0 {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
+            labeled += 1
+            total_boxes += len(boxes)
+            log_msg = f"Labeled: {img_path.name} ({len(boxes)} box, {dt:.1f}s)"
         else:
-            update_status("init_model", 15, "LLM 未返回提示词，回退到默认提示词", "LLM 调用失败，使用默认提示词")
-            prompts = generate_prompts(class_name)
+            # write empty file (consistent with YOLO negatives)
+            label_path.write_text("")
+            empty_frames += 1
+            log_msg = f"Skipped: {img_path.name} — LLM returned 0 boxes ({dt:.1f}s)"
 
-        if total > 0:
-            update_status("init_model", 18, "LLM: 先探查前 3 帧确认目标物...", "LLM: 视觉探查前 3 张图片，确认目标存在并优化类名")
-            probe_results = []
-            for idx in range(min(3, total)):
-                res = _llm_logged_image(f"探查{idx+1}", image_files[idx], class_name)
-                if res:
-                    probe_results.append(res)
-            if probe_results:
-                update_status(
-                    "init_model",
-                    22,
-                    "LLM 探查完成，基于结果生成专属提示词",
-                    f"探查结果样例: {probe_results[0][:70] if len(probe_results[0]) > 70 else probe_results[0]}",
-                )
-                try:
-                    extra = _llm_logged_chat(
-                        "refine_prompts",
-                        [
-                            {"role": "system", "content": "You are a computer vision prompt engineer. Return comma-separated short prompts only."},
-                            {"role": "user", "content": (
-                                f"Target class name: '{class_name}'. "
-                                f"Here are 3 visual descriptions of the target in video frames:\n"
-                                + "\n".join(f"- {r[:200]}" for r in probe_results)
-                                + "\nGenerate 5-8 short text prompts to help a text-conditioned detector find the target. "
-                                  "Use color, shape, material, brand-appearance if you can infer. "
-                                  "Return ONLY a comma-separated list, no numbering, no explanation."
-                            )},
-                        ],
-                        temperature=0.6,
-                        max_tokens=256,
-                    )
-                    if extra:
-                        extra_list = [p.strip().rstrip(".") for p in extra.split(",") if p.strip()]
-                        if extra_list:
-                            merged = list(dict.fromkeys(prompts + extra_list[:6]))
-                            update_status(
-                                "init_model",
-                                25,
-                                f"LLM 二次扩展: 得到 {len(merged)} 个提示词",
-                                f"Merged prompts: {', '.join(merged)}",
-                            )
-                            prompts = merged
-                except Exception:
-                    pass
-    else:
-        prompts = generate_prompts(class_name)
-        if use_llm:
-            update_status("init_model", 10, "LLM 未连接，使用默认提示词", "无法连接 http://127.0.0.1:12345 ，回退到默认提示词生成")
-
-    yolo_world_model.set_classes(prompts)
-
-    def _run_detection(threshold, threshold_label=""):
-        labeled = 0
-        llm_verified = 0
-        llm_denied = 0
-        llm_kept_anyway = 0
-        yolo_skipped = 0
-        llm_skipped = 0
-
-        for idx, img_path in enumerate(image_files):
-            results = yolo_world_model.predict(
-                str(img_path), save=False, verbose=False, conf=threshold
-            )
-            label_path = labels_dir / f"{img_path.stem}.txt"
-
-            has_detection = False
-            boxes_to_write = []
-
-            n_yolo_boxes = sum(
-                (len(r.boxes) if r.boxes is not None else 0) for r in results
-            )
-
-            for r in results:
-                if r.boxes is not None and len(r.boxes) > 0:
-                    for i in range(len(r.boxes)):
-                        conf = r.boxes.conf[i].item()
-                        xyxyn = r.boxes.xyxyn[i].tolist()
-                        cx = (xyxyn[0] + xyxyn[2]) / 2.0
-                        cy = (xyxyn[1] + xyxyn[3]) / 2.0
-                        bw = xyxyn[2] - xyxyn[0]
-                        bh = xyxyn[3] - xyxyn[1]
-
-                        keep_by_default = True
-                        need_llm = False
-
-                        if llm_is_on:
-                            if conf < 0.25:
-                                need_llm = True
-                            elif (idx % 15) == 0:
-                                need_llm = True
-
-                        if need_llm:
-                            analysis = _llm_logged_image(f"conf={conf:.2f}", img_path, class_name)
-                            llm_says_no = bool(
-                                analysis
-                                and "not present" in analysis.lower()
-                            )
-                            if llm_says_no and conf < 0.10:
-                                llm_denied += 1
-                            else:
-                                boxes_to_write.append((cx, cy, bw, bh))
-                                if not llm_says_no:
-                                    llm_verified += 1
-                                else:
-                                    llm_kept_anyway += 1
-                        else:
-                            if keep_by_default:
-                                boxes_to_write.append((cx, cy, bw, bh))
-
-            if boxes_to_write:
-                with open(label_path, "w") as f:
-                    for cx, cy, bw, bh in boxes_to_write:
-                        f.write(f"0 {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
-                has_detection = True
-            else:
-                label_path.write_text("")
-                if n_yolo_boxes == 0:
-                    yolo_skipped += 1
-                else:
-                    llm_skipped += 1
-
-            if has_detection:
-                labeled += 1
-
-            progress = int((idx + 1) / total * 100)
-            if has_detection:
-                log_msg = f"Labeled: {img_path.name} ({len(boxes_to_write)} box)"
-            else:
-                if yolo_skipped + llm_skipped > 0 and n_yolo_boxes == 0:
-                    why = "YOLO no box"
-                elif llm_skipped > 0 and n_yolo_boxes > 0:
-                    why = "LLM rejected all boxes"
-                else:
-                    why = "YOLO no box"
-                log_msg = f"Skipped: {img_path.name} — {why}"
-            if llm_is_on:
-                log_msg += (
-                    f" [LLM ✓{llm_verified} ✗{llm_denied} ~{llm_kept_anyway}]"
-                )
-            update_status(
-                "labeling",
-                progress,
-                f"Labeling frame {idx + 1}/{total} {threshold_label}",
-                log_msg,
-            )
-
-        return labeled, llm_verified, llm_denied, llm_kept_anyway
-
-    labeled, llm_verified, llm_denied, llm_kept_anyway = _run_detection(conf_threshold)
-
-    if labeled == 0 and conf_threshold > 0.03:
-        update_status("labeling", 0, f"No detections at conf={conf_threshold}, retrying at conf=0.05...",
-                      f"0 detections, lowering threshold from {conf_threshold} to 0.05")
-        labeled, llm_verified, llm_denied, llm_kept_anyway = _run_detection(0.05, "(retry conf=0.05)")
-
-    if labeled == 0 and conf_threshold > 0.01:
-        update_status("labeling", 0, f"Still no detections at conf=0.05, retrying at conf=0.02...",
-                      "0 detections, lowering threshold to 0.02")
-        labeled, llm_verified, llm_denied, llm_kept_anyway = _run_detection(0.02, "(retry conf=0.02)")
-
-    if llm_is_on:
+        progress = int((idx + 1) / total * 100)
         update_status(
             "labeling",
-            100,
-            f"LLM 辅助完成: 标注 {labeled}/{total} (✓{llm_verified} ~{llm_kept_anyway} ✗{llm_denied})",
-            f"LLM 总确认通过 {llm_verified} 次，默认保留 {llm_kept_anyway} 次，仅极低置信+明确否决 {llm_denied} 次",
+            progress,
+            f"LLM 标注 {idx + 1}/{total}",
+            log_msg,
         )
+
+    total_dt = time.time() - t_total_start
+    update_status(
+        "labeling",
+        100,
+        f"LLM 标注完成: {labeled}/{total} 帧有标注 (共 {total_boxes} 个框, {total_dt:.0f}s)",
+        f"有标注 {labeled}, 空帧 {empty_frames}, 总框数 {total_boxes}, 总耗时 {total_dt:.1f}s, 平均 {total_dt/max(1,total):.1f}s/帧",
+    )
 
     return labeled
 
@@ -920,10 +952,6 @@ HTML_PAGE = """
           <input type="number" id="fps" value="2" min="0.5" max="30" step="0.5">
         </div>
         <div class="form-group">
-          <label>置信度阈值</label>
-          <input type="number" id="confThreshold" value="0.10" min="0.01" max="0.95" step="0.01">
-        </div>
-        <div class="form-group">
           <label>训练/验证比例</label>
           <input type="number" id="trainRatio" value="0.9" min="0.5" max="0.95" step="0.05">
         </div>
@@ -956,10 +984,10 @@ HTML_PAGE = """
         </div>
       </div>
       <div class="form-group">
-        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
-          <input type="checkbox" id="useLLM" style="width:auto;">
-          <span>使用本地 LLM 辅助标注（qwen3.5 - 增强提示词 + 低置信度复核）</span>
-          <span id="llmStatus" style="font-size:0.75rem;padding:2px 8px;border-radius:10px;background:rgba(255,255,255,0.1);color:#888;"></span>
+        <label style="display:flex;align-items:center;gap:8px;">
+          <span id="llmStatus" style="font-size:0.8rem;padding:4px 10px;border-radius:10px;background:rgba(99,102,241,0.15);color:#a5b4fc;font-weight:500;">
+            🔍 默认使用本地 LLM (qwen3.5) 逐帧视觉标注 — 直接理解语义返回坐标
+          </span>
         </label>
       </div>
     </div>
@@ -1028,17 +1056,17 @@ async function checkLLMStatus() {
     const data = await resp.json();
     const badge = document.getElementById('llmStatus');
     if (data.available) {
-      badge.textContent = '● 已连接';
+      badge.textContent = '🔍 大模型已连接 (qwen3.5) — 逐帧视觉标注，直接理解语义返回坐标';
       badge.style.background = 'rgba(76,175,80,0.2)';
       badge.style.color = '#81c784';
     } else {
-      badge.textContent = '○ 未连接';
+      badge.textContent = '⚠️ 大模型未连接 — 请先启动 http://127.0.0.1:12345';
       badge.style.background = 'rgba(244,67,54,0.15)';
       badge.style.color = '#ef5350';
     }
   } catch(e) {
     const badge = document.getElementById('llmStatus');
-    badge.textContent = '○ 未连接';
+    badge.textContent = '⚠️ 大模型未连接 — 请先启动 http://127.0.0.1:12345';
     badge.style.background = 'rgba(244,67,54,0.15)';
     badge.style.color = '#ef5350';
   }
@@ -1113,9 +1141,7 @@ async function startPipeline() {
         batch: parseInt(document.getElementById('batch').value),
         device: document.getElementById('device').value,
         workers: 0,
-        conf_threshold: parseFloat(document.getElementById('confThreshold').value),
         train_ratio: parseFloat(document.getElementById('trainRatio').value),
-        use_llm: document.getElementById('useLLM').checked,
       })
     });
 
