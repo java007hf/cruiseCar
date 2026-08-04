@@ -8,34 +8,42 @@ sdkconfig
 sdkconfig.old
 managed_components/
 
-# ---- ml/: training artifacts (always ignore contents) ----
-# .venv / pycache / caches
+# ---- ml/: keep only uploaded source videos + final downloadable .pt exports;
+#      ignore all intermediate training artifacts and transient scratch data ----
+# Python environments / caches (always ignore)
 ml/**/.venv/
 ml/**/.venv*/
 ml/**/*.cache
 ml/**/__pycache__/
 
-# Run-specific outputs — all contents gitignored, but the canonical folder itself
-# stays tracked via its .gitkeep placeholder:
+# 1) extractions/  -> extracted frame JPGs + train/val split copies, regenerable.
 ml/extractions/**
 !ml/extractions/.gitkeep
 
-ml/uploads/**
-!ml/uploads/.gitkeep
-
+# 2) datasets/     -> labels/, dataset.yaml, dataset/{images,labels}/{train,val}/ etc, regenerable.
 ml/datasets/**
 !ml/datasets/.gitkeep
 
-ml/outputs/**
-!ml/outputs/.gitkeep
-
-# Base pre-trained checkpoints (yolo11n.pt, yolo26n.pt, yolov8s-worldv2.pt, …)
-# are stored here and gitignored because they can be re-downloaded.
+# 3) weights/      -> base pretrained checkpoints (yolo11n.pt, yolo26n.pt, yolov8s-worldv2.pt, …),
+#                     re-downloadable. Keep skeleton .gitkeep only.
 ml/weights/**
 !ml/weights/.gitkeep
 
-# Transient scratch pad (always gitignored).
+# 4) _tmp/         -> transient scratch pad, always ignore.
 ml/_tmp/**
+
+# 5) uploads/      -> KEEP the raw source videos the user uploaded (no ignore rule here,
+#                     so everything in uploads/ is tracked). Keep .gitkeep as skeleton only
+#                     if the folder is otherwise empty.
+# (no rule = files under uploads/ are tracked)
+
+# 6) outputs/      -> ignore ultralytics run logs ({run_id}/ subdirs, events, optimizers, …);
+#                     only keep top-level final .pt exports produced by the web UI as the
+#                     downloadable artifact (e.g. beibingyang_can_20260804_232133.pt) and the
+#                     skeleton .gitkeep.
+ml/outputs/**
+!ml/outputs/.gitkeep
+!ml/outputs/*.pt
 
 # ---- Root-level training leftovers from earlier iterations (fully gitignore, but only at repo root) ----
 /runs/
