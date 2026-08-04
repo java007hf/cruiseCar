@@ -80,6 +80,10 @@ def llm_detect_boxes(image_path, user_description, max_retries=2):
     Returns list of (x1, y1, x2, y2) tuples (normalized) or empty list if nothing detected.
     On any failure / parse error returns empty list.
     """
+    # Accept both str and Path; the debug log reads .name so we always normalize to Path.
+    if not isinstance(image_path, Path):
+        image_path = Path(image_path)
+
     system_prompt = (
         "You are a precise image annotator. You will be shown an image and a target description. "
         "Return ONLY a valid JSON object with this exact schema, and nothing else:\n"
@@ -100,6 +104,7 @@ def llm_detect_boxes(image_path, user_description, max_retries=2):
         'If nothing matches reply exactly {"boxes": []}.'
     )
 
+    last_error = None
     for attempt in range(max_retries + 1):
         try:
             with open(image_path, "rb") as f:
@@ -113,6 +118,7 @@ def llm_detect_boxes(image_path, user_description, max_retries=2):
             }]
             raw = llm_chat(messages, temperature=0.05 if attempt == 0 else 0.0, max_tokens=512)
             if raw is None:
+                last_error = f"attempt {attempt+1}: LLM returned None"
                 continue
             text = raw.strip()
             # Strip markdown code fences if any
@@ -121,11 +127,18 @@ def llm_detect_boxes(image_path, user_description, max_retries=2):
                 if text.lower().startswith("json"):
                     text = text[4:]
                 text = text.strip("`").strip()
+            # Defensive: guard against empty reply (e.g. LLM crashed, empty string response)
+            if not text:
+                last_error = f"attempt {attempt+1}: LLM reply was empty string"
+                continue
             # Try to find JSON object in messy output
             start = text.find("{")
             end = text.rfind("}")
             if start >= 0 and end > start:
                 text = text[start:end + 1]
+            else:
+                last_error = f"attempt {attempt+1}: no JSON object braces found in reply ({len(text)} chars)"
+                continue
             obj = json.loads(text)
             boxes = []
             for b in obj.get("boxes", []):
@@ -142,10 +155,14 @@ def llm_detect_boxes(image_path, user_description, max_retries=2):
                     continue
                 boxes.append((x1, y1, x2, y2))
             return boxes
-        except Exception as e:
-            if attempt == max_retries:
-                print(f"[LLM] detect_boxes failed after {max_retries+1} tries on {image_path.name}: {e}")
+        except json.JSONDecodeError as e:
+            last_error = f"attempt {attempt+1}: JSONDecodeError on reply: {e} (snippet: {text[:80]!r})"
             continue
+        except Exception as e:
+            last_error = f"attempt {attempt+1}: {type(e).__name__}: {e}"
+            continue
+    # All attempts exhausted
+    print(f"[LLM] detect_boxes failed after {max_retries+1} tries on {image_path.name}: {last_error}")
     return []
 
 
