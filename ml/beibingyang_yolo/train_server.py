@@ -204,30 +204,134 @@ def generate_prompts(class_name):
     return list(dict.fromkeys(prompts))
 
 
+def _llm_logged_chat(label, messages, temperature=0.3, max_tokens=1024):
+    if not llm_available():
+        update_status("labeling", 0, f"LLM [{label}]: 未连接，跳过", f"LLM {label} - 服务不可用，跳过")
+        return None
+    t0 = time.time()
+    try:
+        result = llm_chat(messages, temperature=temperature, max_tokens=max_tokens)
+        dt = time.time() - t0
+        preview = (result[:90] + "...") if len(result) > 90 else result
+        update_status(
+            "labeling",
+            0,
+            f"LLM [{label}]: 完成 ({dt:.1f}s)",
+            f"LLM {label} 耗时 {dt:.1f}s -> {preview}",
+        )
+        return result
+    except Exception as e:
+        dt = time.time() - t0
+        update_status(
+            "labeling",
+            0,
+            f"LLM [{label}]: 出错 ({dt:.1f}s)",
+            f"LLM {label} 出错 ({dt:.1f}s): {e}",
+        )
+        return None
+
+
+def _llm_logged_image(label, img_path, class_name):
+    if not llm_available():
+        return None
+    t0 = time.time()
+    try:
+        result = llm_analyze_image(img_path, class_name)
+        dt = time.time() - t0
+        preview = (result[:90] + "...") if result and len(result) > 90 else (result or "")
+        update_status(
+            "labeling",
+            0,
+            f"LLM 视觉复核 [{label}]: {dt:.1f}s",
+            f"LLM 视觉 {label} ({Path(img_path).name}) 耗时 {dt:.1f}s -> {preview}",
+        )
+        return result
+    except Exception as e:
+        dt = time.time() - t0
+        update_status(
+            "labeling",
+            0,
+            f"LLM 视觉复核 [{label}]: 出错 ({dt:.1f}s)",
+            f"LLM 视觉 {label} ({Path(img_path).name}) 出错 ({dt:.1f}s): {e}",
+        )
+        return None
+
+
 def auto_label_frames(frames_dir, labels_dir, class_name, conf_threshold=0.10, use_llm=False):
     global yolo_world_model
     if yolo_world_model is None:
         update_status("init_model", 5, "Loading YOLO-World model...", "Loading YOLO-World model for auto-labeling")
         yolo_world_model = YOLOWorld("yolov8s-worldv2.pt")
 
-    if use_llm and llm_available():
-        update_status("init_model", 10, "LLM available, generating enhanced prompts...", "Using LLM to generate enhanced detection prompts")
-        prompts = generate_llm_prompts(class_name)
-        update_status("init_model", 15, f"Generated {len(prompts)} prompts", f"LLM prompts: {', '.join(prompts)}")
-    else:
-        prompts = generate_prompts(class_name)
-        if use_llm:
-            update_status("init_model", 10, "LLM not available, using default prompts", "Falling back to default prompt generation")
-
-    yolo_world_model.set_classes(prompts)
-
     image_files = sorted(frames_dir.glob("*.jpg"))
     total = len(image_files)
 
+    llm_is_on = use_llm and llm_available()
+
+    if llm_is_on:
+        update_status("init_model", 10, "LLM 已连接，正在生成提示词...", "LLM: 调用 qwen3.5 生成增强提示词")
+        prompts = generate_llm_prompts(class_name)
+        if prompts:
+            update_status("init_model", 15, f"LLM 生成 {len(prompts)} 个提示词", f"LLM prompts: {', '.join(prompts)}")
+        else:
+            update_status("init_model", 15, "LLM 未返回提示词，回退到默认提示词", "LLM 调用失败，使用默认提示词")
+            prompts = generate_prompts(class_name)
+
+        if total > 0:
+            update_status("init_model", 18, "LLM: 先探查前 3 帧确认目标物...", "LLM: 视觉探查前 3 张图片，确认目标存在并优化类名")
+            probe_results = []
+            for idx in range(min(3, total)):
+                res = _llm_logged_image(f"探查{idx+1}", image_files[idx], class_name)
+                if res:
+                    probe_results.append(res)
+            if probe_results:
+                update_status(
+                    "init_model",
+                    22,
+                    "LLM 探查完成，基于结果生成专属提示词",
+                    f"探查结果样例: {probe_results[0][:70] if len(probe_results[0]) > 70 else probe_results[0]}",
+                )
+                try:
+                    extra = _llm_logged_chat(
+                        "refine_prompts",
+                        [
+                            {"role": "system", "content": "You are a computer vision prompt engineer. Return comma-separated short prompts only."},
+                            {"role": "user", "content": (
+                                f"Target class name: '{class_name}'. "
+                                f"Here are 3 visual descriptions of the target in video frames:\n"
+                                + "\n".join(f"- {r[:200]}" for r in probe_results)
+                                + "\nGenerate 5-8 short text prompts to help a text-conditioned detector find the target. "
+                                  "Use color, shape, material, brand-appearance if you can infer. "
+                                  "Return ONLY a comma-separated list, no numbering, no explanation."
+                            )},
+                        ],
+                        temperature=0.6,
+                        max_tokens=256,
+                    )
+                    if extra:
+                        extra_list = [p.strip().rstrip(".") for p in extra.split(",") if p.strip()]
+                        if extra_list:
+                            merged = list(dict.fromkeys(prompts + extra_list[:6]))
+                            update_status(
+                                "init_model",
+                                25,
+                                f"LLM 二次扩展: 得到 {len(merged)} 个提示词",
+                                f"Merged prompts: {', '.join(merged)}",
+                            )
+                            prompts = merged
+                except Exception:
+                    pass
+    else:
+        prompts = generate_prompts(class_name)
+        if use_llm:
+            update_status("init_model", 10, "LLM 未连接，使用默认提示词", "无法连接 http://127.0.0.1:12345 ，回退到默认提示词生成")
+
+    yolo_world_model.set_classes(prompts)
+
     def _run_detection(threshold, threshold_label=""):
-        nonlocal use_llm
         labeled = 0
         llm_verified = 0
+        llm_denied = 0
 
         for idx, img_path in enumerate(image_files):
             results = yolo_world_model.predict(
@@ -248,13 +352,22 @@ def auto_label_frames(frames_dir, labels_dir, class_name, conf_threshold=0.10, u
                         bw = xyxyn[2] - xyxyn[0]
                         bh = xyxyn[3] - xyxyn[1]
 
-                        if use_llm and llm_available() and conf < 0.4 and labeled > 0:
-                            analysis = llm_analyze_image(img_path, class_name)
+                        need_llm = False
+                        if llm_is_on:
+                            if idx < 5:
+                                need_llm = True
+                            elif conf < 0.4:
+                                need_llm = True
+                            elif (idx % 10) == 0:
+                                need_llm = True
+
+                        if need_llm:
+                            analysis = _llm_logged_image(f"conf={conf:.2f}", img_path, class_name)
                             if analysis and "not present" not in analysis.lower():
                                 boxes_to_write.append((cx, cy, bw, bh))
                                 llm_verified += 1
                             elif analysis and "not present" in analysis.lower():
-                                pass
+                                llm_denied += 1
                             else:
                                 boxes_to_write.append((cx, cy, bw, bh))
                         else:
@@ -273,8 +386,8 @@ def auto_label_frames(frames_dir, labels_dir, class_name, conf_threshold=0.10, u
 
             progress = int((idx + 1) / total * 100)
             log_msg = f"{'Labeled' if has_detection else 'Skipped'}: {img_path.name}"
-            if use_llm and llm_available():
-                log_msg += f" (LLM verified: {llm_verified})"
+            if llm_is_on:
+                log_msg += f" (LLM ✓{llm_verified} ✗{llm_denied})"
             update_status(
                 "labeling",
                 progress,
@@ -282,19 +395,27 @@ def auto_label_frames(frames_dir, labels_dir, class_name, conf_threshold=0.10, u
                 log_msg,
             )
 
-        return labeled, llm_verified
+        return labeled, llm_verified, llm_denied
 
-    labeled, llm_verified = _run_detection(conf_threshold)
+    labeled, llm_verified, llm_denied = _run_detection(conf_threshold)
 
     if labeled == 0 and conf_threshold > 0.03:
         update_status("labeling", 0, f"No detections at conf={conf_threshold}, retrying at conf=0.05...",
                       f"0 detections, lowering threshold from {conf_threshold} to 0.05")
-        labeled, llm_verified = _run_detection(0.05, "(retry conf=0.05)")
+        labeled, llm_verified, llm_denied = _run_detection(0.05, "(retry conf=0.05)")
 
     if labeled == 0 and conf_threshold > 0.01:
         update_status("labeling", 0, f"Still no detections at conf=0.05, retrying at conf=0.02...",
                       "0 detections, lowering threshold to 0.02")
-        labeled, llm_verified = _run_detection(0.02, "(retry conf=0.02)")
+        labeled, llm_verified, llm_denied = _run_detection(0.02, "(retry conf=0.02)")
+
+    if llm_is_on:
+        update_status(
+            "labeling",
+            100,
+            f"LLM 辅助完成: 标注 {labeled}/{total} (✓{llm_verified} ✗{llm_denied})",
+            f"LLM 总确认通过 {llm_verified} 次，驳回 {llm_denied} 次",
+        )
 
     return labeled
 
