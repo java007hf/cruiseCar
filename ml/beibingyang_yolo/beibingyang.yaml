@@ -1,4 +1,4 @@
-path: /Users/bytedance/BitsStudioProjects/cruiseCar/ml/beibingyang_yolo/dataset
+path: dataset
 train: images/train
 val: images/val
 names:
