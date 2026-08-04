@@ -71,7 +71,169 @@ def llm_chat(messages, temperature=0.3, max_tokens=1024):
     )
     with urllib.request.urlopen(req, timeout=120) as resp:
         result = json.loads(resp.read().decode("utf-8"))
-    return result["choices"][0]["message"]["content"]
+    choice = result["choices"][0]
+    msg = choice.get("message", choice)
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if content is None:
+        finish = choice.get("finish_reason")
+        if finish and finish not in ("stop", "eos", "length"):
+            raise RuntimeError(f"LLM refused or errored: finish_reason={finish!r}, message={msg!r}")
+    # Normalize content (collapse list-of-content-parts, coerce None to empty-ish, etc.)
+    # into either a plain str or None. Normalization is shared with the mock-friendly
+    # helper llm_run so tests / callers get consistent behavior regardless of whether
+    # llm_chat was patched by a mock that returns raw list / dict / None.
+    return _normalize_llm_content(content, choice=choice, msg=msg)
+
+
+def _normalize_llm_content(content, *, choice=None, msg=None):
+    """Shared post-processing for raw LLM content returned from chat/completions.
+
+    Accepts:
+      None                        → None (preserves "LLM returned null" semantics)
+      list of content-parts dicts → joined text portion, "" if no text parts
+      any dict                    → try msg['content'] / msg['text'], else str()
+      anything else               → str() coercion
+
+    The normalization runs both for real llm_chat HTTP responses and for the value
+    returned by any monkeypatched llm_chat in tests, so callers (health_probe,
+    detect_boxes) can safely assume the output is either str or None.
+    """
+    if isinstance(content, list):
+        parts = []
+        for c in content:
+            if isinstance(c, dict):
+                if c.get("type") == "text" and isinstance(c.get("text"), str):
+                    parts.append(c["text"])
+                elif isinstance(c.get("text"), str):
+                    parts.append(c["text"])
+            elif isinstance(c, str):
+                parts.append(c)
+        return "".join(parts)
+    if content is None:
+        return None
+    if not isinstance(content, str):
+        if isinstance(content, dict):
+            alt = content.get("text") or content.get("content")
+            if isinstance(alt, str):
+                return alt
+        return str(content)
+    return content
+
+
+def llm_health_probe(sample_image_path, probe_prompt, expected_schema="boxes"):
+    """Send a known tiny probe image + prompt to the local multimodal LLM and verify that
+    it returns a parseable JSON payload matching the expected schema.
+
+    Returns (ok: bool, detail: str) — ok=True only if the reply fully parses into the schema
+    and is not empty / null / no-braces junk. When ok=False the detail string contains an
+    actionable troubleshooting checklist for llama.cpp multimodal setups (the #1 failure is
+    loading a text-only qwen3.5.gguf without --mmproj or the -VL variant gguf).
+    """
+    if sample_image_path is None:
+        # Build a 2x2 solid-color JPEG in-memory so we don't need any on-disk fixture.
+        import io
+        import struct
+        # Minimal 2x2 RGB JPEG payload (a single 8x8 MCU; content doesn't matter, we just
+        # want the server-side vision pipeline to actually be exercised and reply non-empty).
+        tiny = (
+            b'\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00'
+            b'\xff\xdb\x00C\x00' + bytes([8]) * 64 +
+            b'\xff\xc0\x00\x0b\x08\x00\x02\x00\x02\x01\x01\x11\x00'
+            b'\xff\xc4\x00\x14\x00\x01' + bytes(18) +
+            b'\xff\xc4\x00\x14\x10\x01' + bytes(18) +
+            b'\xff\xda\x00\x08\x01\x01\x00\x00?\x00\xd2\xcf \xff\xd9'
+        )
+        tmp = io.BytesIO(tiny)
+        b64 = base64.b64encode(tmp.getvalue()).decode("ascii")
+    else:
+        sample_image_path = Path(sample_image_path)
+        with open(sample_image_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": (
+                "Probe: you MUST reply with ONLY valid JSON following this exact schema, nothing else:\n"
+                f'{{"{expected_schema}": []}}\n'
+                f"User prompt: {probe_prompt}.\n"
+                f'If no object is visible reply exactly {{"{expected_schema}": []}} with no commentary.'
+            )},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+        ],
+    }]
+    try:
+        raw = llm_chat(messages, temperature=0.0, max_tokens=256)
+    except Exception as e:
+        return False, (
+            "🚨 本地 LLM 健康探测请求失败 (HTTP/chat 异常):\n"
+            f"    {type(e).__name__}: {e}\n"
+            "    请先确认 llama-server 能正常接收带图片的请求。"
+        )
+    # Ensure mock callers or weird server responses don't escape normalization.
+    raw = _normalize_llm_content(raw)
+    if raw is None:
+        return False, (
+            "🚨 本地 LLM 健康探测返回 null / None content。\n"
+            "    常见原因: 当前模型是纯文本 gguf，不支持图片输入，但 capabilities 字段被服务端错误地标为了 multimodal。"
+        )
+    text = raw.strip()
+    if not text:
+        return False, _llm_vl_troubleshoot_text(
+            "🚨 本地 LLM 健康探测返回空字符串（没有任何文字输出）。",
+            raw_len=0,
+        )
+    start, end = text.find("{"), text.rfind("}")
+    if not (start >= 0 and end > start):
+        snippet = text[:200]
+        return False, _llm_vl_troubleshoot_text(
+            f"🚨 本地 LLM 返回了非 JSON 内容（没有 {{/}} 大括号），实际回复 ({len(text)} chars):\n    {snippet!r}",
+            raw_len=len(text),
+            raw_snippet=snippet,
+        )
+    json_candidate = text[start:end + 1]
+    try:
+        obj = json.loads(json_candidate)
+    except json.JSONDecodeError as e:
+        return False, _llm_vl_troubleshoot_text(
+            f"🚨 本地 LLM 返回的 JSON 解析失败: {e}\n    内容片段: {json_candidate[:200]!r}",
+            raw_len=len(text),
+        )
+    if expected_schema and not isinstance(obj, dict):
+        return False, f"🚨 健康探测返回 JSON 顶层不是 object: {obj!r}"
+    return True, "健康探测 OK"
+
+
+def _llm_vl_troubleshoot_text(summary, raw_len=None, raw_snippet=None):
+    """Return a consolidated multi-line troubleshooting block for the #1 llama.cpp VL failure modes."""
+    lines = [summary, "排查清单（按可能性从高到低）:"]
+    lines.append(
+        "  1) 模型是否真正加载了 VISION 版本？当前 /v1/models 显示 name=qwen3.5，通常意味着这是 TEXT-ONLY "
+        "(纯文本) 8B/14B/32B gguf；你需要下载并加载文件名里明确带 -VL 的 gguf，例如 "
+        "Qwen3.5-VL-8B-xxx.gguf (不是 Qwen3.5-8B-xxx.gguf)。"
+    )
+    lines.append(
+        "  2) 是否传了 --mmproj？对于 llama.cpp 视觉模型，若视觉权重与 LLM 权重分两个 gguf，"
+        "必须在启动 server 时加 --mmproj <qwen3.5-vl-mmproj-f16.gguf>；少了这个参数 LLM 会完全看不到图片，"
+        "典型表现就是回复空字符串 / 只按文字 prompt 随便回答。"
+    )
+    lines.append(
+        "  3) 检查 llama.cpp 启动日志：出现 'loaded mmproj' / 'multimodal adapter loaded' 之类字样才算成功启用视觉；"
+        "如果 server 只打印了加载文本模型的日志，那就是参数 / 模型文件本身对不上。"
+    )
+    lines.append(
+        "  4) llama.cpp 版本过旧？较新版本才在 /v1/chat/completions 的 OpenAI 兼容层里正确支持 "
+        "'{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,...\"}}' 这种入参结构；"
+        "老版本会静默丢弃图片内容。建议更新到近 1~2 个月内的 llama.cpp build。"
+    )
+    lines.append(
+        "  5) 如使用 API-Proxy/其它中间件转发 12345，请确认它们不会剥离 content 数组里的 image_url 元素，"
+        "只保留 text 部分（这也是常见的空回复来源）。"
+    )
+    if raw_len is not None:
+        lines.append(f"  本次健康探测返回原始内容长度: {raw_len}")
+    if raw_snippet:
+        lines.append(f"  本次健康探测返回原始内容片段: {raw_snippet!r}")
+    return "\n".join(lines)
 
 
 def llm_detect_boxes(image_path, user_description, max_retries=2):
@@ -117,6 +279,7 @@ def llm_detect_boxes(image_path, user_description, max_retries=2):
                 ],
             }]
             raw = llm_chat(messages, temperature=0.05 if attempt == 0 else 0.0, max_tokens=512)
+            raw = _normalize_llm_content(raw)
             if raw is None:
                 last_error = f"attempt {attempt+1}: LLM returned None"
                 continue
@@ -261,6 +424,32 @@ def auto_label_frames(frames_dir, labels_dir, class_name):
         5,
         f"使用大模型直接标注 (共 {total} 帧)",
         f"LLM 标注模式: 逐帧发送图片 + 用户描述 '{class_name}' -> LLM 返回 JSON boxes 坐标",
+    )
+
+    # ------------------------------------------------------------------
+    # Health probe (fail-fast): send the first real frame to the LLM before
+    # starting the N-frame loop. If the server is running a TEXT-ONLY model
+    # (e.g. user loaded qwen3.5.gguf without the -VL variant / without
+    # --mmproj) we'll get an empty / junk reply and can abort immediately
+    # with actionable diagnostics instead of burning N retries × N frames.
+    # ------------------------------------------------------------------
+    sample = image_files[0] if image_files else None
+    probe_desc = class_name or "any visible object"
+    probe_ok, probe_detail = llm_health_probe(sample, probe_desc, expected_schema="boxes")
+    if not probe_ok:
+        print(probe_detail)
+        update_status(
+            "failed", 0, "LLM 健康探测失败，已中止。",
+            probe_detail,
+        )
+        raise RuntimeError(
+            "LLM 健康探测失败（本地大模型看起来没有真正加载视觉能力）。\n"
+            + probe_detail
+        )
+    update_status(
+        "labeling",
+        7,
+        f"LLM 健康探测通过，开始逐帧标注 ({total} frames)",
     )
 
     labeled = 0
