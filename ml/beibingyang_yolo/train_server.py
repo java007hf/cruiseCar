@@ -204,7 +204,7 @@ def generate_prompts(class_name):
     return list(dict.fromkeys(prompts))
 
 
-def auto_label_frames(frames_dir, labels_dir, class_name, conf_threshold=0.25, use_llm=False):
+def auto_label_frames(frames_dir, labels_dir, class_name, conf_threshold=0.10, use_llm=False):
     global yolo_world_model
     if yolo_world_model is None:
         update_status("init_model", 5, "Loading YOLO-World model...", "Loading YOLO-World model for auto-labeling")
@@ -223,61 +223,78 @@ def auto_label_frames(frames_dir, labels_dir, class_name, conf_threshold=0.25, u
 
     image_files = sorted(frames_dir.glob("*.jpg"))
     total = len(image_files)
-    labeled = 0
-    llm_verified = 0
 
-    for idx, img_path in enumerate(image_files):
-        results = yolo_world_model.predict(
-            str(img_path), save=False, verbose=False, conf=conf_threshold
-        )
-        label_path = labels_dir / f"{img_path.stem}.txt"
+    def _run_detection(threshold, threshold_label=""):
+        nonlocal use_llm
+        labeled = 0
+        llm_verified = 0
 
-        has_detection = False
-        boxes_to_write = []
+        for idx, img_path in enumerate(image_files):
+            results = yolo_world_model.predict(
+                str(img_path), save=False, verbose=False, conf=threshold
+            )
+            label_path = labels_dir / f"{img_path.stem}.txt"
 
-        for r in results:
-            if r.boxes is not None and len(r.boxes) > 0:
-                for i in range(len(r.boxes)):
-                    conf = r.boxes.conf[i].item()
-                    xyxyn = r.boxes.xyxyn[i].tolist()
-                    cx = (xyxyn[0] + xyxyn[2]) / 2.0
-                    cy = (xyxyn[1] + xyxyn[3]) / 2.0
-                    bw = xyxyn[2] - xyxyn[0]
-                    bh = xyxyn[3] - xyxyn[1]
+            has_detection = False
+            boxes_to_write = []
 
-                    if use_llm and llm_available() and conf < 0.4 and labeled > 0:
-                        analysis = llm_analyze_image(img_path, class_name)
-                        if analysis and "not present" not in analysis.lower():
-                            boxes_to_write.append((cx, cy, bw, bh))
-                            llm_verified += 1
-                        elif analysis and "not present" in analysis.lower():
-                            pass
+            for r in results:
+                if r.boxes is not None and len(r.boxes) > 0:
+                    for i in range(len(r.boxes)):
+                        conf = r.boxes.conf[i].item()
+                        xyxyn = r.boxes.xyxyn[i].tolist()
+                        cx = (xyxyn[0] + xyxyn[2]) / 2.0
+                        cy = (xyxyn[1] + xyxyn[3]) / 2.0
+                        bw = xyxyn[2] - xyxyn[0]
+                        bh = xyxyn[3] - xyxyn[1]
+
+                        if use_llm and llm_available() and conf < 0.4 and labeled > 0:
+                            analysis = llm_analyze_image(img_path, class_name)
+                            if analysis and "not present" not in analysis.lower():
+                                boxes_to_write.append((cx, cy, bw, bh))
+                                llm_verified += 1
+                            elif analysis and "not present" in analysis.lower():
+                                pass
+                            else:
+                                boxes_to_write.append((cx, cy, bw, bh))
                         else:
                             boxes_to_write.append((cx, cy, bw, bh))
-                    else:
-                        boxes_to_write.append((cx, cy, bw, bh))
 
-        if boxes_to_write:
-            with open(label_path, "w") as f:
-                for cx, cy, bw, bh in boxes_to_write:
-                    f.write(f"0 {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
-            has_detection = True
-        else:
-            label_path.write_text("")
+            if boxes_to_write:
+                with open(label_path, "w") as f:
+                    for cx, cy, bw, bh in boxes_to_write:
+                        f.write(f"0 {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
+                has_detection = True
+            else:
+                label_path.write_text("")
 
-        if has_detection:
-            labeled += 1
+            if has_detection:
+                labeled += 1
 
-        progress = int((idx + 1) / total * 100)
-        log_msg = f"{'Labeled' if has_detection else 'Skipped'}: {img_path.name}"
-        if use_llm and llm_available():
-            log_msg += f" (LLM verified: {llm_verified})"
-        update_status(
-            "labeling",
-            progress,
-            f"Labeling frame {idx + 1}/{total}",
-            log_msg,
-        )
+            progress = int((idx + 1) / total * 100)
+            log_msg = f"{'Labeled' if has_detection else 'Skipped'}: {img_path.name}"
+            if use_llm and llm_available():
+                log_msg += f" (LLM verified: {llm_verified})"
+            update_status(
+                "labeling",
+                progress,
+                f"Labeling frame {idx + 1}/{total} {threshold_label}",
+                log_msg,
+            )
+
+        return labeled, llm_verified
+
+    labeled, llm_verified = _run_detection(conf_threshold)
+
+    if labeled == 0 and conf_threshold > 0.03:
+        update_status("labeling", 0, f"No detections at conf={conf_threshold}, retrying at conf=0.05...",
+                      f"0 detections, lowering threshold from {conf_threshold} to 0.05")
+        labeled, llm_verified = _run_detection(0.05, "(retry conf=0.05)")
+
+    if labeled == 0 and conf_threshold > 0.01:
+        update_status("labeling", 0, f"Still no detections at conf=0.05, retrying at conf=0.02...",
+                      "0 detections, lowering threshold to 0.02")
+        labeled, llm_verified = _run_detection(0.02, "(retry conf=0.02)")
 
     return labeled
 
@@ -354,6 +371,15 @@ def run_pipeline(video_path, class_name, config):
         labeled_count = auto_label_frames(frames_dir, labels_dir, class_name, conf_threshold=conf_threshold, use_llm=use_llm)
         update_status("labeling", 100, f"Labeled {labeled_count}/{frame_count} frames", f"Labeling complete: {labeled_count}/{frame_count} frames with detections")
 
+        if labeled_count == 0:
+            raise RuntimeError(
+                f"No objects detected in any frame. Try: "
+                f"1) use a more specific target name, "
+                f"2) lower the confidence threshold, "
+                f"3) use LLM-assisted labeling, "
+                f"4) ensure the object is clearly visible in the video."
+            )
+
         update_status("splitting", 0, "Splitting dataset into train/val...", f"Train ratio: {train_ratio}")
         split_dataset(frames_dir, labels_dir, train_ratio=train_ratio)
 
@@ -361,10 +387,10 @@ def run_pipeline(video_path, class_name, config):
             if d.exists():
                 shutil.rmtree(str(d))
 
-        shutil.copytree(str(frames_dir.parent / "train"), str(dataset_dir / "images" / "train"))
-        shutil.copytree(str(frames_dir.parent / "val"), str(dataset_dir / "images" / "val"))
-        shutil.copytree(str(labels_dir.parent / "train"), str(dataset_dir / "labels" / "train"))
-        shutil.copytree(str(labels_dir.parent / "val"), str(dataset_dir / "labels" / "val"))
+        shutil.copytree(str(frames_dir / "train"), str(dataset_dir / "images" / "train"))
+        shutil.copytree(str(frames_dir / "val"), str(dataset_dir / "images" / "val"))
+        shutil.copytree(str(labels_dir / "train"), str(dataset_dir / "labels" / "train"))
+        shutil.copytree(str(labels_dir / "val"), str(dataset_dir / "labels" / "val"))
 
         yaml_path = run_dir / "dataset.yaml"
         generate_yaml(dataset_dir, class_name, yaml_path)
@@ -746,7 +772,7 @@ HTML_PAGE = """
         </div>
         <div class="form-group">
           <label>置信度阈值</label>
-          <input type="number" id="confThreshold" value="0.25" min="0.05" max="0.95" step="0.05">
+          <input type="number" id="confThreshold" value="0.10" min="0.01" max="0.95" step="0.01">
         </div>
         <div class="form-group">
           <label>训练/验证比例</label>
