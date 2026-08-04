@@ -56,32 +56,22 @@ The sender and receiver apps now share a 10-byte TCP control frame model:
 │   ├── main/
 │   └── scripts/
 └── ml/
-    └── beibingyang_yolo/
-        ├── auto_label_orange.py     # helper used to bootstrap labels from the orange can region
-        ├── train_server.py          # web-based training platform (Flask + YOLO-World + LLM)
-        ├── beibingyang.yaml         # Ultralytics dataset config
-        ├── dataset/
-        │   ├── images/train/
-        │   ├── images/val/
-        │   ├── labels/train/
-        │   └── labels/val/
-        ├── contact/                 # contact sheets and label-check previews
-        ├── frames/                  # local generated frames, ignored by Git
-        ├── labels/                  # local generated labels before train/val split, ignored by Git
-        └── preview/                 # per-frame label preview images
+    ├── train_server.py          # web-based training platform (Flask + multimodal LLM + YOLO)
+    ├── auto_label_orange.py     # helper used to bootstrap labels from the orange can region
+    └── beibingyang.yaml         # template Ultralytics dataset config
 ```
 
 Training environments, intermediate extraction outputs, and run outputs are ignored by Git:
 
 ```text
 ml/**/.venv*/
-ml/beibingyang_yolo/frames/
-ml/beibingyang_yolo/labels/
-ml/beibingyang_yolo/preview/
-ml/beibingyang_yolo/_uploads/
-ml/beibingyang_yolo/_dataset/
-ml/beibingyang_yolo/_outputs/
-ml/beibingyang_yolo/_tmp/
+ml/**/frames/
+ml/**/labels/
+ml/**/preview/
+ml/_uploads/
+ml/_dataset/
+ml/_outputs/
+ml/_tmp/
 ml/**/runs*/
 ml/**/__pycache__/
 runs/
@@ -194,38 +184,36 @@ The current object demo uses a one-class YOLO detector for the `beibingyang_can`
 
 Training data flow:
 
-1. Extract frames from the source video into `ml/beibingyang_yolo/frames/`.
-2. Bootstrap labels with `ml/beibingyang_yolo/auto_label_orange.py`.
-3. Check `ml/beibingyang_yolo/contact/labels_sheet.jpg` and the individual files in `ml/beibingyang_yolo/preview/`.
-4. Split labeled images into `ml/beibingyang_yolo/dataset/images/train`, `images/val`, `labels/train`, and `labels/val`.
-5. Train YOLO with `ml/beibingyang_yolo/beibingyang.yaml`.
-6. Export the best checkpoint to LiteRT/TFLite.
-7. Copy the exported model to `android-app/app/src/main/assets/detect.tflite`.
+1. Extract frames from the source video into `ml/_dataset/{run_id}/frames/`.
+2. Send each frame + your textual description (any language) to the local multimodal LLM at `http://127.0.0.1:12345`; the LLM returns normalized bounding boxes directly.
+3. Labels are written in YOLO format to `ml/_dataset/{run_id}/labels/`; 90% / 10% are split into train and val.
+4. Train YOLO with a generated `dataset.yaml`.
+5. Export the best checkpoint to LiteRT/TFLite and copy it to `android-app/app/src/main/assets/detect.tflite`.
 
-Useful commands from this training run:
+Useful commands from this training run (run from `ml/`):
 
 ```bash
-# Train from the YOLO11 nano checkpoint.
-ml/beibingyang_yolo/.venv311/bin/yolo detect train \
+# Train from the YOLO11 nano checkpoint (manual fallback, not needed if using the web UI).
+.\.venv\Scripts\yolo detect train \
   model=yolo11n.pt \
-  data=ml/beibingyang_yolo/beibingyang.yaml \
+  data=beibingyang.yaml \
   imgsz=416 \
   epochs=60 \
   batch=4 \
   device=cpu \
-  project=ml/beibingyang_yolo/runs \
+  project=runs \
   name=beibingyang_yolo11n \
   exist_ok=True
 
 # Export the best checkpoint. Ultralytics now maps tflite export to LiteRT.
-ml/beibingyang_yolo/.venv311/bin/yolo export \
-  model=runs/detect/ml/beibingyang_yolo/runs/beibingyang_yolo11n/weights/best.pt \
+.\.venv\Scripts\yolo export \
+  model=runs/detect/runs/beibingyang_yolo11n/weights/best.pt \
   format=litert \
   imgsz=416
 
 # Install the exported model into the Android app.
-cp runs/detect/ml/beibingyang_yolo/runs/beibingyang_yolo11n/weights/best.tflite \
-  android-app/app/src/main/assets/detect.tflite
+cp runs/detect/runs/beibingyang_yolo11n/weights/best.tflite `
+  ..\android-app\app\src\main\assets\detect.tflite
 ```
 
 The generated model currently has this tensor contract:
@@ -241,18 +229,18 @@ The initial training set contains 53 frames from one video, so it is good for va
 
 ## Web-Based Training Platform
 
-`ml/beibingyang_yolo/train_server.py` is a one-file Flask app that wraps the entire extract-label-train pipeline into a browser UI. Instead of running CLI commands manually, you upload a video, type the object name, and click one button.
+`ml/train_server.py` is a one-file Flask app that wraps the entire extract-label-train pipeline into a browser UI. Instead of running CLI commands manually, you upload a video, describe the object you want to track (any language, including Chinese like "红色盖子的罐子"), and click one button.
 
 ### Prerequisites
 
-The existing `.venv` already has `ultralytics`, `opencv-python`, `torch` (CUDA), and `flask` installed. The app also downloads `yolov8s-worldv2.pt` (YOLO-World) and `yolo11n.pt` on first run.
+The existing `.venv` under `ml/` already has `ultralytics`, `opencv-python`, `torch` (CUDA), and `flask` installed. The app uses `yolo11n.pt` as the base training checkpoint (downloaded on first run if missing).
 
-Optional: a local LLM server (e.g. `llama.cpp` with `qwen3.5`) at `http://127.0.0.1:12345` for enhanced auto-labeling. The app works without it.
+**Required**: a local multimodal LLM server (e.g. `llama.cpp` server with a VL-capable model such as `qwen3.5-VL`) running at `http://127.0.0.1:12345` and exposing the standard `/v1/chat/completions` API with image input support. The labeling step sends every frame to the LLM together with your textual description, and the LLM returns normalized bounding boxes directly.
 
 ### Start the server
 
 ```powershell
-cd ml/beibingyang_yolo
+cd ml
 .\.venv\Scripts\python.exe train_server.py
 ```
 
@@ -261,15 +249,14 @@ Open `http://127.0.0.1:5000` in the browser.
 ### Usage
 
 1. **Upload video** — drag and drop or click the upload area (MP4, AVI, MOV, MKV, WEBM, etc.).
-2. **Enter the target object name** — use English, e.g. `beibingyang_can`, `bottle`, `red_car`.
-3. **(Optional) Advanced settings** — adjust frame extraction FPS, confidence threshold, train/val split ratio, epochs, image size, batch size, and device.
-4. **(Optional) Enable LLM** — check "use local LLM" to let `qwen3.5` generate richer detection prompts and verify low-confidence detections visually.
-5. **Click "Start Training"** — the pipeline runs in the background with real-time progress:
+2. **Enter the target description** — any language works. E.g. `beibingyang_can`, `bottle with red cap`, `橙色带拉环的饮料罐`, `红色盖子的罐子`. The more visual details you give (colors, shape, material), the better the LLM will place boxes.
+3. **(Optional) Advanced settings** — adjust frame extraction FPS, train/val split ratio, epochs, image size, batch size, and device.
+4. **Click "Start Training"** — the pipeline runs in the background with real-time progress:
    - **Extract frames** — OpenCV extracts keyframes at the configured FPS.
-   - **Auto-label** — YOLO-World detects the target object using text prompts and generates YOLO format labels. If LLM is enabled, it enhances prompts and verifies uncertain detections.
-   - **Split dataset** — frames are split into train/val sets and a `dataset.yaml` is generated.
+   - **Auto-label (LLM)** — each frame plus your description is sent to the LLM, which returns strict JSON `{"boxes":[[x1,y1,x2,y2],...]}` with 0..1 normalized coordinates. Boxes are converted to YOLO `cx cy bw bh` labels and saved per frame.
+   - **Split dataset** — frames are split 90/10 into train/val and a `dataset.yaml` is generated.
    - **Train** — Ultralytics trains a YOLO11n model with the configured parameters.
-6. **Download** — when training finishes, click the download button to save the `.pt` model file.
+5. **Download** — when training finishes, click the download button to save the `.pt` model file.
 
 ### Pipeline architecture
 
@@ -285,10 +272,8 @@ Browser UI (HTML/CSS/JS)
 Backend (Flask, single file)
   │
   ├─ extract_frames()      → cv2.VideoCapture → JPG frames
-  ├─ auto_label_frames()   → YOLO-World text-prompted detection
-  │    ├─ generate_prompts()      → default heuristic prompts
-  │    ├─ generate_llm_prompts()  → LLM-enhanced prompts (optional)
-  │    └─ llm_analyze_image()     → visual verification (optional)
+  ├─ auto_label_frames()   → per-frame multimodal LLM call
+  │    └─ llm_detect_boxes()  → input: image + text description; output: [[x1,y1,x2,y2],...] in [0,1]
   ├─ split_dataset()       → train/val split + dataset.yaml
   └─ YOLO.train()          → ultralytics training API
 ```
@@ -296,9 +281,9 @@ Backend (Flask, single file)
 ### Output locations
 
 ```text
-ml/beibingyang_yolo/
+ml/
   _uploads/        → uploaded videos (gitignored)
-  _dataset/        → extracted frames, labels, dataset.yaml (gitignored)
+  _dataset/        → extracted frames, labels, dataset.yaml per run (gitignored)
   _outputs/        → training run directories and final .pt models (gitignored)
 ```
 

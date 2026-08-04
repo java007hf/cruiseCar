@@ -14,7 +14,7 @@ from datetime import datetime
 import cv2
 import yaml
 from flask import Flask, request, jsonify, send_file, Response
-from ultralytics import YOLOWorld, YOLO
+from ultralytics import YOLO
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "_uploads"
@@ -39,7 +39,6 @@ state = {
 }
 state_lock = threading.Lock()
 
-yolo_world_model = None
 LLM_BASE_URL = "http://127.0.0.1:12345"
 LLM_MODEL = "qwen3.5"
 
@@ -70,69 +69,6 @@ def llm_chat(messages, temperature=0.3, max_tokens=1024):
     with urllib.request.urlopen(req, timeout=120) as resp:
         result = json.loads(resp.read().decode("utf-8"))
     return result["choices"][0]["message"]["content"]
-
-
-def generate_llm_prompts(class_name, probe_context=None):
-    try:
-        context_note = ""
-        if probe_context:
-            context_note = (
-                "\n\nAdditional visual context from sample frames:\n"
-                f"{probe_context}\n"
-                "Use the visual features above to make your prompts highly specific to this appearance."
-            )
-        resp = llm_chat([
-            {"role": "system", "content": (
-                "You are a computer vision and open-vocabulary object detection expert. "
-                "You output comma-separated English noun phrases optimized for YOLO-World "
-                "grounding. Produce 15-25 short, visually concrete phrases. Include color, "
-                "material, shape, size, typical contents, and angle variants. Prefer "
-                "individual object nouns, not sentences. If the user writes Chinese you MUST "
-                "translate first into the visual appearance concepts described, then expand. "
-                "Avoid brand names unless visually distinctive. Return comma-separated list "
-                "only. No numbering, no bullets, no sentences."
-            )},
-            {"role": "user", "content": (
-                f"Target to detect (user description):\n---\n{class_name}\n---"
-                f"{context_note}\n\n"
-                "Generate 20 short visually-grounded English phrases that YOLO-World can "
-                "ground on images, comma separated, no other text."
-            )},
-        ], temperature=0.4, max_tokens=512)
-        prompts = [p.strip().rstrip(".") for p in resp.replace("\n", ",").split(",") if p.strip()]
-        if prompts:
-            return list(dict.fromkeys(prompts[:25]))
-    except Exception as e:
-        print(f"[LLM] generate_llm_prompts failed: {e}")
-    return generate_prompts(class_name)
-
-
-def llm_describe_target_in_frames(image_paths, user_description):
-    """LLM sees 2-4 real frames and describes what the target actually looks like.
-    Returns a plain-English visual description string used to refine prompts."""
-    try:
-        parts = []
-        for idx, p in enumerate(image_paths):
-            with open(p, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode("utf-8")
-            parts.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-            })
-            parts.append({"type": "text", "text": f"Frame {idx+1}."})
-        parts.append({"type": "text", "text": (
-            f"The user wants to detect objects matching this description:\n"
-            f"---\n{user_description}\n---\n\n"
-            "Looking at all frames above, identify the common object the user is describing. "
-            "Write a short visual description (80 words max) covering: its overall category "
-            "(can/bottle/box/device/etc), dominant color(s), shape, material, size, typical "
-            "features (lid/cap/labels/handle). If you cannot see it say 'not clearly visible'."
-        )})
-        resp = llm_chat([{"role": "user", "content": parts}], temperature=0.2, max_tokens=384)
-        return resp.strip() if resp else None
-    except Exception as e:
-        print(f"[LLM] describe target failed: {e}")
-        return None
 
 
 def llm_detect_boxes(image_path, user_description, max_retries=2):
@@ -286,132 +222,7 @@ def extract_frames(video_path, output_dir, fps=2):
     return extracted, width, height
 
 
-def generate_prompts(class_name):
-    name = class_name.lower().replace("_", " ").replace("-", " ").strip()
-    words = name.split()
-    prompts = [class_name, name]
-    if len(words) >= 2:
-        prompts.append(" ".join(words[-1:]))
-        prompts.append(" ".join(words[:1]))
-    generic = ["object", "item", "thing"]
-    for g in generic:
-        prompts.append(f"{name} {g}")
-
-    category = _category_keywords(class_name)
-    if category is None and (
-        "can" in class_name.lower()
-        or "罐" in class_name
-        or "bottle" in class_name.lower()
-        or "瓶" in class_name
-    ):
-        if "can" in class_name.lower() or "罐" in class_name:
-            category = "can"
-        elif "bottle" in class_name.lower() or "瓶" in class_name:
-            category = "bottle"
-
-    visual_expansions = set()
-
-    if category == "can":
-        for p in CAN_SPECIFIC:
-            visual_expansions.add(p)
-        for c in ["orange", "red", "yellow", "silver", "gold"]:
-            for base in ["can", "beverage can", "aluminum can"]:
-                visual_expansions.add(f"{c} {base}")
-        for m in ["aluminum", "metal", "tin", "steel"]:
-            visual_expansions.add(f"{m} can")
-        for s in ["cylindrical", "round"]:
-            visual_expansions.add(f"{s} can")
-        visual_expansions.add("canned orange soda")
-        visual_expansions.add("canned drink with red cap")
-        visual_expansions.add("aluminum beverage can with pull tab")
-        visual_expansions.add("sealed beverage can")
-
-    if category == "bottle":
-        for p in BOTTLE_SPECIFIC:
-            visual_expansions.add(p)
-        for c in ["orange", "red", "clear", "transparent", "green", "blue"]:
-            for base in ["bottle", "beverage bottle"]:
-                visual_expansions.add(f"{c} {base}")
-        for m in ["plastic", "glass"]:
-            visual_expansions.add(f"{m} bottle")
-
-    if category == "box":
-        for p in BOX_SPECIFIC:
-            visual_expansions.add(p)
-        for c in ["brown", "white", "red"]:
-            visual_expansions.add(f"{c} cardboard box")
-
-    if category is None:
-        noun_suffix = words[-1] if words else name
-        for c in COMMON_COLORS[:8]:
-            visual_expansions.add(f"{c} {noun_suffix}")
-        for m in COMMON_MATERIALS[:6]:
-            visual_expansions.add(f"{m} {noun_suffix}")
-        for s in COMMON_SHAPES[:6]:
-            visual_expansions.add(f"{s} {noun_suffix}")
-        for g in generic:
-            visual_expansions.add(f"{name} shaped {g}")
-
-    for p in list(visual_expansions):
-        prompts.append(p)
-
-    return list(dict.fromkeys(prompts))
-
-
-def _llm_logged_chat(label, messages, temperature=0.3, max_tokens=1024):
-    if not llm_available():
-        update_status("labeling", 0, f"LLM [{label}]: 未连接，跳过", f"LLM {label} - 服务不可用，跳过")
-        return None
-    t0 = time.time()
-    try:
-        result = llm_chat(messages, temperature=temperature, max_tokens=max_tokens)
-        dt = time.time() - t0
-        preview = (result[:90] + "...") if len(result) > 90 else result
-        update_status(
-            "labeling",
-            0,
-            f"LLM [{label}]: 完成 ({dt:.1f}s)",
-            f"LLM {label} 耗时 {dt:.1f}s -> {preview}",
-        )
-        return result
-    except Exception as e:
-        dt = time.time() - t0
-        update_status(
-            "labeling",
-            0,
-            f"LLM [{label}]: 出错 ({dt:.1f}s)",
-            f"LLM {label} 出错 ({dt:.1f}s): {e}",
-        )
-        return None
-
-
-def _llm_logged_image(label, img_path, class_name):
-    if not llm_available():
-        return None
-    t0 = time.time()
-    try:
-        result = llm_analyze_image(img_path, class_name)
-        dt = time.time() - t0
-        preview = (result[:90] + "...") if result and len(result) > 90 else (result or "")
-        update_status(
-            "labeling",
-            0,
-            f"LLM 视觉复核 [{label}]: {dt:.1f}s",
-            f"LLM 视觉 {label} ({Path(img_path).name}) 耗时 {dt:.1f}s -> {preview}",
-        )
-        return result
-    except Exception as e:
-        dt = time.time() - t0
-        update_status(
-            "labeling",
-            0,
-            f"LLM 视觉复核 [{label}]: 出错 ({dt:.1f}s)",
-            f"LLM 视觉 {label} ({Path(img_path).name}) 出错 ({dt:.1f}s): {e}",
-        )
-        return None
-
-
-def auto_label_frames(frames_dir, labels_dir, class_name, conf_threshold=0.10, use_llm=False):
+def auto_label_frames(frames_dir, labels_dir, class_name):
     """LLM-direct labeling: each frame is sent to the multimodal LLM together with the user's
     description (any language). The LLM returns normalized bounding boxes directly, which we
     convert into YOLO-format (cx, cy, bw, bh) label files. No YOLO-World, no probes, no retries."""
@@ -529,9 +340,7 @@ def run_pipeline(video_path, class_name, config):
         batch = config.get("batch", 8)
         device = config.get("device", "0")
         workers = config.get("workers", 0)
-        conf_threshold = config.get("conf_threshold", 0.25)
         train_ratio = config.get("train_ratio", 0.9)
-        use_llm = config.get("use_llm", False)
 
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_dir = DATASET_DIR / run_id
@@ -548,17 +357,16 @@ def run_pipeline(video_path, class_name, config):
         frame_count, width, height = extract_frames(video_path, frames_dir, fps=fps)
         update_status("extracting", 100, f"Extracted {frame_count} frames", f"Extracted {frame_count} frames ({width}x{height})")
 
-        update_status("labeling", 0, "Auto-labeling frames with YOLO-World...", "Starting auto-labeling with YOLO-World")
-        labeled_count = auto_label_frames(frames_dir, labels_dir, class_name, conf_threshold=conf_threshold, use_llm=use_llm)
+        update_status("labeling", 0, "Auto-labeling frames with LLM...", "Starting auto-labeling: LLM returns boxes per frame")
+        labeled_count = auto_label_frames(frames_dir, labels_dir, class_name)
         update_status("labeling", 100, f"Labeled {labeled_count}/{frame_count} frames", f"Labeling complete: {labeled_count}/{frame_count} frames with detections")
 
         if labeled_count == 0:
             raise RuntimeError(
-                f"No objects detected in any frame. Try: "
-                f"1) use a more specific target name, "
-                f"2) lower the confidence threshold, "
-                f"3) use LLM-assisted labeling, "
-                f"4) ensure the object is clearly visible in the video."
+                "No objects detected in any frame. Please check:\n"
+                "  1) LLM (http://127.0.0.1:12345) 已加载视觉模型（qwen3.5-VL 等）\n"
+                "  2) 输入的描述文字清晰说明要追踪的物品（颜色/材质/形状等特征）\n"
+                "  3) 视频中目标物品清晰可见，且大多数帧中存在"
             )
 
         update_status("splitting", 0, "Splitting dataset into train/val...", f"Train ratio: {train_ratio}")
