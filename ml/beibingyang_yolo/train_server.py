@@ -332,6 +332,9 @@ def auto_label_frames(frames_dir, labels_dir, class_name, conf_threshold=0.10, u
         labeled = 0
         llm_verified = 0
         llm_denied = 0
+        llm_kept_anyway = 0
+        yolo_skipped = 0
+        llm_skipped = 0
 
         for idx, img_path in enumerate(image_files):
             results = yolo_world_model.predict(
@@ -341,6 +344,10 @@ def auto_label_frames(frames_dir, labels_dir, class_name, conf_threshold=0.10, u
 
             has_detection = False
             boxes_to_write = []
+
+            n_yolo_boxes = sum(
+                (len(r.boxes) if r.boxes is not None else 0) for r in results
+            )
 
             for r in results:
                 if r.boxes is not None and len(r.boxes) > 0:
@@ -352,26 +359,32 @@ def auto_label_frames(frames_dir, labels_dir, class_name, conf_threshold=0.10, u
                         bw = xyxyn[2] - xyxyn[0]
                         bh = xyxyn[3] - xyxyn[1]
 
+                        keep_by_default = True
                         need_llm = False
+
                         if llm_is_on:
-                            if idx < 5:
+                            if conf < 0.25:
                                 need_llm = True
-                            elif conf < 0.4:
-                                need_llm = True
-                            elif (idx % 10) == 0:
+                            elif (idx % 15) == 0:
                                 need_llm = True
 
                         if need_llm:
                             analysis = _llm_logged_image(f"conf={conf:.2f}", img_path, class_name)
-                            if analysis and "not present" not in analysis.lower():
-                                boxes_to_write.append((cx, cy, bw, bh))
-                                llm_verified += 1
-                            elif analysis and "not present" in analysis.lower():
+                            llm_says_no = bool(
+                                analysis
+                                and "not present" in analysis.lower()
+                            )
+                            if llm_says_no and conf < 0.10:
                                 llm_denied += 1
                             else:
                                 boxes_to_write.append((cx, cy, bw, bh))
+                                if not llm_says_no:
+                                    llm_verified += 1
+                                else:
+                                    llm_kept_anyway += 1
                         else:
-                            boxes_to_write.append((cx, cy, bw, bh))
+                            if keep_by_default:
+                                boxes_to_write.append((cx, cy, bw, bh))
 
             if boxes_to_write:
                 with open(label_path, "w") as f:
@@ -380,14 +393,29 @@ def auto_label_frames(frames_dir, labels_dir, class_name, conf_threshold=0.10, u
                 has_detection = True
             else:
                 label_path.write_text("")
+                if n_yolo_boxes == 0:
+                    yolo_skipped += 1
+                else:
+                    llm_skipped += 1
 
             if has_detection:
                 labeled += 1
 
             progress = int((idx + 1) / total * 100)
-            log_msg = f"{'Labeled' if has_detection else 'Skipped'}: {img_path.name}"
+            if has_detection:
+                log_msg = f"Labeled: {img_path.name} ({len(boxes_to_write)} box)"
+            else:
+                if yolo_skipped + llm_skipped > 0 and n_yolo_boxes == 0:
+                    why = "YOLO no box"
+                elif llm_skipped > 0 and n_yolo_boxes > 0:
+                    why = "LLM rejected all boxes"
+                else:
+                    why = "YOLO no box"
+                log_msg = f"Skipped: {img_path.name} — {why}"
             if llm_is_on:
-                log_msg += f" (LLM ✓{llm_verified} ✗{llm_denied})"
+                log_msg += (
+                    f" [LLM ✓{llm_verified} ✗{llm_denied} ~{llm_kept_anyway}]"
+                )
             update_status(
                 "labeling",
                 progress,
@@ -395,26 +423,26 @@ def auto_label_frames(frames_dir, labels_dir, class_name, conf_threshold=0.10, u
                 log_msg,
             )
 
-        return labeled, llm_verified, llm_denied
+        return labeled, llm_verified, llm_denied, llm_kept_anyway
 
-    labeled, llm_verified, llm_denied = _run_detection(conf_threshold)
+    labeled, llm_verified, llm_denied, llm_kept_anyway = _run_detection(conf_threshold)
 
     if labeled == 0 and conf_threshold > 0.03:
         update_status("labeling", 0, f"No detections at conf={conf_threshold}, retrying at conf=0.05...",
                       f"0 detections, lowering threshold from {conf_threshold} to 0.05")
-        labeled, llm_verified, llm_denied = _run_detection(0.05, "(retry conf=0.05)")
+        labeled, llm_verified, llm_denied, llm_kept_anyway = _run_detection(0.05, "(retry conf=0.05)")
 
     if labeled == 0 and conf_threshold > 0.01:
         update_status("labeling", 0, f"Still no detections at conf=0.05, retrying at conf=0.02...",
                       "0 detections, lowering threshold to 0.02")
-        labeled, llm_verified, llm_denied = _run_detection(0.02, "(retry conf=0.02)")
+        labeled, llm_verified, llm_denied, llm_kept_anyway = _run_detection(0.02, "(retry conf=0.02)")
 
     if llm_is_on:
         update_status(
             "labeling",
             100,
-            f"LLM 辅助完成: 标注 {labeled}/{total} (✓{llm_verified} ✗{llm_denied})",
-            f"LLM 总确认通过 {llm_verified} 次，驳回 {llm_denied} 次",
+            f"LLM 辅助完成: 标注 {labeled}/{total} (✓{llm_verified} ~{llm_kept_anyway} ✗{llm_denied})",
+            f"LLM 总确认通过 {llm_verified} 次，默认保留 {llm_kept_anyway} 次，仅极低置信+明确否决 {llm_denied} 次",
         )
 
     return labeled
