@@ -7,3 +7,13 @@ local.properties
 sdkconfig
 sdkconfig.old
 managed_components/
+ml/**/.venv/
+ml/**/.venv*/
+ml/**/runs*/
+ml/beibingyang_yolo/frames/
+ml/beibingyang_yolo/labels/
+ml/beibingyang_yolo/preview/
+ml/**/*.cache
+runs/
+yolo11n.pt
+android-app/app/src/main/assets/target_object.jpg

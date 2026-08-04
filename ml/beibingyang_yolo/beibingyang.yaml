@@ -1,0 +1,5 @@
+path: /Users/bytedance/BitsStudioProjects/cruiseCar/ml/beibingyang_yolo/dataset
+train: images/train
+val: images/val
+names:
+  0: beibingyang_can

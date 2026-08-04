@@ -104,7 +104,8 @@ class MainActivity : Activity() {
     private fun startObjectRecognitionDemo() {
         objectDemoController?.stop()
         objectDemoController = ObjectRecognitionDemoController(
-            frameProvider = { objectDemoPreview?.snapshot(320, 240) },
+            context = this,
+            frameProvider = { objectDemoPreview?.snapshot(416, 416) },
             onDetections = { detections ->
                 runOnUiThread {
                     objectDemoOverlay?.setDetections(detections)

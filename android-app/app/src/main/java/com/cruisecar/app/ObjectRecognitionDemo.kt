@@ -1,21 +1,34 @@
 package com.cruisecar.app
 
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
 import android.view.View
-import org.opencv.android.OpenCVLoader
-import org.opencv.android.Utils
-import org.opencv.core.Core
-import org.opencv.core.Mat
-import org.opencv.core.MatOfPoint
-import org.opencv.core.MatOfPoint2f
-import org.opencv.core.Rect
-import org.opencv.core.Scalar
-import org.opencv.imgproc.Imgproc
+import org.tensorflow.lite.DataType
+import org.tensorflow.lite.Interpreter
+import java.io.FileInputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.MappedByteBuffer
+import java.nio.channels.FileChannel
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.max
+import kotlin.math.min
+
+private const val MODEL_ASSET_NAME = "detect.tflite"
+private const val LABELS_ASSET_NAME = "labels.txt"
+private const val CONFIDENCE_THRESHOLD = 0.35f
+private const val IOU_THRESHOLD = 0.45f
+private const val MAX_DETECTIONS = 5
+private const val LOOP_INTERVAL_MS = 30L
+
+private enum class ModelInputLayout {
+    NHWC,
+    NCHW
+}
 
 data class ObjectDetection(
     val label: String,
@@ -24,144 +37,237 @@ data class ObjectDetection(
 )
 
 class ObjectRecognitionDemoController(
+    private val context: Context,
     private val frameProvider: () -> Bitmap?,
     private val onDetections: (List<ObjectDetection>) -> Unit
 ) {
     private val running = AtomicBoolean(false)
+    private var detector: YoloTfliteDetector? = null
+    private var workerThread: Thread? = null
 
     fun start(onLog: (String) -> Unit) {
-        if (!OpenCVLoader.initDebug()) {
-            onLog("OpenCV init failed")
-            return
-        }
         if (!running.compareAndSet(false, true)) return
 
-        Thread {
-            onLog("OpenCV object demo started")
-            while (running.get()) {
-                val detections = frameProvider()?.let { analyze(it) }.orEmpty()
-                onDetections(detections)
-                Thread.sleep(220)
+        val activeDetector = YoloTfliteDetector.create(context, onLog)
+        if (activeDetector == null) {
+            running.set(false)
+            return
+        }
+        detector = activeDetector
+
+        workerThread = Thread {
+            onLog("YOLO TFLite object detector started")
+            try {
+                while (running.get()) {
+                    val detections = frameProvider()?.let { activeDetector.detect(it) }.orEmpty()
+                    if (running.get()) onDetections(detections)
+                    Thread.sleep(LOOP_INTERVAL_MS)
+                }
+            } catch (_: InterruptedException) {
+            } finally {
+                activeDetector.close()
+                if (detector === activeDetector) detector = null
             }
-        }.start()
+        }.apply {
+            name = "ObjectRecognitionDetector"
+            start()
+        }
     }
 
     fun stop() {
-        running.set(false)
+        if (!running.getAndSet(false)) return
+        workerThread?.interrupt()
+        if (Thread.currentThread() !== workerThread) {
+            runCatching { workerThread?.join(500) }
+        }
+        workerThread = null
         onDetections(emptyList())
     }
+}
 
-    private fun analyze(bitmap: Bitmap): List<ObjectDetection> {
-        val rgba = Mat()
-        val rgb = Mat()
-        val hsv = Mat()
-        val mask = Mat()
-        val mergedMask = Mat()
-        val hierarchy = Mat()
-        val contours = mutableListOf<MatOfPoint>()
+private class YoloTfliteDetector(
+    private val interpreter: Interpreter,
+    private val labels: List<String>,
+    private val inputWidth: Int,
+    private val inputHeight: Int,
+    private val inputLayout: ModelInputLayout,
+    private val inputType: DataType
+) {
+    fun detect(bitmap: Bitmap): List<ObjectDetection> {
+        val resized = Bitmap.createScaledBitmap(bitmap, inputWidth, inputHeight, true)
+        val input = bitmapToInputBuffer(resized)
+        if (resized !== bitmap) resized.recycle()
 
-        return try {
-            Utils.bitmapToMat(bitmap, rgba)
-            Imgproc.cvtColor(rgba, rgb, Imgproc.COLOR_RGBA2RGB)
-            Imgproc.cvtColor(rgb, hsv, Imgproc.COLOR_RGB2HSV)
+        val outputShape = interpreter.getOutputTensor(0).shape()
+        if (outputShape.size != 3 || outputShape[0] != 1) return emptyList()
 
-            val detections = mutableListOf<ObjectDetection>()
-            for (target in TARGETS) {
-                buildMask(hsv, target, mask, mergedMask)
-                Imgproc.erode(mergedMask, mergedMask, Mat())
-                Imgproc.dilate(mergedMask, mergedMask, Mat())
-                Imgproc.findContours(mergedMask, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+        val output = Array(1) { Array(outputShape[1]) { FloatArray(outputShape[2]) } }
+        interpreter.run(input, output)
+        return parseYoloOutput(output[0], outputShape[1], outputShape[2])
+    }
 
-                for (contour in contours) {
-                    val area = Imgproc.contourArea(contour)
-                    val frameArea = (rgba.width() * rgba.height()).coerceAtLeast(1).toDouble()
-                    val areaRatio = area / frameArea
-                    if (areaRatio < MIN_AREA_RATIO) continue
+    fun close() {
+        interpreter.close()
+    }
 
-                    val rect = Imgproc.boundingRect(contour)
-                    val shape = classifyShape(contour, rect)
-                    detections.add(
-                        ObjectDetection(
-                            label = "${target.label} $shape",
-                            confidence = areaRatio.coerceIn(0.0, 1.0).toFloat(),
-                            rect = rect.normalized(rgba.width(), rgba.height())
-                        )
-                    )
-                }
-                contours.forEach { it.release() }
-                contours.clear()
+    private fun bitmapToInputBuffer(bitmap: Bitmap): ByteBuffer {
+        val bytesPerChannel = if (inputType == DataType.FLOAT32) 4 else 1
+        val buffer = ByteBuffer
+            .allocateDirect(1 * inputWidth * inputHeight * 3 * bytesPerChannel)
+            .order(ByteOrder.nativeOrder())
+        val pixels = IntArray(inputWidth * inputHeight)
+        bitmap.getPixels(pixels, 0, inputWidth, 0, 0, inputWidth, inputHeight)
+        if (inputLayout == ModelInputLayout.NHWC) {
+            for (pixel in pixels) {
+                buffer.putChannel((pixel shr 16) and 0xFF)
+                buffer.putChannel((pixel shr 8) and 0xFF)
+                buffer.putChannel(pixel and 0xFF)
             }
+        } else {
+            for (pixel in pixels) buffer.putChannel((pixel shr 16) and 0xFF)
+            for (pixel in pixels) buffer.putChannel((pixel shr 8) and 0xFF)
+            for (pixel in pixels) buffer.putChannel(pixel and 0xFF)
+        }
+        buffer.rewind()
+        return buffer
+    }
 
-            detections
-                .sortedByDescending { it.confidence }
-                .take(MAX_DETECTIONS)
-        } finally {
-            rgba.release()
-            rgb.release()
-            hsv.release()
-            mask.release()
-            mergedMask.release()
-            hierarchy.release()
-            contours.forEach { it.release() }
+    private fun ByteBuffer.putChannel(value: Int) {
+        if (inputType == DataType.FLOAT32) {
+            putFloat(value / 255f)
+        } else {
+            put(value.toByte())
         }
     }
 
-    private fun buildMask(hsv: Mat, target: ColorTarget, mask: Mat, mergedMask: Mat) {
-        Core.inRange(hsv, target.ranges.first().lower, target.ranges.first().upper, mergedMask)
-        for (range in target.ranges.drop(1)) {
-            Core.inRange(hsv, range.lower, range.upper, mask)
-            Core.bitwise_or(mergedMask, mask, mergedMask)
-        }
-    }
+    private fun parseYoloOutput(output: Array<FloatArray>, firstDim: Int, secondDim: Int): List<ObjectDetection> {
+        val attrsFirst = firstDim < secondDim
+        val boxCount = if (attrsFirst) secondDim else firstDim
+        val attrCount = if (attrsFirst) firstDim else secondDim
+        if (attrCount < 5) return emptyList()
 
-    private fun classifyShape(contour: MatOfPoint, rect: Rect): String {
-        val contour2f = MatOfPoint2f(*contour.toArray())
-        val approx = MatOfPoint2f()
-        return try {
-            val perimeter = Imgproc.arcLength(contour2f, true)
-            Imgproc.approxPolyDP(contour2f, approx, 0.04 * perimeter, true)
-            val vertices = approx.total().toInt()
-            val aspect = rect.width.toFloat() / rect.height.coerceAtLeast(1)
-            when {
-                vertices in 4..5 && aspect in 0.75f..1.33f -> "rectangle"
-                vertices > 7 -> "circle"
-                else -> "object"
+        val detections = ArrayList<ObjectDetection>()
+        for (boxIndex in 0 until boxCount) {
+            val attrs = FloatArray(attrCount) { attrIndex ->
+                if (attrsFirst) output[attrIndex][boxIndex] else output[boxIndex][attrIndex]
             }
-        } finally {
-            contour2f.release()
-            approx.release()
+            decodePrediction(attrs)?.let { detections += it }
         }
+        return detections
+            .sortedByDescending { it.confidence }
+            .nms(IOU_THRESHOLD)
+            .take(MAX_DETECTIONS)
     }
 
-    private fun Rect.normalized(width: Int, height: Int): RectF =
-        RectF(
-            x.toFloat() / width.coerceAtLeast(1),
-            y.toFloat() / height.coerceAtLeast(1),
-            (x + this.width).toFloat() / width.coerceAtLeast(1),
-            (y + this.height).toFloat() / height.coerceAtLeast(1)
-        )
+    private fun decodePrediction(attrs: FloatArray): ObjectDetection? {
+        val cx = attrs[0]
+        val cy = attrs[1]
+        val w = attrs[2]
+        val h = attrs[3]
 
-    private data class HsvRange(val lower: Scalar, val upper: Scalar)
+        val classOffset = if (attrs.size > labels.size + 4) 5 else 4
+        val objectness = if (classOffset == 5) attrs[4].coerceIn(0f, 1f) else 1f
+        var bestClass = 0
+        var bestClassScore = 0f
+        for (i in classOffset until attrs.size) {
+            if (attrs[i] > bestClassScore) {
+                bestClassScore = attrs[i]
+                bestClass = i - classOffset
+            }
+        }
 
-    private data class ColorTarget(val label: String, val ranges: List<HsvRange>)
+        val confidence = (objectness * bestClassScore).coerceIn(0f, 1f)
+        if (confidence < CONFIDENCE_THRESHOLD) return null
+
+        val normalized = max(max(cx, cy), max(w, h)) <= 2f
+        val scaleX = if (normalized) 1f else inputWidth.toFloat()
+        val scaleY = if (normalized) 1f else inputHeight.toFloat()
+        val left = ((cx - w / 2f) / scaleX).coerceIn(0f, 1f)
+        val top = ((cy - h / 2f) / scaleY).coerceIn(0f, 1f)
+        val right = ((cx + w / 2f) / scaleX).coerceIn(0f, 1f)
+        val bottom = ((cy + h / 2f) / scaleY).coerceIn(0f, 1f)
+        if (right <= left || bottom <= top) return null
+
+        val label = labels.getOrElse(bestClass) { "object_$bestClass" }
+        return ObjectDetection(label, confidence, RectF(left, top, right, bottom))
+    }
 
     companion object {
-        private const val MIN_AREA_RATIO = 0.012
-        private const val MAX_DETECTIONS = 6
+        fun create(context: Context, onLog: (String) -> Unit): YoloTfliteDetector? {
+            val model = runCatching { context.assets.openFd(MODEL_ASSET_NAME).use { it.mapModel() } }
+                .onFailure { onLog("Missing $MODEL_ASSET_NAME. Put trained YOLO TFLite model in app/src/main/assets/") }
+                .getOrNull() ?: return null
+            val options = Interpreter.Options().apply {
+                setNumThreads(4)
+                setUseXNNPACK(true)
+            }
+            val interpreter = Interpreter(model, options)
+            val inputTensor = interpreter.getInputTensor(0)
+            val inputShape = inputTensor.shape()
+            if (inputShape.size != 4 || inputShape[0] != 1) {
+                onLog("Unsupported model input shape: ${inputShape.joinToString()}")
+                interpreter.close()
+                return null
+            }
+            val inputLayout: ModelInputLayout
+            val height: Int
+            val width: Int
+            if (inputShape[3] == 3) {
+                inputLayout = ModelInputLayout.NHWC
+                height = inputShape[1]
+                width = inputShape[2]
+            } else if (inputShape[1] == 3) {
+                inputLayout = ModelInputLayout.NCHW
+                height = inputShape[2]
+                width = inputShape[3]
+            } else {
+                onLog("Expected RGB input, got: ${inputShape.joinToString()}")
+                interpreter.close()
+                return null
+            }
+            if (width <= 0 || height <= 0) {
+                onLog("Invalid model input shape: ${inputShape.joinToString()}")
+                interpreter.close()
+                return null
+            }
 
-        private val TARGETS = listOf(
-            ColorTarget(
-                "red",
-                listOf(
-                    HsvRange(Scalar(0.0, 70.0, 50.0), Scalar(10.0, 255.0, 255.0)),
-                    HsvRange(Scalar(170.0, 70.0, 50.0), Scalar(180.0, 255.0, 255.0))
-                )
-            ),
-            ColorTarget("green", listOf(HsvRange(Scalar(35.0, 55.0, 45.0), Scalar(90.0, 255.0, 255.0)))),
-            ColorTarget("blue", listOf(HsvRange(Scalar(95.0, 55.0, 45.0), Scalar(130.0, 255.0, 255.0)))),
-            ColorTarget("yellow", listOf(HsvRange(Scalar(18.0, 70.0, 60.0), Scalar(34.0, 255.0, 255.0))))
-        )
+            val labels = context.loadLabels()
+            onLog("Loaded YOLO model ${width}x$height $inputLayout labels=${labels.size}")
+            return YoloTfliteDetector(interpreter, labels, width, height, inputLayout, inputTensor.dataType())
+        }
     }
+}
+
+private fun android.content.res.AssetFileDescriptor.mapModel(): MappedByteBuffer =
+    FileInputStream(fileDescriptor).channel.use { channel ->
+        channel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
+    }
+
+private fun Context.loadLabels(): List<String> =
+    runCatching {
+        assets.open(LABELS_ASSET_NAME).bufferedReader().useLines { lines ->
+            lines.map { it.trim() }.filter { it.isNotEmpty() }.toList()
+        }
+    }.getOrDefault(listOf("object"))
+
+private fun List<ObjectDetection>.nms(iouThreshold: Float): List<ObjectDetection> {
+    val selected = ArrayList<ObjectDetection>()
+    for (candidate in this) {
+        if (selected.none { it.rect.iou(candidate.rect) > iouThreshold }) {
+            selected += candidate
+        }
+    }
+    return selected
+}
+
+private fun RectF.iou(other: RectF): Float {
+    val left = max(left, other.left)
+    val top = max(top, other.top)
+    val right = min(right, other.right)
+    val bottom = min(bottom, other.bottom)
+    val intersection = max(0f, right - left) * max(0f, bottom - top)
+    val union = width() * height() + other.width() * other.height() - intersection
+    return if (union <= 0f) 0f else intersection / union
 }
 
 class ObjectRecognitionOverlayView(context: android.content.Context) : View(context) {

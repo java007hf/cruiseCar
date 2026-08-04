@@ -34,7 +34,53 @@ The sender and receiver apps now share a 10-byte TCP control frame model:
 - Real-time video: sender sends a mode frame, then connects to the receiver WebRTC signaling server on port `42102`. The receiver publishes camera + microphone through WebRTC, and the sender renders the remote media.
 - Smart follow: sender sends a mode frame. The receiver starts camera preview + OpenCV color tracking locally and sends generated gamepad frames directly to ESP32, so the sender does not need to keep driving.
 - Smart patrol: reserved mode frame and UI entry. The receiver stops motion and logs the selected mode until route planning is added.
-- OpenCV object demo: app camera preview feeds frames into an OpenCV analyzer, detection results are rendered as rectangle overlays on top of the camera view. The analyzer consumes a `frameProvider` abstraction so the same camera frame path can later be shared with WebRTC sending.
+- OpenCV object demo: app camera preview feeds frames into a YOLO TFLite detector, detection results are rendered as rectangle overlays on top of the camera view. The detector consumes a `frameProvider` abstraction so the same camera frame path can later be shared with WebRTC sending.
+
+## Directory Layout
+
+```text
+.
+├── android-app/
+│   ├── app/build.gradle
+│   └── app/src/main/
+│       ├── assets/
+│       │   ├── detect.tflite        # YOLO/LiteRT model used by the Android object demo
+│       │   └── labels.txt           # detection class labels
+│       └── java/com/cruisecar/app/
+│           ├── MainActivity.kt
+│           └── ObjectRecognitionDemo.kt
+├── esp32-firmware/
+│   ├── main/
+│   └── scripts/
+├── esp32-gamepad-hid-demo/
+│   ├── main/
+│   └── scripts/
+└── ml/
+    └── beibingyang_yolo/
+        ├── auto_label_orange.py     # helper used to bootstrap labels from the orange can region
+        ├── beibingyang.yaml         # Ultralytics dataset config
+        ├── dataset/
+        │   ├── images/train/
+        │   ├── images/val/
+        │   ├── labels/train/
+        │   └── labels/val/
+        ├── contact/                 # contact sheets and label-check previews
+        ├── frames/                  # local generated frames, ignored by Git
+        ├── labels/                  # local generated labels before train/val split, ignored by Git
+        └── preview/                 # per-frame label preview images
+```
+
+Training environments, intermediate extraction outputs, and run outputs are ignored by Git:
+
+```text
+ml/**/.venv*/
+ml/beibingyang_yolo/frames/
+ml/beibingyang_yolo/labels/
+ml/beibingyang_yolo/preview/
+ml/**/runs*/
+runs/
+yolo11n.pt
+```
 
 TCP ports:
 
@@ -130,3 +176,58 @@ ESP32:
 cd esp32-firmware
 .\scripts\build-esp32.ps1
 ```
+
+## YOLO/TFLite Object Detection Training
+
+The current object demo uses a one-class YOLO detector for the `beibingyang_can` label. The first dataset was generated from:
+
+```text
+/Users/bytedance/Downloads/飞书20260804-120018.mp4
+```
+
+Training data flow:
+
+1. Extract frames from the source video into `ml/beibingyang_yolo/frames/`.
+2. Bootstrap labels with `ml/beibingyang_yolo/auto_label_orange.py`.
+3. Check `ml/beibingyang_yolo/contact/labels_sheet.jpg` and the individual files in `ml/beibingyang_yolo/preview/`.
+4. Split labeled images into `ml/beibingyang_yolo/dataset/images/train`, `images/val`, `labels/train`, and `labels/val`.
+5. Train YOLO with `ml/beibingyang_yolo/beibingyang.yaml`.
+6. Export the best checkpoint to LiteRT/TFLite.
+7. Copy the exported model to `android-app/app/src/main/assets/detect.tflite`.
+
+Useful commands from this training run:
+
+```bash
+# Train from the YOLO11 nano checkpoint.
+ml/beibingyang_yolo/.venv311/bin/yolo detect train \
+  model=yolo11n.pt \
+  data=ml/beibingyang_yolo/beibingyang.yaml \
+  imgsz=416 \
+  epochs=60 \
+  batch=4 \
+  device=cpu \
+  project=ml/beibingyang_yolo/runs \
+  name=beibingyang_yolo11n \
+  exist_ok=True
+
+# Export the best checkpoint. Ultralytics now maps tflite export to LiteRT.
+ml/beibingyang_yolo/.venv311/bin/yolo export \
+  model=runs/detect/ml/beibingyang_yolo/runs/beibingyang_yolo11n/weights/best.pt \
+  format=litert \
+  imgsz=416
+
+# Install the exported model into the Android app.
+cp runs/detect/ml/beibingyang_yolo/runs/beibingyang_yolo11n/weights/best.tflite \
+  android-app/app/src/main/assets/detect.tflite
+```
+
+The generated model currently has this tensor contract:
+
+```text
+input:  [1, 3, 416, 416] float32 RGB, NCHW, normalized to 0..1
+output: [1, 5, 3549] float32 YOLO boxes/classes
+```
+
+`ObjectRecognitionDemo.kt` supports both NCHW and NHWC RGB TFLite inputs and parses YOLO output layouts `[1, boxes, attrs]` and `[1, attrs, boxes]`.
+
+The initial training set contains 53 frames from one video, so it is good for validating the pipeline and detecting the same can in similar desk scenes. For robust detection, add more short videos with different distances, rotations, lighting, backgrounds, and partial occlusion, then repeat the same extract-label-train-export cycle.
