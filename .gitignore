@@ -7,20 +7,41 @@ local.properties
 sdkconfig
 sdkconfig.old
 managed_components/
+
+# ---- ml/: training artifacts (always ignore contents) ----
+# .venv / pycache / caches
 ml/**/.venv/
 ml/**/.venv*/
-ml/**/runs*/
-ml/**/frames/
-ml/**/labels/
-ml/**/preview/
-ml/**/_uploads/
-ml/**/_dataset/
-ml/**/_outputs/
-ml/**/_tmp/
 ml/**/*.cache
 ml/**/__pycache__/
-runs/
-weights/
-yolo*.pt
-yolov8s-worldv2.pt
+
+# Run-specific outputs — all contents gitignored, but the canonical folder itself
+# stays tracked via its .gitkeep placeholder:
+ml/extractions/**
+!ml/extractions/.gitkeep
+
+ml/uploads/**
+!ml/uploads/.gitkeep
+
+ml/datasets/**
+!ml/datasets/.gitkeep
+
+ml/outputs/**
+!ml/outputs/.gitkeep
+
+# Base pre-trained checkpoints (yolo11n.pt, yolo26n.pt, yolov8s-worldv2.pt, …)
+# are stored here and gitignored because they can be re-downloaded.
+ml/weights/**
+!ml/weights/.gitkeep
+
+# Transient scratch pad (always gitignored).
+ml/_tmp/**
+
+# ---- Root-level training leftovers from earlier iterations (fully gitignore, but only at repo root) ----
+/runs/
+/weights/
+/yolo*.pt
+/yolov8s-worldv2.pt
+
+# Android assets
 android-app/app/src/main/assets/target_object.jpg

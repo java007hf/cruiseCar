@@ -58,25 +58,50 @@ The sender and receiver apps now share a 10-byte TCP control frame model:
 └── ml/
     ├── train_server.py          # web-based training platform (Flask + multimodal LLM + YOLO)
     ├── auto_label_orange.py     # helper used to bootstrap labels from the orange can region
-    └── beibingyang.yaml         # template Ultralytics dataset config
+    ├── beibingyang.yaml         # template Ultralytics dataset config
+    #
+    # Canonical subdirs (kept as placeholders via .gitkeep; contents are gitignored):
+    ├── weights/                 # base pretrained checkpoints (yolo11n.pt, yolo26n.pt, yolov8s-worldv2.pt, …)
+    ├── uploads/                 # raw uploaded videos (one run → one video file)
+    ├── extractions/             # raw frame JPGs extracted from a video, one subdir per run_id
+    │    └── 20260804_232133/
+    │         ├── frame_0001.jpg … frame_NNNN.jpg
+    │         ├── train/         # symlinks/copies made by split_dataset
+    │         └── val/
+    ├── datasets/                # every run produces one dataset folder (split + yaml + labels)
+    │    └── 20260804_232133/
+    │         ├── dataset.yaml
+    │         ├── labels/        # per-frame .txt YOLO labels + train/val split
+    │         └── dataset/       # what Ultralytics actually trains on
+    │              ├── images/{train,val}/
+    │              └── labels/{train,val}/
+    ├── outputs/                 # training runs and final .pt exports
+    │    ├── 20260804_232133/weights/best.pt
+    │    └── beibingyang_can_20260804_232133.pt   # downloadable copy
+    └── _tmp/                    # transient scratch pad, gitignored
 ```
 
-Training environments, intermediate extraction outputs, and run outputs are ignored by Git:
+Training environments and run contents are ignored by Git; the canonical folders stay tracked via their `.gitkeep` placeholder so a fresh clone still has the skeleton structure in place:
 
 ```text
+# Virtual environments + Python caches
 ml/**/.venv*/
-ml/**/frames/
-ml/**/labels/
-ml/**/preview/
-ml/_uploads/
-ml/_dataset/
-ml/_outputs/
-ml/_tmp/
-ml/**/runs*/
 ml/**/__pycache__/
+ml/**/*.cache
+
+# All run-specific contents (the 5 canonical folders are tracked, their payloads are not)
+ml/extractions/**
+ml/uploads/**
+ml/datasets/**
+ml/outputs/**
+ml/weights/**                # base checkpoints can be re-downloaded
+ml/_tmp/**
+
+# Historical root-level training leftovers from earlier iterations
 runs/
 weights/
 yolo*.pt
+yolov8s-worldv2.pt
 ```
 
 TCP ports:
@@ -184,35 +209,35 @@ The current object demo uses a one-class YOLO detector for the `beibingyang_can`
 
 Training data flow:
 
-1. Extract frames from the source video into `ml/_dataset/{run_id}/frames/`.
+1. Extract frames from the source video into `ml/extractions/{run_id}/frame_XXXX.jpg`.
 2. Send each frame + your textual description (any language) to the local multimodal LLM at `http://127.0.0.1:12345`; the LLM returns normalized bounding boxes directly.
-3. Labels are written in YOLO format to `ml/_dataset/{run_id}/labels/`; 90% / 10% are split into train and val.
-4. Train YOLO with a generated `dataset.yaml`.
-5. Export the best checkpoint to LiteRT/TFLite and copy it to `android-app/app/src/main/assets/detect.tflite`.
+3. Labels are written in YOLO format to `ml/datasets/{run_id}/labels/`; 90% / 10% are split into train and val inside `ml/datasets/{run_id}/dataset/{images,labels}/{train,val}/`.
+4. Train YOLO with the generated `ml/datasets/{run_id}/dataset.yaml`; ultralytics logs live under `ml/outputs/{run_id}/`.
+5. Copy the best checkpoint to `ml/outputs/{class_name}_{run_id}.pt`, export it to LiteRT/TFLite, and copy it to `android-app/app/src/main/assets/detect.tflite`.
 
 Useful commands from this training run (run from `ml/`):
 
 ```bash
 # Train from the YOLO11 nano checkpoint (manual fallback, not needed if using the web UI).
-.\.venv\Scripts\yolo detect train \
-  model=yolo11n.pt \
-  data=beibingyang.yaml \
-  imgsz=416 \
-  epochs=60 \
-  batch=4 \
-  device=cpu \
-  project=runs \
-  name=beibingyang_yolo11n \
+.\.venv\Scripts\yolo detect train `
+  model=weights/yolo11n.pt `
+  data=beibingyang.yaml `
+  imgsz=416 `
+  epochs=60 `
+  batch=4 `
+  device=cpu `
+  project=outputs `
+  name=beibingyang_yolo11n `
   exist_ok=True
 
 # Export the best checkpoint. Ultralytics now maps tflite export to LiteRT.
-.\.venv\Scripts\yolo export \
-  model=runs/detect/runs/beibingyang_yolo11n/weights/best.pt \
-  format=litert \
+.\.venv\Scripts\yolo export `
+  model=outputs/beibingyang_yolo11n/weights/best.pt `
+  format=litert `
   imgsz=416
 
 # Install the exported model into the Android app.
-cp runs/detect/runs/beibingyang_yolo11n/weights/best.tflite `
+cp outputs/beibingyang_yolo11n/weights/best.tflite `
   ..\android-app\app\src\main\assets\detect.tflite
 ```
 
@@ -280,11 +305,17 @@ Backend (Flask, single file)
 
 ### Output locations
 
+Each run `{run_id}` = timestamp `YYYYmmdd_HHMMSS` scatters artifacts into four canonical folders:
+
 ```text
 ml/
-  _uploads/        → uploaded videos (gitignored)
-  _dataset/        → extracted frames, labels, dataset.yaml per run (gitignored)
-  _outputs/        → training run directories and final .pt models (gitignored)
+  uploads/{run_id}.{mp4,webm,...}        → uploaded video
+  extractions/{run_id}/                  → raw extracted frames + train/val split symlinks
+  datasets/{run_id}/                     → labels/, dataset/{images,labels}/{train,val}/, dataset.yaml
+  outputs/
+    {run_id}/                            → ultralytics training logs, events, tensorboard
+    {run_id}/weights/best.pt             → best checkpoint during training
+    {class_name}_{run_id}.pt             → downloadable copy (shown in /api/download as final model)
 ```
 
-The final model is saved as `_outputs/{class_name}_{timestamp}.pt`.
+The final downloadable model is saved as `outputs/{class_name}_{run_id}.pt`.

@@ -17,12 +17,15 @@ from flask import Flask, request, jsonify, send_file, Response
 from ultralytics import YOLO
 
 BASE_DIR = Path(__file__).resolve().parent
-UPLOAD_DIR = BASE_DIR / "_uploads"
-DATASET_DIR = BASE_DIR / "_dataset"
-OUTPUT_DIR = BASE_DIR / "_outputs"
-TMP_DIR = BASE_DIR / "_tmp"
+# Canonical subdirectories of ml/ (kept as placeholders via .gitkeep; contents are gitignored).
+WEIGHTS_DIR = BASE_DIR / "weights"       # base pretrained checkpoints (yolo11n.pt etc.)
+UPLOADS_DIR = BASE_DIR / "uploads"     # raw uploaded videos
+EXTRACTIONS_DIR = BASE_DIR / "extractions"  # extracted raw frame JPGs (original frames per run
+DATASETS_DIR = BASE_DIR / "datasets"  # train/val image + label splits + dataset.yaml per run
+OUTPUTS_DIR = BASE_DIR / "outputs"   # training run folders and final .pt exports
+TMP_DIR = BASE_DIR / "_tmp"             # transient temp files (e.g. shutil rmtree helpers etc.)
 
-for d in [UPLOAD_DIR, DATASET_DIR, OUTPUT_DIR, TMP_DIR]:
+for d in [WEIGHTS_DIR, UPLOADS_DIR, EXTRACTIONS_DIR, DATASETS_DIR, OUTPUTS_DIR, TMP_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
@@ -343,12 +346,11 @@ def run_pipeline(video_path, class_name, config):
         train_ratio = config.get("train_ratio", 0.9)
 
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_dir = DATASET_DIR / run_id
-
-        frames_dir = run_dir / "frames"
-        labels_dir = run_dir / "labels"
-        images_dir = run_dir / "images"
-        dataset_dir = run_dir / "dataset"
+        dataset_run_dir = DATASETS_DIR / run_id
+        frames_dir = EXTRACTIONS_DIR / run_id
+        labels_dir = dataset_run_dir / "labels"
+        images_dir = dataset_run_dir / "images"
+        dataset_dir = dataset_run_dir / "dataset"
 
         for d in [frames_dir, labels_dir, images_dir, dataset_dir]:
             d.mkdir(parents=True, exist_ok=True)
@@ -381,13 +383,17 @@ def run_pipeline(video_path, class_name, config):
         shutil.copytree(str(labels_dir / "train"), str(dataset_dir / "labels" / "train"))
         shutil.copytree(str(labels_dir / "val"), str(dataset_dir / "labels" / "val"))
 
-        yaml_path = run_dir / "dataset.yaml"
+        yaml_path = dataset_run_dir / "dataset.yaml"
         generate_yaml(dataset_dir, class_name, yaml_path)
         update_status("splitting", 100, "Dataset split complete", f"YAML config: {yaml_path}")
 
         update_status("training", 0, f"Training YOLO model (epochs={epochs})...", "Starting YOLO training")
 
-        model = YOLO("yolo11n.pt")
+        # Load base checkpoint from the canonical weights folder; if it is missing fall back
+        # to the bare filename so ultralytics will auto-download the default into cwd.
+        base_weights = WEIGHTS_DIR / "yolo11n.pt"
+        model_arg = str(base_weights) if base_weights.exists() else "yolo11n.pt"
+        model = YOLO(model_arg)
 
         progress_callback = []
 
@@ -418,16 +424,16 @@ def run_pipeline(video_path, class_name, config):
             batch=batch,
             device=device,
             workers=workers,
-            project=str(OUTPUT_DIR),
+            project=str(OUTPUTS_DIR),
             name=run_id,
             callbacks={"on_epoch_end": tracker},
         )
 
-        best_model_path = OUTPUT_DIR / run_id / "weights" / "best.pt"
+        best_model_path = OUTPUTS_DIR / run_id / "weights" / "best.pt"
         if not best_model_path.exists():
-            best_model_path = OUTPUT_DIR / run_id / "weights" / "last.pt"
+            best_model_path = OUTPUTS_DIR / run_id / "weights" / "last.pt"
 
-        final_model_path = OUTPUT_DIR / f"{class_name}_{run_id}.pt"
+        final_model_path = OUTPUTS_DIR / f"{class_name}_{run_id}.pt"
         shutil.copy2(str(best_model_path), str(final_model_path))
 
         update_status("done", 100, "Training complete!", f"Model saved to: {final_model_path}")
@@ -472,7 +478,7 @@ def api_upload():
         return jsonify({"error": f"Unsupported format: {ext}. Allowed: {', '.join(allowed)}"}), 400
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    video_path = UPLOAD_DIR / f"{run_id}{ext}"
+    video_path = UPLOADS_DIR / f"{run_id}{ext}"
     f.save(str(video_path))
 
     return jsonify({"video_path": str(video_path), "filename": f.filename})
@@ -512,7 +518,7 @@ def api_process():
 @app.route("/api/download/<path:filename>")
 def api_download(filename):
     safe_name = os.path.basename(filename)
-    file_path = OUTPUT_DIR / safe_name
+    file_path = OUTPUTS_DIR / safe_name
     if not file_path.exists():
         return jsonify({"error": "File not found"}), 404
     return send_file(str(file_path), as_attachment=True, download_name=safe_name)
