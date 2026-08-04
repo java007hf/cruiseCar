@@ -243,39 +243,86 @@ def _llm_vl_troubleshoot_text(summary, raw_len=None, raw_snippet=None):
     return "\n".join(lines)
 
 
-def llm_detect_boxes(image_path, user_description, max_retries=2):
+def llm_detect_boxes(image_path, user_description, max_retries=2, *, temperature=None, extra_rules=None, extra_user_note=None):
     """Ask multimodal LLM directly for normalized 0..1 bounding boxes of the described target.
 
-    Returns list of (x1, y1, x2, y2) tuples (normalized) or empty list if nothing detected.
-    On any failure / parse error returns empty list.
+    Parameters (keyword-only for extensibility):
+        temperature    - Override the default 0.0 sampling temperature. Higher values (0.3, 0.6) make
+                         the model re-examine more carefully instead of anchoring on "no target".
+        extra_rules    - Optional str appended to the "Rules (MANDATORY...)" section of the system
+                         prompt. Used by caller-side retry passes to add per-pass emphasis rules.
+                         The string is appended as a new bullet point, so callers should include the
+                         leading "- ".
+        extra_user_note - Optional str appended to the user prompt (after the description delimiter
+                          block) as an extra emphasis note. Good for "this is retry pass 2, please
+                          double-check even the tiny parts".
+
+    Returns (boxes, raw_diagnostics_tuple) where boxes is a list of (x1,y1,x2,y2) tuples (normalized)
+    and diagnostics tuple is (last_error: str|None, raw_reply_preview: str|None, n_attempts: int)
+    so callers can summarize failures for debugging. On any failure boxes will be empty.
     """
     # Accept both str and Path; the debug log reads .name so we always normalize to Path.
     if not isinstance(image_path, Path):
         image_path = Path(image_path)
 
+    # Pre-compute a bilingual prompt: keep user's original description + an English translation.
+    # VL models often generalize better when the concept is expressed in English (their training
+    # data is heavily English weighted), even when the user writes Chinese. We never modify the
+    # user description itself; just append the English gloss as a disambiguation.
+    english_gloss = _english_gloss_for(user_description)
+    bilingual_desc = user_description
+    if english_gloss and english_gloss.lower() != user_description.strip().lower():
+        bilingual_desc = f"{user_description} (English reference for the VL model: {english_gloss})"
+
     system_prompt = (
-        "You are a precise image annotator. You will be shown an image and a target description. "
+        "You are a precise, single-pixel-level careful image annotator. "
+        "You will be shown an image and a target object description in any language. "
         "Return ONLY a valid JSON object with this exact schema, and nothing else:\n"
         '{"boxes": [[x1, y1, x2, y2], ...]}\n\n'
-        "Rules:\n"
+        "Rules (MANDATORY, violations are fatal):\n"
+        "- You MUST output at least one box if ANY portion of the described target is visible. "
+        "This INCLUDES but is NOT LIMITED TO: partially occluded (e.g. covered by a hand, "
+        "a finger, a sleeve, another object), blurry / out of focus, at the image border "
+        "(cropped / cut off), or only a tiny sliver / arc / semicircle of a round cap is "
+        "showing. Do NOT output {\"boxes\": []} just because the object is small, or only "
+        "a small semicircle / partial circle is exposed — ALWAYS output its tight bounding "
+        "box anyway. If a round lid / cap is blocked by a hand so only a 10% circular arc "
+        "remains visible, you still MUST return the bounding box of the full underlying "
+        "circle (or as much as you can infer). In Chinese: 哪怕只露出一小部分半圆 / 被手遮挡 "
+        "/ 被其他物体挡住 / 只有一条弧形边露出 / 在画面边缘被裁掉了一部分，也必须框出来，"
+        "绝对不能因为只看到一小块就返回空 boxes。\n"
+        "- You MUST find every instance of the target. If there are 5 targets on screen "
+        "(even if some are only partially visible), return 5 boxes; do not return only one.\n"
         "- Coordinates are NORMALIZED floats in [0.0, 1.0], measured from the TOP-LEFT image corner. "
         "x is width axis, y is height axis. x1=left, y1=top, x2=right, y2=bottom.\n"
         "- Each box must satisfy 0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1.\n"
         "- Each box in 'boxes' MUST be a FLAT 4-element NUMBER ARRAY — do NOT wrap a box inside a "
         "JSON object with keys like 'bbox', 'bbox_2d', 'coords', 'points', 'xyxy', etc.\n"
-        "- Box should TIGHTLY enclose the target, exclude unrelated background.\n"
-        "- If multiple instances match the description, return all boxes.\n"
-        "- If NO matching object is clearly visible, return {\"boxes\": []}.\n"
+        "- Box should TIGHTLY enclose the target, exclude unrelated background. If only a sliver "
+        "of the target is visible, you may extrapolate to the full object outline if the shape "
+        "is obvious (e.g. a clearly round cap with 90% covered still gets its full-circle box).\n"
+        "- Only output {\"boxes\": []} when you are 100% confident NO matching object appears at all "
+        "(e.g. image is blank or the description describes something clearly not present).\n"
         "- Do NOT include Markdown fences (```), explanations, text, keys other than 'boxes', or extra whitespace."
     )
-    user_prompt = (
+    if extra_rules:
+        # Inject caller-supplied emphasis rules right before the closing of the Rules list so the
+        # LLM sees them in the same context window (and immediately after the core rules).
+        if not system_prompt.endswith("\n"):
+            system_prompt += "\n"
+        system_prompt += (extra_rules if extra_rules.startswith("-") else "- " + extra_rules) + "\n"
+    user_prompt_parts = [
         f"Target object description (any language, you must understand semantically):\n"
-        f"---\n{user_description}\n---\n\n"
+        f"---\n{bilingual_desc}\n---\n\n"
         "Return only {\"boxes\": [[x1,y1,x2,y2], ...]} with normalized coordinates for every matching instance. "
         'If nothing matches reply exactly {"boxes": []}.'
-    )
+    ]
+    if extra_user_note:
+        user_prompt_parts.append("\n\n" + extra_user_note)
+    user_prompt = "".join(user_prompt_parts)
 
     last_error = None
+    last_reply_preview = None
     for attempt in range(max_retries + 1):
         try:
             with open(image_path, "rb") as f:
@@ -287,11 +334,13 @@ def llm_detect_boxes(image_path, user_description, max_retries=2):
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
                 ],
             }]
-            raw = llm_chat(messages, temperature=0.0, max_tokens=1024)
+            raw = llm_chat(messages, temperature=(temperature if temperature is not None else 0.0), max_tokens=1024)
             raw = _normalize_llm_content(raw)
             if raw is None:
                 last_error = f"attempt {attempt+1}: LLM returned None"
+                last_reply_preview = None
                 continue
+            last_reply_preview = raw[:200]
             text = raw.strip()
             # Strip markdown code fences if any
             if text.startswith("```"):
@@ -338,14 +387,10 @@ def llm_detect_boxes(image_path, user_description, max_retries=2):
                 except (ValueError, TypeError):
                     continue
                 # Heuristic: detect pixel coordinates (e.g. the LLM returned 0..image size instead
-                # of 0..1). For a typical extraction-sized image, any coordinate > 1 means pixel scale;
-                # but we don't know the image size here, so we inspect the *distribution*: if any value
-                # exceeds 2 we treat the whole reply as pixel-scale and silently skip (caller will log
-                # last_error because the overall box count drops). For replies that use an intermediate
-                # percent-0..100 range (e.g. 0..99 floats) we also need to normalize.
+                # of 0..1). If any value > 1.5 treat as pixel-scale / percent-scale; if all <=100
+                # treat percent-scale and divide by 100; otherwise reject the single box.
                 if any(v > 1.5 for v in (x1, y1, x2, y2)):
                     if all(v <= 100.0 for v in (x1, y1, x2, y2)):
-                        # Treat as 0..100 percent scale → divide by 100
                         x1, y1, x2, y2 = x1 / 100.0, y1 / 100.0, x2 / 100.0, y2 / 100.0
                     else:
                         last_error = (
@@ -359,7 +404,7 @@ def llm_detect_boxes(image_path, user_description, max_retries=2):
                 if bw < 0.005 or bh < 0.005:
                     continue
                 boxes.append((x1, y1, x2, y2))
-            return boxes
+            return boxes, (last_error, last_reply_preview, attempt + 1)
         except json.JSONDecodeError as e:
             last_error = f"attempt {attempt+1}: JSONDecodeError on reply: {e} (snippet: {text[:80]!r})"
             continue
@@ -368,7 +413,46 @@ def llm_detect_boxes(image_path, user_description, max_retries=2):
             continue
     # All attempts exhausted
     print(f"[LLM] detect_boxes failed after {max_retries+1} tries on {image_path.name}: {last_error}")
-    return []
+    return [], (last_error, last_reply_preview, max_retries + 1)
+
+
+def _english_gloss_for(user_description: str) -> str:
+    """Very small Chinese->English glossary for common VL '瓶盖 / 北冰洋罐 / 汽车' style prompts.
+    We intentionally only cover a handful of phrases because for arbitrary prompts this is out of
+    scope; anything not covered returns empty string so callers skip the append.
+    """
+    text = user_description.strip()
+    if not text:
+        return ""
+    gloss = text
+    replacements = [
+        ("红色的盖子", "red round cap / red lid (like a bottle cap)"),
+        ("红色 圆形的盖子", "red round cap / red lid, circular bottle cap"),
+        ("红色圆形盖子", "red round cap / red lid, circular bottle cap"),
+        ("红色盖子", "red cap / red lid (bottle cap, can lid, etc.)"),
+        ("盖子", "cap / lid (bottle cap, can lid)"),
+        ("瓶盖", "bottle cap / can lid"),
+        ("北冰洋", "Arctic Ocean brand soda can (cylindrical drink can, usually orange / red / yellow)"),
+        ("北冰洋汽水", "Arctic Ocean orange soda can, cylindrical"),
+        ("罐子", "metal can, soda can"),
+        ("易拉罐", "aluminum soda / beverage can"),
+        ("汽车", "car / automobile / vehicle"),
+        ("红色汽车", "red car"),
+        ("人", "person / human"),
+        ("行人", "pedestrian / person"),
+        ("猫", "cat"),
+        ("狗", "dog"),
+        ("杯子", "cup / mug"),
+        ("瓶子", "bottle"),
+        ("手机", "cell phone / smartphone"),
+    ]
+    for ch, en in replacements:
+        if ch in gloss:
+            # Don't double-substitute; just replace once
+            gloss = gloss.replace(ch, en, 1)
+    if gloss == text:
+        return ""
+    return gloss
 
 
 def update_status(step, progress, message="", log=None):
@@ -498,12 +582,191 @@ def auto_label_frames(frames_dir, labels_dir, class_name):
     total_boxes = 0
     parse_errors = 0
     empty_frames = 0
+    llm_failures = 0          # LLM communication / parse / empty-reply failures (not "no object visible" cases)
+    # Post-process retry stats: the extra 2 passes for truly-empty frames to squeeze more recall.
+    r1_frames = 0             # pass 1 (default) first-try: how many frames got boxes on pass 1
+    r2_retry_count = 0        # how many frames went into pass 2
+    r2_salvaged = 0           # how many of them got boxes via pass 2
+    r3_retry_count = 0        # how many still-empty frames went into pass 3
+    r3_salvaged = 0           # how many of them got boxes via pass 3
+    r13_all_empty = 0         # how many stayed empty after all 3 passes
+    diagnostics = []          # (frame_name, last_error, raw_reply_preview) for failures
+    consecutive_empty = 0
+    CONSECUTIVE_EMPTY_ABORT = 10  # after this many consecutive fully-empty LLM replies, abort pipeline
+    consecutive_broken = 0
+    CONSECUTIVE_BROKEN_ABORT = 5  # after this many consecutive parse / empty-string / None reply, abort
+    MAX_EMPTY_RETRY_PASSES = 2    # user-requested: up to 2 additional runs for "no result" frames (pass 2 & 3)
+
+    # Output dir for copies of images that failed LLM reply + their diagnostic txt. User can inspect
+    # them visually after a run, or use them to re-test llm_detect_boxes manually.
+    failures_dir = labels_dir.parent / "failures"
+    if failures_dir.exists():
+        for p in list(failures_dir.iterdir()):
+            p.unlink()
+    failures_dir.mkdir(exist_ok=True)
+
     t_total_start = time.time()
 
     for idx, img_path in enumerate(image_files):
         t0 = time.time()
-        boxes = llm_detect_boxes(str(img_path), class_name, max_retries=2)
+        boxes, diag = llm_detect_boxes(str(img_path), class_name, max_retries=2)
+        (last_error, raw_preview, _n_attempts) = diag
+        final_pass_used = 1  # pass 1 is the default run
         dt = time.time() - t0
+
+        had_llm_failure = bool(last_error and "empty string" in last_error) or bool(
+            last_error and ("returned None" in last_error or "JSONDecodeError" in last_error or "no JSON object braces" in last_error)
+        )
+        if had_llm_failure:
+            llm_failures += 1
+            consecutive_broken += 1
+            consecutive_empty += 1 if (last_error and "empty string" in last_error) else 0
+            diagnostics.append((img_path.name, last_error or "", raw_preview or ""))
+            # Save a diagnostic copy: JPG + sidecar .txt with error + preview + user description
+            try:
+                shutil.copy2(img_path, failures_dir / img_path.name)
+                sidecar = failures_dir / f"{img_path.stem}.txt"
+                lines = [
+                    f"user_description: {class_name}",
+                    f"final_pass_used: {final_pass_used}",
+                    f"last_error: {last_error or ''}",
+                    f"raw_reply_preview: {raw_preview or ''}",
+                ]
+                sidecar.write_text("\n".join(lines), encoding="utf-8")
+            except Exception:
+                pass
+            # Abort thresholds — if we're clearly not getting valid replies anymore, stop early
+            # instead of burning minutes while the OOM'd / frozen server returns empty strings.
+            if consecutive_broken >= CONSECUTIVE_BROKEN_ABORT:
+                summary_err = (
+                    f"LLM 连续 {CONSECUTIVE_BROKEN_ABORT} 帧都失败（最近一次: {last_error}）。"
+                    "这通常意味着 llama-server 显存占用过高 / OOM 导致推理失败或超时。\n"
+                    "修复建议: 1) 重启 llama-server；2) 降低 -b / -ngl / --mlock 等减少显存占用；"
+                    "3) 确认 -c 上下文长度足够放图像占位 token；4) 若视频太长，降低抽帧 fps。"
+                )
+                update_status("failed", 0, "LLM 连续失败，已中止标注。", summary_err)
+                raise RuntimeError(summary_err)
+            if consecutive_empty >= CONSECUTIVE_EMPTY_ABORT:
+                summary_err = (
+                    f"LLM 连续 {CONSECUTIVE_EMPTY_ABORT} 帧返回空字符串（reply was empty string）。"
+                    "典型原因: llama-server 视觉编码管线崩了（mmproj 加载错误 / OOM）。\n"
+                    "修复建议: 重启 llama-server 并重试；如仍然失败，降低抽帧 fps。"
+                )
+                update_status("failed", 0, "LLM 连续空回复，已中止标注。", summary_err)
+                raise RuntimeError(summary_err)
+        else:
+            consecutive_broken = 0
+            consecutive_empty = 0
+            # ==========================================================
+            # USER REQUESTED RETRY LOGIC: up to 2 extra passes for
+            # frames that returned boxes=[] (truly empty) on pass 1.
+            # ==========================================================
+            if not boxes:
+                # Retry pass 2: temperature=0.3, append aggressive rule asking the LLM to
+                # re-examine extremely small slivers / partial circles / hand-shielded regions.
+                r2_retry_count += 1
+                t_p2 = time.time()
+                boxes_r2, diag_r2 = llm_detect_boxes(
+                    str(img_path), class_name, max_retries=1,
+                    temperature=0.3,
+                    extra_rules=(
+                        "- EXTREMELY IMPORTANT RE-EXAMINATION RULE (retry pass 2 / 3): "
+                        "The previous run for this same image returned boxes=[] which was likely "
+                        "wrong. Re-examine every 1x1 pixel patch with extreme care. Look for the "
+                        "target object EVEN IF IT IS: (a) only a tiny sliver of red semicircle/arc "
+                        "visible on the image border, (b) covered by a hand / finger so only the "
+                        "edge curve is showing, (c) smaller than 5% of the image area, "
+                        "(d) so blurry that you can barely make out the circular outline. "
+                        "漏检（false negative）比误检严重得多。In Chinese: 请极其仔细地重新检查整张图片，"
+                        "特别是画面边缘和被手/手指/其他物体遮挡的局部区域；只要有任何一丝、一条"
+                        "弧形边、1/4个圆形、一个小红点看起来像目标，都必须框出来，绝不允许因为只有"
+                        "极小一部分就返回空 boxes。漏检比误检的后果要严重得多。\n"
+                    ),
+                    extra_user_note=(
+                        "This is RETRY PASS 2/3 for this image. My previous answer to the same "
+                        "question was boxes=[] and it was almost certainly a false negative. "
+                        "Overrule your previous confidence: if there is even a 10% chance the "
+                        "target appears anywhere (partially visible, tiny, obscured), output the "
+                        "box instead of returning empty. / 这是对这张图的重试第 2/3 轮，请推翻之前"
+                        "的判断，哪怕只有一成把握有目标也必须框出来。"
+                    ),
+                )
+                dt += (time.time() - t_p2)
+                (r2_last_err, r2_raw_prev, _r2_att) = diag_r2
+                if boxes_r2:
+                    boxes = boxes_r2
+                    last_error = r2_last_err  # may be None or leftover warning; r2 actually succeeded
+                    raw_preview = r2_raw_prev
+                    final_pass_used = 2
+                    r2_salvaged += 1
+                    # Override had_llm_failure for r2-only if r2 had a failure (shouldn't happen
+                    # when boxes_r2 is non-empty, but guard anyway).
+                    had_llm_failure = bool(r2_last_err and ("empty string" in r2_last_err or
+                        "returned None" in r2_last_err or "JSONDecodeError" in r2_last_err or
+                        "no JSON object braces" in r2_last_err))
+                else:
+                    # Retry pass 3 / 3: temperature=0.6, more aggressive.
+                    r3_retry_count += 1
+                    t_p3 = time.time()
+                    boxes_r3, diag_r3 = llm_detect_boxes(
+                        str(img_path), class_name, max_retries=1,
+                        temperature=0.6,
+                        extra_rules=(
+                            "- CRITICAL FINAL RE-EXAMINATION RULE (retry pass 3 / 3): "
+                            "This is your LAST CHANCE on this image. There is VERY STRONG "
+                            "prior belief that the target is present in this image even if "
+                            "you can't see it clearly. You MUST output at least one box "
+                            "UNLESS the image truly contains nothing that could possibly be "
+                            "the target. In Chinese: 这是最后一次重试机会。此帧图片在数据集里"
+                            "极大概率确实包含你要找的目标，请再放大想象细看画面边缘、被手遮挡"
+                            "的局部、模糊的弧形边缘、只有一小条红色圆弧的地方；只要有任何可能"
+                            "是目标就必须框出来，不到万不得已不要返回空。"
+                        ),
+                        extra_user_note=(
+                            "FINAL RETRY PASS 3/3. Overrule your prior two empty-box decisions. "
+                            "It is MUCH better to return a slightly-off box than to miss the "
+                            "target entirely. / 这是最后一次重试，推翻前两次的空判断，漏检远"
+                            "比误检糟糕，请宁可多框一个可疑区域也不要返回空。"
+                        ),
+                    )
+                    dt += (time.time() - t_p3)
+                    (r3_last_err, r3_raw_prev, _r3_att) = diag_r3
+                    if boxes_r3:
+                        boxes = boxes_r3
+                        last_error = r3_last_err
+                        raw_preview = r3_raw_prev
+                        final_pass_used = 3
+                        r3_salvaged += 1
+                        had_llm_failure = bool(r3_last_err and ("empty string" in r3_last_err or
+                            "returned None" in r3_last_err or "JSONDecodeError" in r3_last_err or
+                            "no JSON object braces" in r3_last_err))
+            if not boxes and not had_llm_failure:
+                empty_frames += 1  # truly no object (reply boxes: []), not a failure (after all 3 passes)
+                r13_all_empty += 1
+            elif boxes and final_pass_used == 1:
+                r1_frames += 1
+            if not boxes:
+                # Save per-frame diagnostic for empty frames (whether truly-empty or LLM failed)
+                # so user can see which passes were tried and what the last reply looked like.
+                try:
+                    shutil.copy2(img_path, failures_dir / img_path.name)
+                    sidecar = failures_dir / f"{img_path.stem}.txt"
+                    lines = [
+                        f"user_description: {class_name}",
+                        f"final_pass_used: {final_pass_used}",
+                    ]
+                    if r2_retry_count or final_pass_used >= 2:
+                        lines += [
+                            f"r2_was_tried: {'yes' if r2_retry_count else 'no'}",
+                            f"r3_was_tried: {'yes' if (r3_retry_count and final_pass_used in (1,3)) or final_pass_used == 3 else 'no'}",
+                        ]
+                    lines += [
+                        f"last_error: {last_error or ''}",
+                        f"raw_reply_preview: {raw_preview or ''}",
+                    ]
+                    sidecar.write_text("\n".join(lines), encoding="utf-8")
+                except Exception:
+                    pass
 
         label_path = labels_dir / f"{img_path.stem}.txt"
         if boxes:
@@ -516,12 +779,25 @@ def auto_label_frames(frames_dir, labels_dir, class_name):
                     f.write(f"0 {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
             labeled += 1
             total_boxes += len(boxes)
-            log_msg = f"Labeled: {img_path.name} ({len(boxes)} box, {dt:.1f}s)"
+            extra_parts = []
+            if final_pass_used >= 2:
+                extra_parts.append(f"pass{final_pass_used} salvaged")
+            if last_error:
+                extra_parts.append(f"last_err={last_error}")
+            extra = f" ({'; '.join(extra_parts)})" if extra_parts else ""
+            log_msg = f"Labeled: {img_path.name} ({len(boxes)} box, {dt:.1f}s){extra}"
         else:
             # write empty file (consistent with YOLO negatives)
             label_path.write_text("")
-            empty_frames += 1
-            log_msg = f"Skipped: {img_path.name} — LLM returned 0 boxes ({dt:.1f}s)"
+            # empty_frames incremented once in the pass1/2/3 block above to avoid double-counting.
+            if had_llm_failure:
+                log_msg = (
+                    f"Failed: {img_path.name} — {last_error} ({dt:.1f}s)"
+                )
+                parse_errors += 1
+            else:
+                tries = f" (3-passes empty, r2/r3 tried)" if final_pass_used >= 2 else ""
+                log_msg = f"Skipped: {img_path.name} — no matching object ({dt:.1f}s){tries}"
 
         progress = int((idx + 1) / total * 100)
         update_status(
@@ -531,12 +807,50 @@ def auto_label_frames(frames_dir, labels_dir, class_name):
             log_msg,
         )
 
+    # Emit a consolidated per-run diagnostic report so the user can eyeball which frames went bad
+    # without scrolling through 64 lines of log.
+    report_path = labels_dir.parent / "labeling_report.txt"
+    lines = [
+        f"user_description: {class_name}",
+        f"total_frames: {total}",
+        f"labeled_frames: {labeled}",
+        f"  - pass1 (default, temperature=0.0) first-hit labeled: {r1_frames}",
+        f"  - pass2 (retry, temperature=0.3) salvaged (was empty on pass1): {r2_salvaged} / {r2_retry_count}",
+        f"  - pass3 (retry, temperature=0.6) salvaged (was still empty after pass2): {r3_salvaged} / {r3_retry_count}",
+        f"  - all 3 passes empty (still no boxes): {r13_all_empty}",
+        f"totally_empty_frames (no-object reply + failure frames): {empty_frames + llm_failures}",
+        f"truly_empty_frames (boxes=[] after all 3 passes, no LLM failure): {empty_frames}",
+        f"llm_failure_frames (empty-string / None / parse error): {llm_failures}",
+        f"total_boxes: {total_boxes}",
+        f"total_seconds: {time.time() - t_total_start:.1f}",
+        "",
+    ]
+    if diagnostics:
+        lines.append(f"failure details (n={len(diagnostics)}):")
+        for name, err, preview in diagnostics:
+            lines.append(f"  - {name}: {err}")
+            if preview:
+                lines.append(f"      reply_preview: {preview[:400]}")
+    else:
+        lines.append("No LLM failures detected this run.")
+    try:
+        report_path.write_text("\n".join(lines), encoding="utf-8")
+        print(f"[auto_label_frames] Report written to: {report_path}")
+    except Exception:
+        pass
+
     total_dt = time.time() - t_total_start
     update_status(
         "labeling",
         100,
         f"LLM 标注完成: {labeled}/{total} 帧有标注 (共 {total_boxes} 个框, {total_dt:.0f}s)",
-        f"有标注 {labeled}, 空帧 {empty_frames}, 总框数 {total_boxes}, 总耗时 {total_dt:.1f}s, 平均 {total_dt/max(1,total):.1f}s/帧",
+        (
+            f"有标注 {labeled} (首轮命中 {r1_frames}, 第2轮救回 {r2_salvaged}/{r2_retry_count}, "
+            f"第3轮救回 {r3_salvaged}/{r3_retry_count}), 真正空帧(3轮都没物体) {empty_frames}, "
+            f"LLM故障帧 {llm_failures}, 总框数 {total_boxes}, 总耗时 {total_dt:.1f}s, "
+            f"平均 {total_dt/max(1,total):.1f}s/帧。详细报告: {report_path.name}；"
+            f"失败图片和侧车 txt 在: {failures_dir.name}/"
+        ),
     )
 
     return labeled
@@ -665,7 +979,23 @@ def run_pipeline(video_path, class_name, config):
 
         tracker = ProgressTracker()
 
-        results = model.train(
+        # Register progress via model.add_callback. The older `callbacks={...}` kwarg was
+        # removed from ultralytics get_cfg in recent versions (causes
+        # SyntaxError: 'callbacks' is not a valid YOLO argument), so we must NOT pass it
+        # through the overrides dict (which is what **model.train(kwargs) feeds to get_cfg).
+        # See https://docs.ultralytics.com/integrations/callbacks/
+        try:
+            model.add_callback("on_fit_epoch_end", tracker)
+        except Exception:
+            # Some older builds still use the `on_epoch_end` event name instead
+            try:
+                model.add_callback("on_epoch_end", tracker)
+            except Exception:
+                # If neither event works we still want to run training; progress bar will
+                # just stay coarse-grained from the run_pipeline finalization markers.
+                pass
+
+        train_kwargs = dict(
             data=str(yaml_path),
             epochs=epochs,
             imgsz=imgsz,
@@ -674,8 +1004,10 @@ def run_pipeline(video_path, class_name, config):
             workers=workers,
             project=str(OUTPUTS_DIR),
             name=run_id,
-            callbacks={"on_epoch_end": tracker},
+            # NOTE: do NOT add `callbacks=...` here. Ultralytics >= v8.4 rejects it with
+            #       SyntaxError: 'callbacks' is not a valid YOLO argument.
         )
+        results = model.train(**train_kwargs)
 
         best_model_path = OUTPUTS_DIR / run_id / "weights" / "best.pt"
         if not best_model_path.exists():

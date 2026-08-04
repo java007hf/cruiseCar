@@ -28,6 +28,11 @@ ml/datasets/**
 #                     re-downloadable. Keep skeleton .gitkeep only.
 ml/weights/**
 !ml/weights/.gitkeep
+# base weights may also be dropped directly under ml/ by accident (e.g. ultralytics default
+# save path), also ignore those to avoid polluting history.
+ml/yolo*.pt
+ml/*.pt
+# (keeps only `ml/outputs/*.pt` via the outputs/ whitelist below — and uploads/*.mov as source videos)
 
 # 4) _tmp/         -> transient scratch pad, always ignore.
 ml/_tmp/**
