@@ -13,7 +13,14 @@ ml/**/runs*/
 ml/beibingyang_yolo/frames/
 ml/beibingyang_yolo/labels/
 ml/beibingyang_yolo/preview/
+ml/beibingyang_yolo/_uploads/
+ml/beibingyang_yolo/_dataset/
+ml/beibingyang_yolo/_outputs/
+ml/beibingyang_yolo/_tmp/
 ml/**/*.cache
+ml/**/__pycache__/
 runs/
+weights/
 yolo*.pt
+yolov8s-worldv2.pt
 android-app/app/src/main/assets/target_object.jpg

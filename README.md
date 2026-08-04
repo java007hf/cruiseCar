@@ -58,6 +58,7 @@ The sender and receiver apps now share a 10-byte TCP control frame model:
 └── ml/
     └── beibingyang_yolo/
         ├── auto_label_orange.py     # helper used to bootstrap labels from the orange can region
+        ├── train_server.py          # web-based training platform (Flask + YOLO-World + LLM)
         ├── beibingyang.yaml         # Ultralytics dataset config
         ├── dataset/
         │   ├── images/train/
@@ -77,9 +78,15 @@ ml/**/.venv*/
 ml/beibingyang_yolo/frames/
 ml/beibingyang_yolo/labels/
 ml/beibingyang_yolo/preview/
+ml/beibingyang_yolo/_uploads/
+ml/beibingyang_yolo/_dataset/
+ml/beibingyang_yolo/_outputs/
+ml/beibingyang_yolo/_tmp/
 ml/**/runs*/
+ml/**/__pycache__/
 runs/
-yolo11n.pt
+weights/
+yolo*.pt
 ```
 
 TCP ports:
@@ -231,3 +238,68 @@ output: [1, 5, 3549] float32 YOLO boxes/classes
 `ObjectRecognitionDemo.kt` supports both NCHW and NHWC RGB TFLite inputs and parses YOLO output layouts `[1, boxes, attrs]` and `[1, attrs, boxes]`.
 
 The initial training set contains 53 frames from one video, so it is good for validating the pipeline and detecting the same can in similar desk scenes. For robust detection, add more short videos with different distances, rotations, lighting, backgrounds, and partial occlusion, then repeat the same extract-label-train-export cycle.
+
+## Web-Based Training Platform
+
+`ml/beibingyang_yolo/train_server.py` is a one-file Flask app that wraps the entire extract-label-train pipeline into a browser UI. Instead of running CLI commands manually, you upload a video, type the object name, and click one button.
+
+### Prerequisites
+
+The existing `.venv` already has `ultralytics`, `opencv-python`, `torch` (CUDA), and `flask` installed. The app also downloads `yolov8s-worldv2.pt` (YOLO-World) and `yolo11n.pt` on first run.
+
+Optional: a local LLM server (e.g. `llama.cpp` with `qwen3.5`) at `http://127.0.0.1:12345` for enhanced auto-labeling. The app works without it.
+
+### Start the server
+
+```powershell
+cd ml/beibingyang_yolo
+.\.venv\Scripts\python.exe train_server.py
+```
+
+Open `http://127.0.0.1:5000` in the browser.
+
+### Usage
+
+1. **Upload video** — drag and drop or click the upload area (MP4, AVI, MOV, MKV, WEBM, etc.).
+2. **Enter the target object name** — use English, e.g. `beibingyang_can`, `bottle`, `red_car`.
+3. **(Optional) Advanced settings** — adjust frame extraction FPS, confidence threshold, train/val split ratio, epochs, image size, batch size, and device.
+4. **(Optional) Enable LLM** — check "use local LLM" to let `qwen3.5` generate richer detection prompts and verify low-confidence detections visually.
+5. **Click "Start Training"** — the pipeline runs in the background with real-time progress:
+   - **Extract frames** — OpenCV extracts keyframes at the configured FPS.
+   - **Auto-label** — YOLO-World detects the target object using text prompts and generates YOLO format labels. If LLM is enabled, it enhances prompts and verifies uncertain detections.
+   - **Split dataset** — frames are split into train/val sets and a `dataset.yaml` is generated.
+   - **Train** — Ultralytics trains a YOLO11n model with the configured parameters.
+6. **Download** — when training finishes, click the download button to save the `.pt` model file.
+
+### Pipeline architecture
+
+```text
+Browser UI (HTML/CSS/JS)
+  │
+  ├─ POST /api/upload      → save video to _uploads/
+  ├─ POST /api/process     → start background pipeline thread
+  ├─ GET  /api/status      → poll progress (step, %, logs)
+  ├─ GET  /api/llm_status  → check local LLM availability
+  └─ GET  /api/download    → download trained .pt file
+
+Backend (Flask, single file)
+  │
+  ├─ extract_frames()      → cv2.VideoCapture → JPG frames
+  ├─ auto_label_frames()   → YOLO-World text-prompted detection
+  │    ├─ generate_prompts()      → default heuristic prompts
+  │    ├─ generate_llm_prompts()  → LLM-enhanced prompts (optional)
+  │    └─ llm_analyze_image()     → visual verification (optional)
+  ├─ split_dataset()       → train/val split + dataset.yaml
+  └─ YOLO.train()          → ultralytics training API
+```
+
+### Output locations
+
+```text
+ml/beibingyang_yolo/
+  _uploads/        → uploaded videos (gitignored)
+  _dataset/        → extracted frames, labels, dataset.yaml (gitignored)
+  _outputs/        → training run directories and final .pt models (gitignored)
+```
+
+The final model is saved as `_outputs/{class_name}_{timestamp}.pt`.
