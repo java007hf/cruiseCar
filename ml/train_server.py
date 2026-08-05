@@ -42,6 +42,20 @@ state = {
 }
 state_lock = threading.Lock()
 
+# ---- Manual labeling session globals ----
+# When run_pipeline reaches "waiting_manual_label", _MANUAL_LABEL_EVENT stays
+# unsignaled (blocks pipeline thread) until the user clicks the UI "完成"
+# button which calls /api/manual_label/complete → .set() wakes the thread.
+_MANUAL_LABEL_EVENT = threading.Event()
+_MANUAL_LABEL_CTX = {
+    # Populated by run_pipeline before signaling the wait:
+    "run_id": None,
+    "frames_dir": None,   # str: Path to extracted raw JPGs (same dir train_server reads)
+    "labels_dir": None,   # str: Path where YOLO .txt labels should be written
+    "todo_filenames": [],  # list[str] basenames (frame_XXXX.jpg) of frames with NO .txt yet
+    "done_filenames": set(),  # basenames saved OR skipped via API (so UI never re-prompts)
+}
+
 LLM_BASE_URL = "http://127.0.0.1:12345"
 LLM_MODEL = "qwen3.5"
 
@@ -789,6 +803,15 @@ def reset_state():
         state["logs"] = []
         state["error"] = None
         state["result"] = None
+    # Also clean up any leftover manual-labeling globals so a new run starts fresh.
+    _MANUAL_LABEL_EVENT.clear()
+    _MANUAL_LABEL_CTX.update({
+        "run_id": None,
+        "frames_dir": None,
+        "labels_dir": None,
+        "todo_filenames": [],
+        "done_filenames": set(),
+    })
 
 
 def extract_frames(video_path, output_dir, fps=2):
@@ -1533,6 +1556,54 @@ def run_pipeline(video_path, class_name, config):
         labeled_count = auto_label_frames(frames_dir, labels_dir, class_name)
         update_status("labeling", 100, f"Labeled {labeled_count}/{frame_count} frames", f"Labeling complete: {labeled_count}/{frame_count} frames with detections")
 
+        # --------------------------- MANUAL LABEL BRIDGE ---------------------------
+        # If the user checked "允许人工标注补漏" (default True), pause the pipeline
+        # thread here after auto-labeling and expose the frames that have NO .txt label
+        # yet (either LLM returned boxes=[], LLM failed and aborted early, or any
+        # other gap) to the web UI for manual mouse-drag bbox annotation.
+        # After user presses "完成", /api/manual_label/complete calls
+        # _MANUAL_LABEL_EVENT.set() which returns us to splitting/training below.
+        enable_manual_label = bool(config.get("enable_manual_label", True))
+        if enable_manual_label:
+            all_jpgs = sorted([p.name for p in frames_dir.glob("*.jpg")])
+            if all_jpgs:
+                # Unlabeled = JPG exists but corresponding YOLO .txt does NOT yet exist.
+                # This covers every case:
+                #   - LLM returned "boxes":[] → we never write .txt (matches skip semantics).
+                #   - LLM crashed mid-run (5-frame empty / bad-json abort) → tail frames have no txt.
+                #   - LLM genuinely couldn't find the object in those frames → user chooses
+                #     "跳过此帧" which writes an empty .txt (negative / background sample).
+                unlabeled_basenames = [
+                    jpg_name
+                    for jpg_name in all_jpgs
+                    if not (labels_dir / (Path(jpg_name).stem + ".txt")).exists()
+                ]
+                if unlabeled_basenames:
+                    _MANUAL_LABEL_EVENT.clear()
+                    _MANUAL_LABEL_CTX.update({
+                        "run_id": run_id,
+                        "frames_dir": str(frames_dir),
+                        "labels_dir": str(labels_dir),
+                        "todo_filenames": list(unlabeled_basenames),
+                        "done_filenames": set(),
+                    })
+                    update_status(
+                        "waiting_manual_label",
+                        50,
+                        f"LLM 标注完成，待人工补标 {len(unlabeled_basenames)} 张。请在页面框选后点『全部完成』继续。",
+                        f"Manual labeling phase: {len(unlabeled_basenames)} unlabeled / {len(all_jpgs)} total frames. "
+                        f"UI shows each frame; user saves bboxes as YOLO-format .txt or skips (empty .txt negative).",
+                    )
+                    # Block the pipeline daemon thread indefinitely here. This is why
+                    # we run run_pipeline in a threading.Thread (not the Flask request
+                    # handler): a synchronous HTTP worker would tie up a gunicorn/werkzeug
+                    # worker indefinitely. /api/reset clears the event via reset_state()
+                    # above so a canceled run can be restarted cleanly without deadlock.
+                    _MANUAL_LABEL_EVENT.wait()
+                    # Count txts again after manual save/skip pass to propagate correct
+                    # "labeled_count" to set_done() result + "if labeled_count == 0" check.
+                    labeled_count = len(list(labels_dir.glob("*.txt")))
+
         if labeled_count == 0:
             raise RuntimeError(
                 "No objects detected in any frame. Please check:\n"
@@ -1734,6 +1805,7 @@ def api_process():
         "conf_threshold": data.get("conf_threshold", 0.25),
         "train_ratio": data.get("train_ratio", 0.9),
         "use_llm": data.get("use_llm", False),
+        "enable_manual_label": bool(data.get("enable_manual_label", True)),
     }
 
     t = threading.Thread(target=run_pipeline, args=(video_path, class_name, config), daemon=True)
@@ -1755,6 +1827,167 @@ def api_download(filename):
 def api_reset():
     reset_state()
     return jsonify({"status": "reset"})
+
+
+# -------------------------- Manual Labeling APIs --------------------------
+# These APIs form the bidirectional bridge between the web UI's "人工补标"
+# canvas widget and the run_pipeline daemon thread (blocked on
+# _MANUAL_LABEL_EVENT.wait() inside run_pipeline MANUAL LABEL BRIDGE above).
+
+@app.route("/api/frame/<run_id>/<path:filename>")
+def api_manual_frame(run_id: str, filename: str):
+    """Serve extracted raw JPG for a single frame inside the manual-label phase.
+
+    Security: only allow serving files directly under EXTRACTIONS_DIR/<run_id>/
+    (canonical per-run frame directory).  Path traversal (../../) is blocked by
+    stripping to just the leaf basename of `filename` before joining.
+    """
+    safe_basename = Path(filename).name  # drop any directory components
+    candidate = EXTRACTIONS_DIR / run_id / safe_basename
+    # Double-check the resolved path still lives under EXTRACTIONS_DIR after symlink follow
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (FileNotFoundError, RuntimeError):
+        return jsonify({"error": "Frame not found"}), 404
+    if not str(resolved).startswith(str(EXTRACTIONS_DIR.resolve())):
+        return jsonify({"error": "Forbidden"}), 403
+    return send_file(str(resolved))
+
+
+@app.route("/api/manual_label/todo")
+def api_manual_todo():
+    """Return the list of frames still missing a label.
+
+    Called by the UI as soon as /api/status reports step='waiting_manual_label'.
+    Response shape:
+      { run_id, todo: string[], done: string[], total }
+    """
+    with state_lock:
+        todo = list(_MANUAL_LABEL_CTX["todo_filenames"])
+        done = sorted(_MANUAL_LABEL_CTX["done_filenames"])
+        return jsonify({
+            "run_id": _MANUAL_LABEL_CTX["run_id"],
+            "todo": todo,
+            "done": done,
+            "total": len(todo),
+        })
+
+
+@app.route("/api/manual_label/save", methods=["POST"])
+def api_manual_save():
+    """Persist a list of user-drawn bboxes into YOLO .txt label for one frame.
+
+    Input JSON: { filename: "frame_0007.jpg", boxes: [[cx,cy,bw,bh], ...] }
+      - coords are 0..1 normalized (same format YOLO dataset expects).
+      - class_id is always written as 0 (single-class pipeline, matches
+        dataset.yaml names=[class_name] → index 0).
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    filename = str(body.get("filename", "")).strip()
+    boxes = body.get("boxes") or []
+    if not filename or not _MANUAL_LABEL_CTX["run_id"]:
+        return jsonify({"error": "Missing filename / no active manual-label session"}), 400
+    if not isinstance(boxes, list):
+        return jsonify({"error": "'boxes' must be a list of [cx,cy,bw,bh] normalized coords"}), 400
+
+    safe_base = Path(filename).name
+    labels_dir = Path(_MANUAL_LABEL_CTX["labels_dir"])
+    if not labels_dir.exists():
+        return jsonify({"error": "Labels directory not ready yet"}), 400
+    label_path = labels_dir / f"{Path(safe_base).stem}.txt"
+
+    def _clamp(v: float) -> float:
+        return max(0.0, min(1.0, float(v)))
+
+    lines_out = []
+    for box in boxes:
+        if not (isinstance(box, (list, tuple)) and len(box) >= 4):
+            continue
+        try:
+            cx, cy, bw, bh = _clamp(box[0]), _clamp(box[1]), _clamp(box[2]), _clamp(box[3])
+        except (TypeError, ValueError):
+            continue
+        if bw < 1e-4 or bh < 1e-4:
+            continue  # ignore zero-size box (occasional 1-px click-drag glitch)
+        lines_out.append(f"0 {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
+    label_path.write_text("".join(lines_out), encoding="utf-8")
+    # Mark frame as "processed" so the UI won't re-surface it when reloading
+    # the todo list after save.  We write to done_filenames regardless of
+    # whether lines_out is empty: user pressed "Save" explicitly on a 0-box
+    # canvas → they considered it a negative / background frame (which is what
+    # an empty .txt means to both YOLO and our split_dataset copytree below).
+    with state_lock:
+        _MANUAL_LABEL_CTX["done_filenames"].add(safe_base)
+    return jsonify({
+        "ok": True,
+        "saved": label_path.name,
+        "box_count": len(lines_out),
+    })
+
+
+@app.route("/api/manual_label/skip", methods=["POST"])
+def api_manual_skip():
+    """Mark frame as "no target present" by writing an empty YOLO label.
+
+    Semantically equivalent to save() with boxes=[] (which also writes an
+    empty .txt). This gives the UI a clearly-labelled action path so users
+    don't have to think about "Save with zero boxes = negative sample".
+
+    An empty .txt tells both split_dataset (copytree into train split) and
+    ultralytics YOLO: "this frame contains zero instances of any class"
+    → treated as negative / background sample, improves classifier margin.
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    filename = str(body.get("filename", "")).strip()
+    if not filename or not _MANUAL_LABEL_CTX["run_id"]:
+        return jsonify({"error": "Missing filename / no active manual-label session"}), 400
+    safe_base = Path(filename).name
+    labels_dir = Path(_MANUAL_LABEL_CTX["labels_dir"])
+    label_path = labels_dir / f"{Path(safe_base).stem}.txt"
+    label_path.write_text("", encoding="utf-8")  # empty = negative frame
+    with state_lock:
+        _MANUAL_LABEL_CTX["done_filenames"].add(safe_base)
+    return jsonify({"ok": True, "skipped": label_path.name})
+
+
+@app.route("/api/manual_label/complete", methods=["POST"])
+def api_manual_complete():
+    """Release the run_pipeline daemon thread to continue with dataset split
+    and training phases once the user has finished save/skip on every frame
+    they care about (or explicitly choose to proceed with remaining gaps).
+
+    We do NOT force the user to touch every frame: we accept "complete" even
+    when some todo items are not in done_filenames, because those untouched
+    frames simply keep their original "no .txt" state → behave the same as
+    they would without the manual-label phase at all (equivalent to cancelling
+    the manual pass on those specific frames).
+    """
+    if not _MANUAL_LABEL_CTX["run_id"]:
+        return jsonify({"error": "No active manual-label session. Start training first."}), 400
+    remaining = sum(
+        1 for f in _MANUAL_LABEL_CTX["todo_filenames"]
+        if f not in _MANUAL_LABEL_CTX["done_filenames"]
+    )
+    # Signal the daemon thread (blocked on _MANUAL_LABEL_EVENT.wait()) to
+    # re-scan the labels directory and proceed to splitting + training.
+    _MANUAL_LABEL_EVENT.set()
+    update_log_line = (
+        f"Manual labeling complete signaled by user. "
+        f"{len(_MANUAL_LABEL_CTX['todo_filenames']) - remaining}/{len(_MANUAL_LABEL_CTX['todo_filenames'])} frames saved/skipped; "
+        f"{remaining} frames left untouched (no .txt → will remain unlabeled same as pre-manual-pass)."
+    )
+    update_status(
+        "waiting_manual_label",
+        50,
+        f"人工标注结束，继续训练流程（{remaining} 帧未处理，视为未标注）。",
+        update_log_line,
+    )
+    return jsonify({
+        "ok": True,
+        "processed": len(_MANUAL_LABEL_CTX["todo_filenames"]) - remaining,
+        "total": len(_MANUAL_LABEL_CTX["todo_filenames"]),
+        "untouched": remaining,
+    })
 
 
 @app.route("/api/llm_status")
@@ -1958,6 +2191,53 @@ HTML_PAGE = """
   .status-running { background: rgba(102,126,234,0.3); color: #b8b8ff; }
   .status-done { background: rgba(76,175,80,0.3); color: #81c784; }
   .status-error { background: rgba(244,67,54,0.3); color: #ef5350; }
+
+  /* Manual Labeling Section */
+  .manual-section { display: none; }
+  .manual-section.active { display: block; }
+  .manual-header {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 12px; flex-wrap: wrap; gap: 10px;
+  }
+  .manual-title { font-size: 1rem; color: #b8b8ff; font-weight: 600; }
+  .manual-counter {
+    font-size: 0.85rem; padding: 5px 12px; border-radius: 14px;
+    background: rgba(102,126,234,0.2); color: #a5b4fc;
+  }
+  .canvas-wrap {
+    background: rgba(0,0,0,0.4); border-radius: 10px; padding: 10px;
+    display: flex; justify-content: center; align-items: center;
+    border: 1px solid rgba(255,255,255,0.08); overflow: auto;
+    max-height: 520px;
+  }
+  #labelCanvas {
+    display: block; max-width: 100%; cursor: crosshair;
+    border-radius: 6px; background: #1a1a2e;
+  }
+  .manual-hint {
+    font-size: 0.8rem; color: #888; margin-top: 10px;
+    padding: 10px 12px; background: rgba(0,0,0,0.25);
+    border-radius: 8px; line-height: 1.6;
+  }
+  .manual-hint code {
+    background: rgba(255,255,255,0.1); padding: 2px 6px;
+    border-radius: 4px; color: #a5b4fc; font-size: 0.78rem;
+  }
+  .box-list {
+    margin-top: 12px; display: flex; flex-wrap: wrap; gap: 6px;
+  }
+  .box-chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 10px; border-radius: 14px;
+    background: rgba(102,126,234,0.15); color: #a5b4fc;
+    font-size: 0.78rem; border: 1px solid rgba(102,126,234,0.3);
+  }
+  .box-chip .x-btn {
+    cursor: pointer; color: #ef5350; font-weight: 700;
+    padding: 0 2px; line-height: 1;
+  }
+  .box-chip .x-btn:hover { color: #ff8a80; }
+  .empty-boxes { color: #888; font-size: 0.8rem; font-style: italic; }
 </style>
 </head>
 <body>
@@ -2031,6 +2311,15 @@ HTML_PAGE = """
           </span>
         </label>
       </div>
+      <div class="form-group" style="margin-top:4px;">
+        <label style="display:flex;align-items:center;gap:10px;cursor:pointer;user-select:none;padding:10px 12px;background:rgba(102,126,234,0.08);border-radius:8px;border:1px solid rgba(102,126,234,0.2);">
+          <input type="checkbox" id="enableManualLabel" checked style="width:18px;height:18px;accent-color:#667eea;cursor:pointer;">
+          <div>
+            <div style="color:#e0e0e0;font-weight:500;">✏️ 启用人工补标（推荐）</div>
+            <div style="color:#888;font-size:0.8rem;margin-top:2px;">LLM 标注完成后，未识别的图片将展示给您，可手动框选后再进入训练</div>
+          </div>
+        </label>
+      </div>
     </div>
 
     <div class="btn-group">
@@ -2052,10 +2341,48 @@ HTML_PAGE = """
     <div class="step-indicator" id="stepIndicator">
       <div class="step" data-step="extracting">📸 抽帧</div>
       <div class="step" data-step="labeling">🏷️ 标注</div>
+      <div class="step" data-step="waiting_manual_label">🖍️ 人工补标</div>
       <div class="step" data-step="splitting">📊 分割</div>
       <div class="step" data-step="training">🧠 训练</div>
     </div>
     <div class="log-area" id="logArea"></div>
+  </div>
+
+  <div class="card manual-section" id="manualSection">
+    <h2>
+      4. 🖍️ 人工补标
+      <span class="status-badge status-running" style="margin-left:8px;">waiting_manual_label</span>
+    </h2>
+    <div class="manual-header">
+      <div class="manual-title" id="manualFrameTitle">frame_0001.jpg</div>
+      <div class="manual-counter" id="manualCounter">0 / 0</div>
+    </div>
+    <div class="canvas-wrap">
+      <canvas id="labelCanvas" width="800" height="600"></canvas>
+    </div>
+    <div class="manual-hint">
+      💡 <b>操作说明：</b>
+      <code>鼠标左键按住拖动</code> 绘制目标框 ｜
+      <code>点击框右侧 ×</code> 或 <code>按 Delete/Backspace 键</code> 删除最后一个框 ｜
+      <code>鼠标右键</code> 撤销上一个框 ｜
+      所有框都需完整包住目标物体（保存时自动转为 YOLO 归一化坐标 class_id cx cy bw bh）。
+    </div>
+    <div class="box-list" id="boxList">
+      <span class="empty-boxes">（暂无框，拖动鼠标在图上绘制第一个目标框）</span>
+    </div>
+    <div class="btn-group">
+      <button class="btn btn-secondary" id="prevFrameBtn" onclick="manualPrevFrame()">⬅️ 上一张</button>
+      <button class="btn btn-secondary" onclick="manualUndoLast()">↶ 撤销最后一个框</button>
+      <button class="btn btn-secondary" onclick="manualClearAll()">🗑️ 清空所有</button>
+      <button class="btn btn-secondary" id="skipFrameBtn" onclick="manualSkipFrame()">⏭️ 跳过此帧（背景/无目标）</button>
+      <button class="btn btn-primary" id="saveFrameBtn" onclick="manualSaveFrame()">✅ 保存此帧并下一张</button>
+    </div>
+    <div class="btn-group" style="margin-top:12px;">
+      <button class="btn btn-primary" style="background:linear-gradient(90deg,#4caf50,#2e7d32);" onclick="manualCompleteAll()">🎉 全部完成，开始训练</button>
+      <span style="color:#888;font-size:0.82rem;align-self:center;margin-left:4px;">
+        若不想处理剩余未标注帧，可直接点此进入训练（剩余帧将保持未标注状态）。
+      </span>
+    </div>
   </div>
 
   <div class="card result-section" id="resultSection">
@@ -2135,7 +2462,7 @@ function updateStepIndicator(activeStep) {
   document.querySelectorAll('.step').forEach(el => {
     const step = el.dataset.step;
     el.classList.remove('active', 'done');
-    const stepOrder = ['extracting', 'init_model', 'labeling', 'splitting', 'training'];
+    const stepOrder = ['extracting', 'init_model', 'labeling', 'waiting_manual_label', 'splitting', 'training', 'exporting'];
     const activeIdx = stepOrder.indexOf(activeStep);
     const elIdx = stepOrder.indexOf(step);
     if (activeIdx >= 0 && elIdx < activeIdx) el.classList.add('done');
@@ -2183,6 +2510,7 @@ async function startPipeline() {
         device: document.getElementById('device').value,
         workers: 0,
         train_ratio: parseFloat(document.getElementById('trainRatio').value),
+        enable_manual_label: document.getElementById('enableManualLabel').checked,
       })
     });
 
@@ -2259,6 +2587,7 @@ function resetUI() {
   uploadArea.style.borderColor = '';
   document.getElementById('progressSection').classList.remove('active');
   document.getElementById('resultSection').classList.remove('active');
+  document.getElementById('manualSection').classList.remove('active');
   document.getElementById('progressFill').style.width = '0%';
   document.getElementById('progressPct').textContent = '0%';
   document.getElementById('progressStep').textContent = '等待开始...';
@@ -2267,7 +2596,419 @@ function resetUI() {
   document.querySelectorAll('.step').forEach(el => el.classList.remove('active', 'done'));
   document.getElementById('startBtn').disabled = false;
   document.getElementById('startBtn').textContent = '🚀 开始训练';
+  manualTeardown();
 }
+
+/* ==================== Manual Labeling (Canvas-based) ==================== */
+const _MANUAL = {
+  runId: null,
+  todo: [],         // full list of basenames from /api/manual_label/todo
+  curIdx: -1,       // current index within todo
+  boxes: [],        // boxes on current frame: [{x1,y1,x2,y2}] all 0..1 normalized vs NATURAL image size
+  natW: 0,          // natural (original) image width for current frame
+  natH: 0,          // natural (original) image height for current frame
+  dispW: 0,         // canvas display width (CSS pixels) for coord mapping
+  dispH: 0,
+  drawing: false,
+  drawStart: null,  // {x,y} in 0..1 normalized coords
+  drawCur: null,
+  _img: null,
+  _entered: false,
+  _pollingWasOn: false,
+};
+
+function manualTeardown() {
+  const c = document.getElementById('labelCanvas');
+  if (c) {
+    const ctx = c.getContext('2d');
+    ctx.clearRect(0, 0, c.width, c.height);
+  }
+  Object.assign(_MANUAL, {
+    runId: null, todo: [], curIdx: -1, boxes: [],
+    natW: 0, natH: 0, dispW: 0, dispH: 0,
+    drawing: false, drawStart: null, drawCur: null,
+    _img: null, _entered: false,
+  });
+}
+
+async function manualEnterIfNeeded(data) {
+  if (_MANUAL._entered) return;
+  if (data.step !== 'waiting_manual_label') return;
+  _MANUAL._entered = true;
+  // Remember polling state, keep it running (still want logs + status updates)
+  try {
+    const resp = await fetch('/api/manual_label/todo');
+    const todoData = await resp.json();
+    if (!todoData.run_id || !todoData.todo || todoData.todo.length === 0) {
+      // Nothing to label → signal complete on behalf of user (no frames needed)
+      await manualCompleteAll(true);
+      return;
+    }
+    _MANUAL.runId = todoData.run_id;
+    // Exclude any already-done frames from the interactive todo list
+    const doneSet = new Set(todoData.done || []);
+    const remaining = (todoData.todo || []).filter(f => !doneSet.has(f));
+    _MANUAL.todo = remaining.length ? remaining : (todoData.todo || []);
+    _MANUAL.curIdx = 0;
+    document.getElementById('manualSection').classList.add('active');
+    _bindCanvasEvents();
+    await manualLoadFrame(0);
+  } catch (e) {
+    console.error('manualEnter failed:', e);
+    alert('进入人工补标失败: ' + e.message);
+  }
+}
+
+function _bindCanvasEvents() {
+  const c = document.getElementById('labelCanvas');
+  if (c._bound) return;
+  c._bound = true;
+  c.addEventListener('mousedown', onCanvasMouseDown);
+  c.addEventListener('mousemove', onCanvasMouseMove);
+  c.addEventListener('mouseup', onCanvasMouseUp);
+  c.addEventListener('mouseleave', onCanvasMouseUp);
+  c.addEventListener('contextmenu', e => {
+    e.preventDefault();
+    manualUndoLast();
+  });
+  document.addEventListener('keydown', e => {
+    if (!_MANUAL._entered || !document.getElementById('manualSection').classList.contains('active')) return;
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      // Don't trigger while focus is inside an input; label page has no inputs but guard anyway
+      const tag = (document.activeElement && document.activeElement.tagName) || '';
+      if (tag !== 'INPUT' && tag !== 'TEXTAREA') {
+        e.preventDefault();
+        manualUndoLast();
+      }
+    }
+  });
+}
+
+function _canvasToNorm(c, clientX, clientY) {
+  // Map client (page) coords → canvas element coords → 0..1 normalized vs displayed portion
+  // (letterboxed inside canvas). We use the actual CSS size for hit testing, then translate
+  // to natural 0..1 via the letterbox offset we recorded at draw time.
+  const rect = c.getBoundingClientRect();
+  const cx = clientX - rect.left;
+  const cy = clientY - rect.top;
+  const cw = rect.width;
+  const ch = rect.height;
+  // Letterbox: image fits inside cw×ch preserving aspect, centered.
+  const iw = _MANUAL.natW || cw;
+  const ih = _MANUAL.natH || ch;
+  const scale = Math.min(cw / iw, ch / ih);
+  const dw = iw * scale;
+  const dh = ih * scale;
+  const offX = (cw - dw) / 2;
+  const offY = (ch - dh) / 2;
+  _MANUAL.dispW = cw;
+  _MANUAL.dispH = ch;
+  // Clamp cx,cy inside the drawn image rectangle (ignore clicks on padding bars)
+  const ix = Math.max(0, Math.min(dw, cx - offX));
+  const iy = Math.max(0, Math.min(dh, cy - offY));
+  // Convert to 0..1 vs natural image dimensions (this is what we store in boxes[])
+  const nx = dw > 0 ? ix / dw : 0;
+  const ny = dh > 0 ? iy / dh : 0;
+  return { nx, ny };
+}
+
+function onCanvasMouseDown(e) {
+  if (e.button !== 0) return;
+  const c = document.getElementById('labelCanvas');
+  const { nx, ny } = _canvasToNorm(c, e.clientX, e.clientY);
+  _MANUAL.drawing = true;
+  _MANUAL.drawStart = { x: nx, y: ny };
+  _MANUAL.drawCur = { x: nx, y: ny };
+  manualRedraw();
+}
+function onCanvasMouseMove(e) {
+  if (!_MANUAL.drawing) return;
+  const c = document.getElementById('labelCanvas');
+  const { nx, ny } = _canvasToNorm(c, e.clientX, e.clientY);
+  _MANUAL.drawCur = { x: nx, y: ny };
+  manualRedraw();
+}
+function onCanvasMouseUp(e) {
+  if (!_MANUAL.drawing) return;
+  const c = document.getElementById('labelCanvas');
+  let endP;
+  if (e && e.clientX != null) {
+    endP = _canvasToNorm(c, e.clientX, e.clientY);
+  } else {
+    endP = _MANUAL.drawCur || _MANUAL.drawStart;
+  }
+  _MANUAL.drawing = false;
+  const s = _MANUAL.drawStart;
+  const x1 = Math.min(s.x, endP.nx);
+  const y1 = Math.min(s.y, endP.ny);
+  const x2 = Math.max(s.x, endP.nx);
+  const y2 = Math.max(s.y, endP.ny);
+  _MANUAL.drawStart = null;
+  _MANUAL.drawCur = null;
+  // Ignore tiny boxes (accidental click)
+  if ((x2 - x1) < 0.005 || (y2 - y1) < 0.005) {
+    manualRedraw();
+    return;
+  }
+  _MANUAL.boxes.push({ x1, y1, x2, y2 });
+  manualRedraw();
+  renderBoxList();
+}
+
+function manualRedraw() {
+  const c = document.getElementById('labelCanvas');
+  if (!_MANUAL._img) return;
+  const ctx = c.getContext('2d');
+  // Resize canvas backing store to CSS-rendered size × devicePixelRatio for crispness
+  const rect = c.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = Math.max(10, Math.round(rect.width));
+  const cssH = Math.max(10, Math.round(rect.height));
+  // Only resize when needed to avoid flickering
+  if (c.width !== Math.round(cssW * dpr) || c.height !== Math.round(cssH * dpr)) {
+    c.width = Math.round(cssW * dpr);
+    c.height = Math.round(cssH * dpr);
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+  // Draw image letterboxed into cssW×cssH
+  const iw = _MANUAL.natW || _MANUAL._img.naturalWidth || cssW;
+  const ih = _MANUAL.natH || _MANUAL._img.naturalHeight || cssH;
+  const scale = Math.min(cssW / iw, cssH / ih);
+  const dw = iw * scale;
+  const dh = ih * scale;
+  const offX = (cssW - dw) / 2;
+  const offY = (cssH - dh) / 2;
+  ctx.drawImage(_MANUAL._img, offX, offY, dw, dh);
+  // Helper: convert 0..1 box (natural image) to canvas CSS coords
+  const toCss = b => ({
+    x: offX + b.x1 * dw,
+    y: offY + b.y1 * dh,
+    w: (b.x2 - b.x1) * dw,
+    h: (b.y2 - b.y1) * dh,
+  });
+  // Draw committed boxes
+  _MANUAL.boxes.forEach((b, i) => {
+    const r = toCss(b);
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = '#667eea';
+    ctx.fillStyle = 'rgba(102,126,234,0.15)';
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.strokeRect(r.x, r.y, r.w, r.h);
+    // Label chip
+    const label = `#${i + 1}`;
+    ctx.font = '12px "Segoe UI", sans-serif';
+    const tw = ctx.measureText(label).width;
+    ctx.fillStyle = '#667eea';
+    ctx.fillRect(r.x, Math.max(0, r.y - 16), tw + 8, 16);
+    ctx.fillStyle = '#fff';
+    ctx.fillText(label, r.x + 4, Math.max(12, r.y - 4));
+  });
+  // Draw in-progress drag rectangle
+  if (_MANUAL.drawing && _MANUAL.drawStart && _MANUAL.drawCur) {
+    const s = _MANUAL.drawStart, e = _MANUAL.drawCur;
+    const b = {
+      x1: Math.min(s.x, e.x), y1: Math.min(s.y, e.y),
+      x2: Math.max(s.x, e.x), y2: Math.max(s.y, e.y),
+    };
+    const r = toCss(b);
+    ctx.lineWidth = 2;
+    ctx.setLineDash([6, 4]);
+    ctx.strokeStyle = '#fbbf24';
+    ctx.fillStyle = 'rgba(251,191,36,0.12)';
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.strokeRect(r.x, r.y, r.w, r.h);
+    ctx.setLineDash([]);
+  }
+}
+
+function renderBoxList() {
+  const list = document.getElementById('boxList');
+  if (!_MANUAL.boxes.length) {
+    list.innerHTML = '<span class="empty-boxes">（暂无框，拖动鼠标在图上绘制第一个目标框）</span>';
+    return;
+  }
+  list.innerHTML = _MANUAL.boxes.map((b, i) => {
+    const cx = ((b.x1 + b.x2) / 2).toFixed(3);
+    const cy = ((b.y1 + b.y2) / 2).toFixed(3);
+    const bw = (b.x2 - b.x1).toFixed(3);
+    const bh = (b.y2 - b.y1).toFixed(3);
+    return `<span class="box-chip">
+      框#${i + 1} cx=${cx} cy=${cy} bw=${bw} bh=${bh}
+      <span class="x-btn" onclick="manualDeleteBox(${i})" title="删除此框">×</span>
+    </span>`;
+  }).join('');
+}
+
+function manualDeleteBox(i) {
+  if (!_MANUAL.boxes[i]) return;
+  _MANUAL.boxes.splice(i, 1);
+  manualRedraw();
+  renderBoxList();
+}
+function manualUndoLast() {
+  if (_MANUAL.boxes.length) {
+    _MANUAL.boxes.pop();
+    manualRedraw();
+    renderBoxList();
+  }
+}
+function manualClearAll() {
+  _MANUAL.boxes = [];
+  manualRedraw();
+  renderBoxList();
+}
+
+async function manualLoadFrame(idx) {
+  if (!_MANUAL.todo.length) return;
+  if (idx < 0) idx = 0;
+  if (idx >= _MANUAL.todo.length) idx = _MANUAL.todo.length - 1;
+  _MANUAL.curIdx = idx;
+  const filename = _MANUAL.todo[idx];
+  document.getElementById('manualFrameTitle').textContent = filename;
+  document.getElementById('manualCounter').textContent =
+    `${idx + 1} / ${_MANUAL.todo.length}  （待补标总数: ${_MANUAL.todo.length}）`;
+  const url = `/api/frame/${_MANUAL.runId}/${encodeURIComponent(filename)}`;
+  const img = new Image();
+  img.crossOrigin = 'anonymous';
+  img.onload = () => {
+    _MANUAL._img = img;
+    _MANUAL.natW = img.naturalWidth;
+    _MANUAL.natH = img.naturalHeight;
+    _MANUAL.boxes = [];
+    renderBoxList();
+    // Defer redraw so CSS layout of canvas is settled
+    requestAnimationFrame(() => {
+      manualRedraw();
+      window.addEventListener('resize', _onWinResize, { once: true });
+    });
+  };
+  img.onerror = () => {
+    alert(`加载图片失败: ${filename}`);
+  };
+  img.src = url;
+  // Reset per-frame buttons
+  document.getElementById('prevFrameBtn').disabled = idx <= 0;
+}
+let __resizeRaf = 0;
+function _onWinResize() {
+  if (!__resizeRaf) {
+    __resizeRaf = requestAnimationFrame(() => {
+      __resizeRaf = 0;
+      if (_MANUAL._img) manualRedraw();
+    });
+  }
+  window.addEventListener('resize', _onWinResize, { once: true });
+}
+
+function manualPrevFrame() {
+  if (_MANUAL.curIdx > 0) manualLoadFrame(_MANUAL.curIdx - 1);
+}
+
+async function manualSaveFrame() {
+  const filename = _MANUAL.todo[_MANUAL.curIdx];
+  if (!filename) return;
+  // Convert boxes[x1,y1,x2,y2] 0..1 → YOLO [cx,cy,bw,bh] 0..1
+  const yolo = _MANUAL.boxes.map(b => {
+    const cx = (b.x1 + b.x2) / 2;
+    const cy = (b.y1 + b.y2) / 2;
+    const bw = b.x2 - b.x1;
+    const bh = b.y2 - b.y1;
+    return [cx, cy, bw, bh];
+  });
+  try {
+    const resp = await fetch('/api/manual_label/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename, boxes: yolo }),
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) throw new Error(data.error || 'save failed');
+    // Advance to next frame, or if last one, prompt complete
+    if (_MANUAL.curIdx + 1 < _MANUAL.todo.length) {
+      await manualLoadFrame(_MANUAL.curIdx + 1);
+    } else {
+      // Last frame saved
+      const goOn = confirm(
+        `✅ 已保存最后一张 ${filename}（${yolo.length} 个框）。\n要结束人工补标并开始训练吗？\n点"取消"可留在本页继续修改。`
+      );
+      if (goOn) await manualCompleteAll(true);
+    }
+  } catch (e) {
+    alert('保存失败: ' + e.message);
+  }
+}
+
+async function manualSkipFrame() {
+  const filename = _MANUAL.todo[_MANUAL.curIdx];
+  if (!filename) return;
+  const ok = confirm(`⏭️ 将 "${filename}" 标记为"无目标/背景帧"（写入空 .txt，作为 YOLO 负样本参与训练）。\n确定跳过？`);
+  if (!ok) return;
+  try {
+    const resp = await fetch('/api/manual_label/skip', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename }),
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) throw new Error(data.error || 'skip failed');
+    if (_MANUAL.curIdx + 1 < _MANUAL.todo.length) {
+      await manualLoadFrame(_MANUAL.curIdx + 1);
+    } else {
+      const goOn = confirm(`⏭️ 已跳过最后一张。要结束人工补标并开始训练吗？`);
+      if (goOn) await manualCompleteAll(true);
+    }
+  } catch (e) {
+    alert('跳过失败: ' + e.message);
+  }
+}
+
+async function manualCompleteAll(silent) {
+  if (!silent) {
+    const todo = _MANUAL.todo.length;
+    let processed = 0;
+    try {
+      const resp = await fetch('/api/manual_label/todo');
+      const d = await resp.json();
+      processed = (d.done || []).length;
+    } catch (_) { /* ignore */ }
+    const left = Math.max(0, todo - processed);
+    const msg = left > 0
+      ? `还有 ${left} / ${todo} 张未处理（保持原未标注状态，不会进入训练集）。\n确定结束人工补标，开始训练？`
+      : `已处理 ${processed} / ${todo} 张。确定结束人工补标，开始训练？`;
+    if (!confirm(msg)) return;
+  }
+  try {
+    const resp = await fetch('/api/manual_label/complete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) throw new Error(data.error || 'complete failed');
+  } catch (e) {
+    console.warn('manualComplete signal error:', e);
+  }
+  // Hide manual section, keep polling (progress/training next)
+  document.getElementById('manualSection').classList.remove('active');
+  _MANUAL._entered = false;
+}
+
+/* Patch updateUI: call manualEnterIfNeeded when step=waiting_manual_label */
+(function patchUpdateUI() {
+  // Preserve the original updateUI defined above and wrap it.
+  const _origUpdateUI = window.updateUI;
+  window.updateUI = function (data) {
+    _origUpdateUI(data);
+    if (data.step === 'waiting_manual_label' && data.status !== 'error' && data.status !== 'done') {
+      manualEnterIfNeeded(data);
+    } else if (data.status === 'done' || data.status === 'error') {
+      // Make sure manual section hides on run end
+      document.getElementById('manualSection').classList.remove('active');
+      _MANUAL._entered = false;
+    }
+  };
+})();
 </script>
 </body>
 </html>
