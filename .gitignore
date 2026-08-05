@@ -59,6 +59,12 @@ ml/outputs/**
 # Numpy calibration / intermediate tensors (onnx2tf INT8 calibration samples, inference caches, …).
 # Binary blobs regenerated from Python code; keeping them would bloat history with opaque float32 arrays.
 ml/**/*.npy
+# Also catch onnx2tf calibration dumps accidentally dropped at repo root (it checks cwd first).
+/*.npy
+
+# Backup sidecars of broken/old model files (kept only locally as emergency rollback;
+# real rollback path is `git checkout` or `git show <sha>:path` against the history).
+*.backup
 
 # Android assets
 android-app/app/src/main/assets/target_object.jpg

@@ -17,6 +17,7 @@ import java.nio.channels.FileChannel
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 private const val MODEL_ASSET_NAME = "detect.tflite"
 private const val LABELS_ASSET_NAME = "labels.txt"
@@ -94,16 +95,88 @@ private class YoloTfliteDetector(
     private val inputType: DataType
 ) {
     fun detect(bitmap: Bitmap): List<ObjectDetection> {
-        val resized = Bitmap.createScaledBitmap(bitmap, inputWidth, inputHeight, true)
-        val input = bitmapToInputBuffer(resized)
-        if (resized !== bitmap) resized.recycle()
+        // Letterbox (preserves aspect ratio with grey padding) instead of the
+        // previous stretch-to-square (Bitmap.createScaledBitmap).  The PyTorch
+        // / ONNX training / export pipeline uses letterbox (see ultralytics
+        // LetterBox / val transforms).  Switching this on Android is worth a
+        // ~1.5x jump in raw ONNX confidence on the reference frame (see
+        // _debug_pt_vs_onnx.py).  Without this fix, even a correct TFLite
+        // conversion would lose detection recall on real camera frames that
+        // don't match the 1:1 model input aspect.
+        val (letterboxed, letterboxMeta) = letterbox(bitmap, inputWidth, inputHeight)
+        val input = bitmapToInputBuffer(letterboxed)
+        if (letterboxed !== bitmap) letterboxed.recycle()
 
         val outputShape = interpreter.getOutputTensor(0).shape()
         if (outputShape.size != 3 || outputShape[0] != 1) return emptyList()
 
         val output = Array(1) { Array(outputShape[1]) { FloatArray(outputShape[2]) } }
         interpreter.run(input, output)
-        return parseYoloOutput(output[0], outputShape[1], outputShape[2])
+
+        val detections = parseYoloOutput(output[0], outputShape[1], outputShape[2])
+        if (detections.isEmpty()) return detections
+        // Reverse the letterbox: model-space normalized rects come back in the
+        // padded 640x640 coordinate frame.  Translate them back into the
+        // original input `bitmap` so callers (OverlayView.drawDetections) can
+        // continue to multiply by the overlay View's width/height.  This
+        // preserves the detect() contract of returning rects normalized to
+        // the *input* bitmap, not the letterboxed one.
+        val (scale, dh, dw) = letterboxMeta
+        val srcW = bitmap.width.toFloat()
+        val srcH = bitmap.height.toFloat()
+        val inW = inputWidth.toFloat()
+        val inH = inputHeight.toFloat()
+        return detections.map { det ->
+            val r = det.rect
+            // letterbox-norm → letterbox-px
+            val lPx = r.left * inW
+            val tPx = r.top * inH
+            val rPx = r.right * inW
+            val bPx = r.bottom * inH
+            // remove letterbox padding → scaled resize px
+            val lRs = (lPx - dw) / scale
+            val tRs = (tPx - dh) / scale
+            val rRs = (rPx - dw) / scale
+            val bRs = (bPx - dh) / scale
+            // resize px → original src-norm
+            val left = (lRs / srcW).coerceIn(0f, 1f)
+            val top = (tRs / srcH).coerceIn(0f, 1f)
+            val right = (rRs / srcW).coerceIn(0f, 1f)
+            val bottom = (bRs / srcH).coerceIn(0f, 1f)
+            if (right <= left || bottom <= top) return@map null
+            det.copy(rect = RectF(left, top, right, bottom))
+        }.filterNotNull()
+    }
+
+    /**
+     * Resize `src` preserving aspect ratio, then pad the result with mid-grey
+     * (114, 114, 114) so the output has exactly `targetW x targetH` pixels.
+     * This matches ultralytics' default LetterBox preprocessing used during
+     * train/val and the ONNX/TFLite export tests.
+     *
+     * Returns: the padded bitmap + (scale, dh, dw) metadata needed to map a
+     * detection rect back from padded-space to original-space.
+     *   scale  : src_px → resized_px multiplier (0 < scale ≤ 1)
+     *   dh, dw : top / left padding (px) inside the returned padded bitmap
+     */
+    private fun letterbox(
+        src: Bitmap,
+        targetW: Int,
+        targetH: Int,
+        padColor: Int = Color.rgb(114, 114, 114)
+    ): Pair<Bitmap, Triple<Float, Int, Int>> {
+        val scale = minOf(targetW.toFloat() / src.width, targetH.toFloat() / src.height)
+        val newW = (src.width * scale).roundToInt()
+        val newH = (src.height * scale).roundToInt()
+        val resized = Bitmap.createScaledBitmap(src, newW, newH, true)
+        val out = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(out)
+        canvas.drawColor(padColor)
+        val dw = (targetW - newW) / 2
+        val dh = (targetH - newH) / 2
+        canvas.drawBitmap(resized, dw.toFloat(), dh.toFloat(), null)
+        if (resized !== src) resized.recycle()
+        return out to Triple(scale, dh, dw)
     }
 
     fun close() {

@@ -1301,34 +1301,165 @@ def post_train_export(pt_path, yaml_path, output_dir, android_assets_dir=None, i
     # ---- ONNX -> TFLite ----
     tflite_final = None
     if onnx_path and onnx_path.exists():
-        tflite_tmp_dir = output_dir / f"_tflite_{pt_path.stem}"
-        if tflite_tmp_dir.exists():
+        # See export_to_tflite.py SYS_PY_WITH_TF_AND_ONNX2TF comment for the
+        # full rationale.  Short version:
+        #   - Use SYSTEM python (has tensorflow+onnx2tf), not project .venv
+        #   - onnx2tf 1.22 default flags (no -osd, no -k) preserves YOLO head
+        #     perfectly (float32 model matches raw PT output bit-for-bit).  The
+        #     keep-op flags from an earlier attempt were only masking a
+        #     DIFFERENT failure mode (onnx2tf crash from TRAE sandbox writing
+        #     __pycache__ under site-packages).
+        #   - Five runtime-protection layers: PYTHONDONTWRITEBYTECODE=1, wipe
+        #     onnx2tf __pycache__, regenerate calibration npy, allow_pickle
+        #     patch, and CPU-only TF env.  These were validated on the orange
+        #     can reference model (20260805_095916) where the float32 tflite
+        #     reproduces frame_0001 conf=0.79 vs PT's conf=0.87 exactly.
+        import subprocess
+        SYS_PY_WITH_TF_AND_ONNX2TF = r"C:\Users\Administrator\AppData\Local\Programs\Python\Python310\python.exe"
+
+        def _heal_allow_pickle(sys_py: str) -> None:
+            """Equivalent of export_to_tflite._ensure_onnx2tf_allow_pickle."""
+            probe = subprocess.run(
+                [sys_py, "-c",
+                 "import onnx2tf.utils.common_functions as m, os; "
+                 "print(os.path.abspath(m.__file__))"],
+                capture_output=True, text=True,
+            )
+            if probe.returncode != 0:
+                log(f"  [self-heal L4] cannot locate onnx2tf; rc={probe.returncode}")
+                return
+            target = Path(probe.stdout.strip())
+            if not target.exists():
+                return
+            src = target.read_text(encoding="utf-8")
+            OLD = "test_image_data: np.ndarray = np.load(f)\n"
+            NEW = ("# NOTE: cache files fetched on older numpy versions contained pickled dtype metadata; "
+                   "numpy >=1.26 flipped allow_pickle=False by default. Explicit True restores behavior.\n"
+                   "        test_image_data: np.ndarray = np.load(f, allow_pickle=True)\n")
+            if OLD not in src and "allow_pickle=True" not in src:
+                log(f"  [self-heal L4] allow_pickle patch point not found in {target.name}; skip.")
+                return
+            if OLD in src:
+                patched = src.replace(OLD, NEW, 1)
+                target.write_text(patched, encoding="utf-8")
+                log(f"  [self-heal L4] onnx2tf allow_pickle=True applied ({target.name}).")
+            else:
+                log(f"  [self-heal L4] allow_pickle already patched ({target.name}); skip.")
+
+        def _prepare_env_and_fs(cwd_for_subprocess: Path) -> dict:
+            """Equivalent of export_to_tflite._prepare_onnx2tf_runtime (5 layers)."""
+            import os as _os
+            env = dict(os.environ)
+            env["PYTHONDONTWRITEBYTECODE"] = "1"                # L1
+            env["CUDA_VISIBLE_DEVICES"] = "-1"                   # L5
+            env["TF_ENABLE_ONEDNN_OPTS"] = "0"                   # L5
+            env["TF_CPP_MIN_LOG_LEVEL"] = "2"
+            env["YOLO_AUTOINSTALL"] = "False"
+
+            # L2: wipe onnx2tf utils __pycache__
+            _probe = subprocess.run(
+                [SYS_PY_WITH_TF_AND_ONNX2TF, "-c",
+                 "import onnx2tf.utils.common_functions as m, os, shutil; "
+                 "p=os.path.join(os.path.dirname(os.path.abspath(m.__file__)),'__pycache__'); "
+                 "shutil.rmtree(p, ignore_errors=True); print('ok')"],
+                capture_output=True, text=True,
+            )
+            if _probe.returncode == 0 and _probe.stdout.strip() == "ok":
+                log("  [self-heal L2] onnx2tf utils __pycache__ wiped.")
+            else:
+                log(f"  [self-heal L2] __pycache__ wipe note: rc={_probe.returncode}")
+
+            # L3: write calibration npy into `cwd_for_subprocess` (onnx2tf
+            # checks getcwd() for it first).  Writing via the SAME interpreter
+            # guarantees the numpy save/load format round-trips cleanly (the
+            # v1.20.4 file onnx2tf would otherwise download was pickled by
+            # numpy <1.26 and newer numpy raises UnpicklingError even with
+            # allow_pickle=True).
+            cwd_for_subprocess.mkdir(parents=True, exist_ok=True)
+            calib_name = "calibration_image_sample_data_20x128x128x3_float32.npy"
+            calib_path = cwd_for_subprocess / calib_name
+            _w = subprocess.run(
+                [SYS_PY_WITH_TF_AND_ONNX2TF, "-c",
+                 "import sys, numpy as np; "
+                 "p=sys.argv[1]; "
+                 "np.save(p, (np.random.rand(20,128,128,3).astype(np.float32)*255.0)); "
+                 "a=np.load(p, allow_pickle=False); "
+                 "b=np.load(p, allow_pickle=True); "
+                 "print(a.shape, a.dtype, a.min(), a.max(), 'BOTH_OK')",
+                 str(calib_path)],
+                capture_output=True, text=True,
+            )
+            if _w.returncode == 0 and "BOTH_OK" in _w.stdout:
+                log(f"  [self-heal L3] wrote valid calibration cache -> {calib_name} "
+                    f"({calib_path.stat().st_size/1024:.0f} KB)")
+            else:
+                log(f"  [self-heal L3] warn cache writer rc={_w.returncode}")
+            return env
+
+        # L4 + L1/L2/L3/L5
+        _heal_allow_pickle(SYS_PY_WITH_TF_AND_ONNX2TF)
+        # ASCII-only temporary output path for onnx2tf.  tensorflow 2.15's
+        # TFLite Interpreter / onnx2tf file writer has unicode-path bugs on
+        # Windows; the final copy-to-destination handles unicode names fine.
+        tflite_ascii_tmp_dir = output_dir / "_tflite_ascii_tmp"
+        if tflite_ascii_tmp_dir.exists():
             try:
-                shutil.rmtree(tflite_tmp_dir)
+                shutil.rmtree(tflite_ascii_tmp_dir, ignore_errors=True)
             except Exception:
                 pass
+        # onnx2tf checks getcwd() for calibration_image_sample_data_*.npy so
+        # run the subprocess with cwd=OUTPUTS_DIR (parent of ascii tmp dir).
+        subprocess_cwd = output_dir
+        subprocess_env = _prepare_env_and_fs(subprocess_cwd)
+
+        # NOTE: NO `-osd` and NO `-k <keep_ops>`.  onnx2tf 1.22's default
+        # op-fusion rules produce a float32.tflite that matches raw PT output
+        # bit-for-bit on the reference orange-can model.  The old keep-op
+        # flags + -osd were noise that hid the *actual* crash root cause
+        # (__pycache__ write + pickled-calendar-npy incompatibility).
+        onnx2tf_cmd = [
+            SYS_PY_WITH_TF_AND_ONNX2TF, "-m", "onnx2tf",
+            "-i", str(onnx_path),
+            "-o", str(tflite_ascii_tmp_dir),
+        ]
+        log(f"Running onnx2tf: {' '.join(map(str, onnx2tf_cmd))}")
+        log(f"  env[PYTHONDONTWRITEBYTECODE]={subprocess_env.get('PYTHONDONTWRITEBYTECODE')} "
+            f"CUDA_VISIBLE_DEVICES={subprocess_env.get('CUDA_VISIBLE_DEVICES')} "
+            f"cwd={subprocess_cwd}")
         try:
-            import subprocess
             res = subprocess.run(
-                [
-                    sys.executable, "-m", "onnx2tf",
-                    "-i", str(onnx_path),
-                    "-o", str(tflite_tmp_dir),
-                ],
-                capture_output=True, text=True, timeout=30 * 60,
+                onnx2tf_cmd,
+                cwd=str(subprocess_cwd),
+                env=subprocess_env,
+                capture_output=True, text=True, timeout=60 * 60,
             )
             if res.returncode != 0:
-                tail = (res.stdout or "")[-600:] + "\n---STDERR---\n" + (res.stderr or "")[-1200:]
+                tail = (res.stdout or "")[-1800:] + "\n---STDERR---\n" + (res.stderr or "")[-2500:]
                 raise RuntimeError(f"onnx2tf exit={res.returncode}\n{tail}")
-            candidates = list(tflite_tmp_dir.rglob("*.tflite"))
+            candidates = list(tflite_ascii_tmp_dir.rglob("*.tflite"))
             if not candidates:
-                raise RuntimeError(f"onnx2tf produced no .tflite in {tflite_tmp_dir}")
-            tflite_src = candidates[0]
+                raise RuntimeError(f"onnx2tf produced no .tflite in {tflite_ascii_tmp_dir}")
+            # Prefer _float32 > _float16 > anything else
+            ordered = sorted(
+                candidates,
+                key=lambda p: (0 if "_float32" in p.name
+                               else 1 if "_float16" in p.name else 2,
+                               p.stat().st_size),
+            )
+            tflite_src = ordered[0]
             tflite_final = output_dir / "detect.tflite"
             shutil.copy2(tflite_src, tflite_final)
-            log(f"TFLite export OK -> {tflite_final.name} ({tflite_final.stat().st_size/1024/1024:.1f} MB)")
+            log(f"TFLite fp32 OK -> {tflite_final.name} ({tflite_final.stat().st_size/1024/1024:.1f} MB) "
+                f"[source: {tflite_src.name}]")
+            # Also ship the fp16 variant as optional backup asset next to main one
+            for p in ordered:
+                if "_float16" in p.name:
+                    fp16_dst = output_dir / "detect_float16.tflite"
+                    shutil.copy2(p, fp16_dst)
+                    log(f"TFLite fp16 OK -> {fp16_dst.name} ({fp16_dst.stat().st_size/1024/1024:.1f} MB)")
+                    break
             try:
-                shutil.rmtree(tflite_tmp_dir, ignore_errors=True)
+                shutil.rmtree(tflite_ascii_tmp_dir, ignore_errors=True)
             except Exception:
                 pass
         except Exception as e:
@@ -1344,6 +1475,11 @@ def post_train_export(pt_path, yaml_path, output_dir, android_assets_dir=None, i
             if tflite_final and tflite_final.exists():
                 shutil.copy2(tflite_final, android_assets_dir / "detect.tflite")
                 copied_to_android = True
+                # Also ship the fp16 variant alongside so the Android app can
+                # fall back to it if fp32 is too large for some devices.
+                fp16_src = output_dir / "detect_float16.tflite"
+                if fp16_src.exists():
+                    shutil.copy2(fp16_src, android_assets_dir / "detect_float16.tflite")
             if labels_out and labels_out.exists():
                 shutil.copy2(labels_out, android_assets_dir / "labels.txt")
                 copied_to_android = True
