@@ -69,7 +69,7 @@ def llm_available():
         return False
 
 
-def llm_chat(messages, temperature=0.3, max_tokens=1024):
+def llm_chat(messages, temperature=0.3, max_tokens=3072):
     payload = {
         "model": LLM_MODEL,
         "messages": messages,
@@ -131,6 +131,29 @@ def llm_chat(messages, temperature=0.3, max_tokens=1024):
         snippet_parts = [
             f"[EMPTY_CONTENT_DEBUG] finish_reason={finish!r}",
         ]
+        # --- Extra: detect reasoning-model quota exhaustion (qwen3.5 style)
+        # When finish_reason='length' AND usage.completion_tokens >= max_tokens
+        # AND content is empty, it means qwen3.5 spent ALL its quota writing
+        # reasoning_content / "内心独白" before it even started emitting JSON.
+        # Caller-side remediation: restart llama-server with `-c 8192` (or higher)
+        # and ensure this llm_chat max_tokens default (3072) is well below
+        # ctx-size minus the prompt tokens (~1500).
+        usage = result.get("usage") if isinstance(result, dict) else None
+        if isinstance(usage, dict):
+            comp_toks = usage.get("completion_tokens")
+            if (
+                finish == "length"
+                and isinstance(comp_toks, int)
+                and comp_toks >= int(max_tokens)
+            ):
+                snippet_parts.insert(
+                    1,
+                    f"[QUOTA_EXHAUSTED] completion_tokens={comp_toks} hit max_tokens={max_tokens} → "
+                    f"reasoning_content ate the whole budget before JSON could be written. "
+                    f"REMEDY: (1) Restart llama-server with `-c 8192` at minimum (preferred); "
+                    f"(2) prompt_tokens={usage.get('prompt_tokens')} → "
+                    f"required ctx-size >= {int(comp_toks) + int(usage.get('prompt_tokens') or 0) + 512}.",
+                )
         if isinstance(msg, dict):
             for k in ("tool_calls", "refusal", "reasoning_content"):
                 if k in msg and msg[k] is not None:
@@ -463,7 +486,7 @@ def llm_health_probe(sample_image_path, probe_prompt, expected_schema="boxes"):
         ],
     }]
     try:
-        raw = llm_chat(messages, temperature=0.0, max_tokens=1024)
+        raw = llm_chat(messages, temperature=0.0, max_tokens=3072)
     except Exception as e:
         return False, (
             "🚨 本地 LLM 健康探测请求失败 (HTTP/chat 异常):\n"
@@ -630,14 +653,14 @@ def llm_detect_boxes(image_path, user_description, max_retries=2, *, temperature
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
                 ],
             }]
-            raw = llm_chat(messages, temperature=(temperature if temperature is not None else 0.0), max_tokens=1024)
+            raw = llm_chat(messages, temperature=(temperature if temperature is not None else 0.0), max_tokens=3072)
             raw = _normalize_llm_content(raw)
             if raw is None:
                 last_error = f"attempt {attempt+1}: LLM returned None"
                 last_reply_preview = None
                 continue
-            # Keep up to 4000 chars (max_tokens=1024 → ~4KB) so failure diagnostics retain context
-            last_reply_preview = raw[:4000]
+            # Keep up to 6000 chars (max_tokens=3072 → ~12KB typical) so failure diagnostics retain context
+            last_reply_preview = raw[:6000]
             text = raw.strip()
             # Catch the [EMPTY_CONTENT_DEBUG] sentinel produced by llm_chat when the server
             # returned 0 tokens (llama.cpp multimodal KV cache overflow bug). Preserve the
@@ -1578,31 +1601,65 @@ def run_pipeline(video_path, class_name, config):
                     for jpg_name in all_jpgs
                     if not (labels_dir / (Path(jpg_name).stem + ".txt")).exists()
                 ]
+                # --- UX fix: even when LLM labeled *everything* (unlabeled=[]),
+                # we still hang at waiting_manual_label so the user gets clear
+                # feedback ("全标成功") instead of silently jumping to training.
+                # Two buttons are then exposed in the UI:
+                #   (a) "直接训练（不复核）" → /api/manual_label/complete → Event.set()
+                #   (b) "复核全部帧（编辑 LLM 已有框）" → /api/manual_label/review_all
+                #       → todo becomes all_jpgs, pre_saved_boxes loaded from existing .txt
+                # We also need a way to know which mode we're in, so stash it in _MANUAL_LABEL_CTX.
                 if unlabeled_basenames:
-                    _MANUAL_LABEL_EVENT.clear()
-                    _MANUAL_LABEL_CTX.update({
-                        "run_id": run_id,
-                        "frames_dir": str(frames_dir),
-                        "labels_dir": str(labels_dir),
-                        "todo_filenames": list(unlabeled_basenames),
-                        "done_filenames": set(),
-                    })
-                    update_status(
-                        "waiting_manual_label",
-                        50,
-                        f"LLM 标注完成，待人工补标 {len(unlabeled_basenames)} 张。请在页面框选后点『全部完成』继续。",
-                        f"Manual labeling phase: {len(unlabeled_basenames)} unlabeled / {len(all_jpgs)} total frames. "
-                        f"UI shows each frame; user saves bboxes as YOLO-format .txt or skips (empty .txt negative).",
+                    initial_todo = list(unlabeled_basenames)
+                    mode_hint = "patch"  # patch missing labels only
+                    user_msg = (
+                        f"LLM 标注完成，待人工补标 {len(unlabeled_basenames)}/{len(all_jpgs)} 张。"
+                        f" 请在页面框选后点『全部完成』继续；也可切换到『复核全部帧』模式检查全部图片。"
                     )
-                    # Block the pipeline daemon thread indefinitely here. This is why
-                    # we run run_pipeline in a threading.Thread (not the Flask request
-                    # handler): a synchronous HTTP worker would tie up a gunicorn/werkzeug
-                    # worker indefinitely. /api/reset clears the event via reset_state()
-                    # above so a canceled run can be restarted cleanly without deadlock.
-                    _MANUAL_LABEL_EVENT.wait()
-                    # Count txts again after manual save/skip pass to propagate correct
-                    # "labeled_count" to set_done() result + "if labeled_count == 0" check.
-                    labeled_count = len(list(labels_dir.glob("*.txt")))
+                    detail_msg = (
+                        f"Manual labeling phase (PATCH mode): "
+                        f"{len(unlabeled_basenames)} unlabeled / {len(all_jpgs)} total frames. "
+                        f"UI shows each frame without prior bboxes; user can switch to REVIEW mode "
+                        f"to see & edit LLM-produced bboxes on every frame."
+                    )
+                else:
+                    initial_todo = list(all_jpgs)  # will show pre-saved boxes; user picks review-or-skip
+                    mode_hint = "review_prompt"    # shows two action buttons instead of canvas first
+                    user_msg = (
+                        f"🎉 LLM 已成功标注 {len(all_jpgs)} 张（全部成功，0 张遗漏）。"
+                        f" 请选择下一步：『直接训练』跳过人工复核，或『开始复核全部帧』手动检查/编辑 LLM 结果。"
+                    )
+                    detail_msg = (
+                        f"Manual labeling phase (REVIEW prompt): all {len(all_jpgs)} frames already "
+                        f"have YOLO .txt from LLM. UI presents two actions: (1) skip manual entirely, "
+                        f"(2) enter REVIEW mode which loads the LLM-produced bboxes onto canvas so "
+                        f"user can delete/adjust/add boxes before committing to training."
+                    )
+                _MANUAL_LABEL_EVENT.clear()
+                _MANUAL_LABEL_CTX.update({
+                    "run_id": run_id,
+                    "frames_dir": str(frames_dir),
+                    "labels_dir": str(labels_dir),
+                    "todo_filenames": list(initial_todo),
+                    "done_filenames": set(),
+                    "all_filenames": list(all_jpgs),
+                    "mode": mode_hint,   # "patch" | "review_prompt" | "review"
+                })
+                update_status(
+                    "waiting_manual_label",
+                    50,
+                    user_msg,
+                    detail_msg,
+                )
+                # Block the pipeline daemon thread indefinitely here. This is why
+                # we run run_pipeline in a threading.Thread (not the Flask request
+                # handler): a synchronous HTTP worker would tie up a gunicorn/werkzeug
+                # worker indefinitely. /api/reset clears the event via reset_state()
+                # above so a canceled run can be restarted cleanly without deadlock.
+                _MANUAL_LABEL_EVENT.wait()
+                # Count txts again after manual save/skip pass to propagate correct
+                # "labeled_count" to set_done() result + "if labeled_count == 0" check.
+                labeled_count = len(list(labels_dir.glob("*.txt")))
 
         if labeled_count == 0:
             raise RuntimeError(
@@ -1856,21 +1913,122 @@ def api_manual_frame(run_id: str, filename: str):
 
 @app.route("/api/manual_label/todo")
 def api_manual_todo():
-    """Return the list of frames still missing a label.
+    """Return the list of frames still missing a label + existing LLM-produced bboxes.
 
     Called by the UI as soon as /api/status reports step='waiting_manual_label'.
     Response shape:
-      { run_id, todo: string[], done: string[], total }
+      { run_id, mode, todo, done, total, all_count, unlabeled_count, labeled_count,
+        pre_saved_boxes: { filename: [{x1,y1,x2,y2}] } }
+
+    pre_saved_boxes contains one entry per frame that already has a YOLO .txt in
+    labels_dir. Coordinates are 0..1 normalized, converted from YOLO
+    class_id cx cy bw bh → JS expects x1y1x2y2 (two-point rectangle) so frontend
+    can load them onto the canvas for editing / deletion / adjustment.
     """
+    def _read_yolo_boxes(label_path: Path):
+        """Return list of {x1,y1,x2,y2} dicts (0..1 normalized) or [] if file missing/empty.
+        """
+        if not label_path.exists():
+            return []
+        try:
+            text = label_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return []
+        result = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            try:
+                # class_id parts[0] is ignored here (frontend always uses class 0 for single-class pipeline)
+                cx, cy, bw, bh = (float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4]))
+            except ValueError:
+                continue
+            bw = max(0.0, min(1.0, bw))
+            bh = max(0.0, min(1.0, bh))
+            x1 = max(0.0, cx - bw / 2.0)
+            y1 = max(0.0, cy - bh / 2.0)
+            x2 = min(1.0, cx + bw / 2.0)
+            y2 = min(1.0, cy + bh / 2.0)
+            if x2 - x1 < 1e-4 or y2 - y1 < 1e-4:
+                continue
+            result.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2})
+        return result
+
     with state_lock:
         todo = list(_MANUAL_LABEL_CTX["todo_filenames"])
         done = sorted(_MANUAL_LABEL_CTX["done_filenames"])
-        return jsonify({
-            "run_id": _MANUAL_LABEL_CTX["run_id"],
-            "todo": todo,
-            "done": done,
-            "total": len(todo),
-        })
+        mode = _MANUAL_LABEL_CTX.get("mode", "patch")
+        all_files = _MANUAL_LABEL_CTX.get("all_filenames") or list(todo)
+        labels_dir = Path(_MANUAL_LABEL_CTX["labels_dir"]) if _MANUAL_LABEL_CTX["labels_dir"] else None
+
+    # Counts (always compute outside lock – pure filesystem reads, cheap & consistent)
+    all_count = len(all_files)
+    pre_saved_boxes = {}
+    labeled_count = 0
+    if labels_dir is not None and labels_dir.exists():
+        for jpg_name in all_files:
+            stem = Path(jpg_name).stem
+            lbl = labels_dir / f"{stem}.txt"
+            if lbl.exists():
+                labeled_count += 1
+                boxes = _read_yolo_boxes(lbl)
+                if boxes:
+                    pre_saved_boxes[jpg_name] = boxes
+        for jpg_name in todo:
+            if jpg_name in pre_saved_boxes:
+                continue  # already loaded via all_files sweep above
+            stem = Path(jpg_name).stem
+            lbl = labels_dir / f"{stem}.txt"
+            if lbl.exists():
+                boxes = _read_yolo_boxes(lbl)
+                if boxes:
+                    pre_saved_boxes[jpg_name] = boxes
+    unlabeled_count = max(0, all_count - labeled_count)
+
+    return jsonify({
+        "run_id": _MANUAL_LABEL_CTX["run_id"],
+        "mode": mode,
+        "todo": todo,
+        "done": done,
+        "total": len(todo),
+        "all_count": all_count,
+        "labeled_count": labeled_count,
+        "unlabeled_count": unlabeled_count,
+        "pre_saved_boxes": pre_saved_boxes,
+    })
+
+
+@app.route("/api/manual_label/review_all", methods=["POST"])
+def api_manual_review_all():
+    """Switch manual-label session into REVIEW mode:
+
+      * todo list becomes ALL frames (not just unlabeled ones)
+      * mode is reset to "review" so the UI shows pre_saved_boxes on canvas
+      * done_filenames is cleared so user walks through every frame once
+
+    Callable from any mode:
+      - review_prompt (LLM labeled everything): user clicked "开始复核全部帧"
+      - patch (LLM missed some frames): user clicked "切换到复核全部帧" in toolbar
+
+    Always redirects to regular canvas UI; caller should re-GET /api/manual_label/todo.
+    """
+    if not _MANUAL_LABEL_CTX["run_id"]:
+        return jsonify({"error": "No active manual-label session. Start training first."}), 400
+    with state_lock:
+        all_files = _MANUAL_LABEL_CTX.get("all_filenames") or list(_MANUAL_LABEL_CTX["todo_filenames"])
+        _MANUAL_LABEL_CTX["todo_filenames"] = list(all_files)
+        _MANUAL_LABEL_CTX["done_filenames"] = set()
+        _MANUAL_LABEL_CTX["mode"] = "review"
+    return jsonify({
+        "ok": True,
+        "mode": "review",
+        "total": len(all_files),
+        "all_count": len(all_files),
+    })
 
 
 @app.route("/api/manual_label/save", methods=["POST"])
@@ -2238,6 +2396,29 @@ HTML_PAGE = """
   }
   .box-chip .x-btn:hover { color: #ff8a80; }
   .empty-boxes { color: #888; font-size: 0.8rem; font-style: italic; }
+
+  /* Review-prompt stats cards (shown when LLM labeled 100% of frames) */
+  .rp-stat {
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 12px;
+    padding: 14px 22px;
+    min-width: 140px;
+    text-align: center;
+  }
+  .rp-num {
+    font-size: 2rem;
+    font-weight: 700;
+    line-height: 1;
+    margin-bottom: 6px;
+  }
+  .rp-label {
+    font-size: 0.8rem;
+    opacity: 0.75;
+  }
+  .manual-mode-label {
+    user-select: none;
+  }
 </style>
 </head>
 <body>
@@ -2352,36 +2533,75 @@ HTML_PAGE = """
     <h2>
       4. 🖍️ 人工补标
       <span class="status-badge status-running" style="margin-left:8px;">waiting_manual_label</span>
+      <span class="manual-mode-label" id="manualModeLabel" style="float:right;font-weight:normal;font-size:0.85rem;color:#667eea;background:rgba(102,126,234,0.08);padding:2px 10px;border-radius:999px;">模式: -</span>
     </h2>
-    <div class="manual-header">
+
+    <!-- ============= REVIEW_PROMPT: LLM 全标成功时的双按钮面板 ============= -->
+    <div class="review-prompt-panel" id="reviewPromptPanel" style="display:none; background:linear-gradient(135deg, rgba(76,175,80,0.08), rgba(102,126,234,0.08)); border:1px dashed rgba(76,175,80,0.4); border-radius:14px; padding:28px; margin:12px 0 8px; text-align:center;">
+      <div style="font-size:2.6rem; margin-bottom:10px;">🎉</div>
+      <h3 style="margin:4px 0 14px; color:#2e7d32; font-size:1.3rem;">LLM 自动标注全部成功！</h3>
+      <div class="rp-stats" style="display:flex; gap:16px; justify-content:center; margin:18px 0 24px; flex-wrap:wrap;">
+        <div class="rp-stat"><div class="rp-num" id="rp_all">0</div><div class="rp-label">总帧数</div></div>
+        <div class="rp-stat" style="color:#4caf50;"><div class="rp-num" id="rp_labeled">0</div><div class="rp-label">✅ 已成功标注</div></div>
+        <div class="rp-stat" style="color:#ef5350;"><div class="rp-num" id="rp_unlabeled">0</div><div class="rp-label">❌ 待补标</div></div>
+      </div>
+      <div style="display:flex; gap:14px; justify-content:center; flex-wrap:wrap;">
+        <button class="btn btn-primary" style="background:linear-gradient(90deg,#4caf50,#2e7d32); min-width:220px; font-size:1rem; padding:12px 22px;"
+          onclick="manualCompleteAll()">
+          ⏭️ 直接进入训练（跳过人工）
+          <div style="font-size:0.75rem; opacity:0.85; font-weight:normal;">使用 LLM 标注的 100% 结果立刻开始训练</div>
+        </button>
+        <button class="btn btn-primary" style="background:linear-gradient(90deg,#667eea,#764ba2); min-width:220px; font-size:1rem; padding:12px 22px;"
+          onclick="manualStartReviewAll()">
+          🖍️ 开始复核全部帧
+          <div style="font-size:0.75rem; opacity:0.85; font-weight:normal;">逐张检查 LLM 框选，可删除 / 调整 / 新增目标框</div>
+        </button>
+      </div>
+      <div style="margin-top:20px; color:#777; font-size:0.82rem;">
+        💡 <b>建议：</b>第一次训练 / 换目标类别时推荐先复核 5~10 张确认框选质量；
+        同一类别再次训练且你已确认 LLM 表现稳定，可以直接点「进入训练」节省时间。
+      </div>
+    </div>
+
+    <!-- ============= EDITOR (patch / review mode): Toolbar + Canvas + Actions ============= -->
+    <div id="manualToolbar" style="display:none; margin-bottom:8px;">
+      <button class="btn btn-secondary" id="switchReviewBtn" onclick="manualSwitchToReviewFromPatch()"
+        style="background:linear-gradient(90deg,#ff9800,#f57c00); color:white; border:none; display:none;">
+        🔁 切换到「复核全部帧」模式（查看 / 编辑 LLM 已标结果）
+      </button>
+    </div>
+
+    <div class="manual-header" id="manualHeaderWrap" style="display:none;">
       <div class="manual-title" id="manualFrameTitle">frame_0001.jpg</div>
       <div class="manual-counter" id="manualCounter">0 / 0</div>
     </div>
-    <div class="canvas-wrap">
+    <div class="canvas-wrap" id="manualCanvasCage" style="display:none;">
       <canvas id="labelCanvas" width="800" height="600"></canvas>
     </div>
-    <div class="manual-hint">
-      💡 <b>操作说明：</b>
-      <code>鼠标左键按住拖动</code> 绘制目标框 ｜
-      <code>点击框右侧 ×</code> 或 <code>按 Delete/Backspace 键</code> 删除最后一个框 ｜
-      <code>鼠标右键</code> 撤销上一个框 ｜
-      所有框都需完整包住目标物体（保存时自动转为 YOLO 归一化坐标 class_id cx cy bw bh）。
-    </div>
-    <div class="box-list" id="boxList">
-      <span class="empty-boxes">（暂无框，拖动鼠标在图上绘制第一个目标框）</span>
-    </div>
-    <div class="btn-group">
-      <button class="btn btn-secondary" id="prevFrameBtn" onclick="manualPrevFrame()">⬅️ 上一张</button>
-      <button class="btn btn-secondary" onclick="manualUndoLast()">↶ 撤销最后一个框</button>
-      <button class="btn btn-secondary" onclick="manualClearAll()">🗑️ 清空所有</button>
-      <button class="btn btn-secondary" id="skipFrameBtn" onclick="manualSkipFrame()">⏭️ 跳过此帧（背景/无目标）</button>
-      <button class="btn btn-primary" id="saveFrameBtn" onclick="manualSaveFrame()">✅ 保存此帧并下一张</button>
-    </div>
-    <div class="btn-group" style="margin-top:12px;">
-      <button class="btn btn-primary" style="background:linear-gradient(90deg,#4caf50,#2e7d32);" onclick="manualCompleteAll()">🎉 全部完成，开始训练</button>
-      <span style="color:#888;font-size:0.82rem;align-self:center;margin-left:4px;">
-        若不想处理剩余未标注帧，可直接点此进入训练（剩余帧将保持未标注状态）。
-      </span>
+    <div id="manualActions" style="display:none;">
+      <div class="manual-hint">
+        💡 <b>操作说明：</b>
+        <code>鼠标左键按住拖动</code> 绘制目标框 ｜
+        <code>点击框右侧 ×</code> 或 <code>按 Delete/Backspace 键</code> 删除最后一个框 ｜
+        <code>鼠标右键</code> 撤销上一个框 ｜
+        所有框都需完整包住目标物体（保存时自动转为 YOLO 归一化坐标 class_id cx cy bw bh）。
+      </div>
+      <div class="box-list" id="boxList">
+        <span class="empty-boxes">（暂无框，拖动鼠标在图上绘制第一个目标框）</span>
+      </div>
+      <div class="btn-group">
+        <button class="btn btn-secondary" id="prevFrameBtn" onclick="manualPrevFrame()">⬅️ 上一张</button>
+        <button class="btn btn-secondary" onclick="manualUndoLast()">↶ 撤销最后一个框</button>
+        <button class="btn btn-secondary" onclick="manualClearAll()">🗑️ 清空所有</button>
+        <button class="btn btn-secondary" id="skipFrameBtn" onclick="manualSkipFrame()">⏭️ 跳过此帧（背景/无目标）</button>
+        <button class="btn btn-primary" id="saveFrameBtn" onclick="manualSaveFrame()">✅ 保存此帧并下一张</button>
+      </div>
+      <div class="btn-group" style="margin-top:12px;">
+        <button class="btn btn-primary" style="background:linear-gradient(90deg,#4caf50,#2e7d32);" onclick="manualCompleteAll()">🎉 全部完成，开始训练</button>
+        <span style="color:#888;font-size:0.82rem;align-self:center;margin-left:4px;">
+          若不想处理剩余未标注帧，可直接点此进入训练（剩余帧将保持未标注状态）。
+        </span>
+      </div>
     </div>
   </div>
 
@@ -2602,15 +2822,18 @@ function resetUI() {
 /* ==================== Manual Labeling (Canvas-based) ==================== */
 const _MANUAL = {
   runId: null,
-  todo: [],         // full list of basenames from /api/manual_label/todo
-  curIdx: -1,       // current index within todo
-  boxes: [],        // boxes on current frame: [{x1,y1,x2,y2}] all 0..1 normalized vs NATURAL image size
-  natW: 0,          // natural (original) image width for current frame
-  natH: 0,          // natural (original) image height for current frame
-  dispW: 0,         // canvas display width (CSS pixels) for coord mapping
+  mode: 'patch',       // 'patch' | 'review_prompt' | 'review'
+  todo: [],            // full list of basenames from /api/manual_label/todo
+  preSavedBoxes: {},   // filename -> [{x1,y1,x2,y2}] existing LLM bboxes (for review mode)
+  stats: { all: 0, labeled: 0, unlabeled: 0 },
+  curIdx: -1,          // current index within todo
+  boxes: [],           // boxes on current frame: [{x1,y1,x2,y2}] all 0..1 normalized vs NATURAL image size
+  natW: 0,             // natural (original) image width for current frame
+  natH: 0,             // natural (original) image height for current frame
+  dispW: 0,            // canvas display width (CSS pixels) for coord mapping
   dispH: 0,
   drawing: false,
-  drawStart: null,  // {x,y} in 0..1 normalized coords
+  drawStart: null,     // {x,y} in 0..1 normalized coords
   drawCur: null,
   _img: null,
   _entered: false,
@@ -2624,39 +2847,132 @@ function manualTeardown() {
     ctx.clearRect(0, 0, c.width, c.height);
   }
   Object.assign(_MANUAL, {
-    runId: null, todo: [], curIdx: -1, boxes: [],
+    runId: null, mode: 'patch', todo: [], preSavedBoxes: {},
+    stats: { all: 0, labeled: 0, unlabeled: 0 },
+    curIdx: -1, boxes: [],
     natW: 0, natH: 0, dispW: 0, dispH: 0,
     drawing: false, drawStart: null, drawCur: null,
     _img: null, _entered: false,
   });
+  const panel = document.getElementById('reviewPromptPanel');
+  if (panel) panel.style.display = 'none';
+  const toolbar = document.getElementById('manualToolbar');
+  if (toolbar) toolbar.style.display = '';
+  const header = document.getElementById('manualHeaderWrap');
+  if (header) header.style.display = '';
+  const cage = document.getElementById('manualCanvasCage');
+  if (cage) cage.style.display = '';
+  const actions = document.getElementById('manualActions');
+  if (actions) actions.style.display = '';
 }
 
 async function manualEnterIfNeeded(data) {
   if (_MANUAL._entered) return;
   if (data.step !== 'waiting_manual_label') return;
   _MANUAL._entered = true;
-  // Remember polling state, keep it running (still want logs + status updates)
   try {
     const resp = await fetch('/api/manual_label/todo');
     const todoData = await resp.json();
     if (!todoData.run_id || !todoData.todo || todoData.todo.length === 0) {
-      // Nothing to label → signal complete on behalf of user (no frames needed)
       await manualCompleteAll(true);
       return;
     }
     _MANUAL.runId = todoData.run_id;
-    // Exclude any already-done frames from the interactive todo list
-    const doneSet = new Set(todoData.done || []);
-    const remaining = (todoData.todo || []).filter(f => !doneSet.has(f));
-    _MANUAL.todo = remaining.length ? remaining : (todoData.todo || []);
-    _MANUAL.curIdx = 0;
+    _MANUAL.mode = todoData.mode || 'patch';
+    _MANUAL.preSavedBoxes = todoData.pre_saved_boxes || {};
+    _MANUAL.stats = {
+      all: todoData.all_count || todoData.todo.length,
+      labeled: todoData.labeled_count || 0,
+      unlabeled: (todoData.unlabeled_count != null) ? todoData.unlabeled_count : 0,
+    };
     document.getElementById('manualSection').classList.add('active');
     _bindCanvasEvents();
-    await manualLoadFrame(0);
+
+    if (_MANUAL.mode === 'review_prompt') {
+      // --- ALL frames LLM-labeled successfully. Show two big buttons. ---
+      manualShowReviewPrompt();
+    } else {
+      // --- Regular mode (patch or already in review): show canvas editor. ---
+      const doneSet = new Set(todoData.done || []);
+      const remaining = (todoData.todo || []).filter(f => !doneSet.has(f));
+      _MANUAL.todo = remaining.length ? remaining : (todoData.todo || []);
+      _MANUAL.curIdx = 0;
+      manualShowEditorUI();
+      await manualLoadFrame(0);
+    }
   } catch (e) {
     console.error('manualEnter failed:', e);
     alert('进入人工补标失败: ' + e.message);
   }
+}
+
+function manualShowEditorUI() {
+  const prompt = document.getElementById('reviewPromptPanel');
+  if (prompt) prompt.style.display = 'none';
+  const tb = document.getElementById('manualToolbar');
+  if (tb) tb.style.display = '';
+  const header = document.getElementById('manualHeaderWrap');
+  if (header) header.style.display = '';
+  const cage = document.getElementById('manualCanvasCage');
+  if (cage) cage.style.display = '';
+  const acts = document.getElementById('manualActions');
+  if (acts) acts.style.display = '';
+  // Update mode label at top-right
+  const ml = document.getElementById('manualModeLabel');
+  if (ml) {
+    if (_MANUAL.mode === 'review') ml.textContent = '模式: 复核全部（编辑 LLM 已有框）';
+    else ml.textContent = '模式: 补标未成功帧（空白 canvas）';
+  }
+  // Always enable "switch to review all" when in patch mode
+  const sw = document.getElementById('switchReviewBtn');
+  if (sw) sw.style.display = (_MANUAL.mode === 'patch') ? '' : 'none';
+}
+
+function manualShowReviewPrompt() {
+  const prompt = document.getElementById('reviewPromptPanel');
+  if (!prompt) return;
+  prompt.style.display = '';
+  const tb = document.getElementById('manualToolbar');
+  if (tb) tb.style.display = 'none';
+  const header = document.getElementById('manualHeaderWrap');
+  if (header) header.style.display = 'none';
+  const cage = document.getElementById('manualCanvasCage');
+  if (cage) cage.style.display = 'none';
+  const acts = document.getElementById('manualActions');
+  if (acts) acts.style.display = 'none';
+  const ml = document.getElementById('manualModeLabel');
+  if (ml) ml.textContent = '模式: 选择操作（LLM 已全标成功）';
+  // Fill stats
+  document.getElementById('rp_all').textContent = _MANUAL.stats.all;
+  document.getElementById('rp_labeled').textContent = _MANUAL.stats.labeled;
+  document.getElementById('rp_unlabeled').textContent = _MANUAL.stats.unlabeled;
+}
+
+async function manualStartReviewAll() {
+  try {
+    const resp = await fetch('/api/manual_label/review_all', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    const d = await resp.json();
+    if (!resp.ok || !d.ok) throw new Error(d.error || '切换到复核模式失败');
+    // Re-fetch todo for fresh todo list + pre_saved_boxes for all frames
+    const t = await fetch('/api/manual_label/todo');
+    const todoData = await t.json();
+    _MANUAL.mode = todoData.mode || 'review';
+    _MANUAL.preSavedBoxes = todoData.pre_saved_boxes || {};
+    _MANUAL.todo = (todoData.todo || []).slice();
+    _MANUAL.curIdx = 0;
+    manualShowEditorUI();
+    await manualLoadFrame(0);
+  } catch (e) {
+    alert('切换到复核模式失败: ' + e.message);
+  }
+}
+
+async function manualSwitchToReviewFromPatch() {
+  // Same backend call; convenience function so the toolbar button onclick can differ
+  await manualStartReviewAll();
 }
 
 function _bindCanvasEvents() {
@@ -2866,8 +3182,10 @@ async function manualLoadFrame(idx) {
   _MANUAL.curIdx = idx;
   const filename = _MANUAL.todo[idx];
   document.getElementById('manualFrameTitle').textContent = filename;
-  document.getElementById('manualCounter').textContent =
-    `${idx + 1} / ${_MANUAL.todo.length}  （待补标总数: ${_MANUAL.todo.length}）`;
+  const modeTxt = _MANUAL.mode === 'review'
+    ? `复核全部帧：${idx + 1} / ${_MANUAL.todo.length}  （共 ${_MANUAL.stats.all} 张，LLM 已标 ${_MANUAL.stats.labeled}，未标 ${_MANUAL.stats.unlabeled}）`
+    : `补标：${idx + 1} / ${_MANUAL.todo.length}  （总 ${_MANUAL.stats.all} / 待补标 ${_MANUAL.todo.length}）`;
+  document.getElementById('manualCounter').textContent = modeTxt;
   const url = `/api/frame/${_MANUAL.runId}/${encodeURIComponent(filename)}`;
   const img = new Image();
   img.crossOrigin = 'anonymous';
@@ -2875,9 +3193,17 @@ async function manualLoadFrame(idx) {
     _MANUAL._img = img;
     _MANUAL.natW = img.naturalWidth;
     _MANUAL.natH = img.naturalHeight;
-    _MANUAL.boxes = [];
+    // --- REVIEW MODE: load pre-saved LLM boxes onto canvas so user can edit/delete/add ---
+    const saved = (_MANUAL.preSavedBoxes && _MANUAL.preSavedBoxes[filename]) || [];
+    if (saved.length) {
+      _MANUAL.boxes = saved.map(b => ({
+        x1: Number(b.x1) || 0, y1: Number(b.y1) || 0,
+        x2: Number(b.x2) || 0, y2: Number(b.y2) || 0,
+      })).filter(b => b.x2 - b.x1 > 0.0005 && b.y2 - b.y1 > 0.0005);
+    } else {
+      _MANUAL.boxes = [];
+    }
     renderBoxList();
-    // Defer redraw so CSS layout of canvas is settled
     requestAnimationFrame(() => {
       manualRedraw();
       window.addEventListener('resize', _onWinResize, { once: true });
@@ -2887,7 +3213,6 @@ async function manualLoadFrame(idx) {
     alert(`加载图片失败: ${filename}`);
   };
   img.src = url;
-  // Reset per-frame buttons
   document.getElementById('prevFrameBtn').disabled = idx <= 0;
 }
 let __resizeRaf = 0;
