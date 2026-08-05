@@ -21,7 +21,13 @@ import kotlin.math.roundToInt
 
 private const val MODEL_ASSET_NAME = "detect.tflite"
 private const val LABELS_ASSET_NAME = "labels.txt"
-private const val CONFIDENCE_THRESHOLD = 0.35f
+// NOTE: 0.35 → 0.20 for the small orange-can single-class dataset trained
+// on only ~50 near-frontal frames.  At 0.35, a 15° camera pitch change drops
+// raw tflite confidence from 0.79 to ~0.28 (below threshold → 0 detections).
+// Lowering to 0.20 tolerates the extra viewpoint variance until we re-train
+// with a dataset that covers more angles / distances / backgrounds.  Revisit
+// this threshold once the training dataset grows beyond ~200 diverse frames.
+private const val CONFIDENCE_THRESHOLD = 0.20f
 private const val IOU_THRESHOLD = 0.45f
 private const val MAX_DETECTIONS = 5
 private const val LOOP_INTERVAL_MS = 30L
@@ -92,7 +98,12 @@ private class YoloTfliteDetector(
     private val inputWidth: Int,
     private val inputHeight: Int,
     private val inputLayout: ModelInputLayout,
-    private val inputType: DataType
+    private val inputType: DataType,
+    /** Debug logger (same sink as Controller.start()).  Emits per-frame
+     *  top-confidence diagnostics so we can quickly tell the difference
+     *  between "the model gives 0.9 but threshold filters it out" vs
+     *  "the model genuinely outputs 0.00x noise". */
+    private val onLog: (String) -> Unit,
 ) {
     fun detect(bitmap: Bitmap): List<ObjectDetection> {
         // Letterbox (preserves aspect ratio with grey padding) instead of the
@@ -113,8 +124,37 @@ private class YoloTfliteDetector(
         val output = Array(1) { Array(outputShape[1]) { FloatArray(outputShape[2]) } }
         interpreter.run(input, output)
 
+        // ---- diagnostics: global max conf across ALL 8400 candidates
+        // before any threshold / NMS.  Lets us tell "threshold too high"
+        // (e.g. max conf=0.28, threshold=0.35 → 0 detections) from
+        // "model genuinely can't see it" (max conf=0.00x).  Cheap to
+        // compute (<1ms on 8400 boxes).
+        val (rawMaxConf, rawAboveThreshold) = scanRawMaxConf(
+            output[0], outputShape[1], outputShape[2]
+        )
+
         val detections = parseYoloOutput(output[0], outputShape[1], outputShape[2])
-        if (detections.isEmpty()) return detections
+        if (rawMaxConf < 0.01f || detections.isEmpty()) {
+            // Throttle: only log every ~8th frame at 30ms loop (~3.75 logs/s).
+            // Full blast would produce ~1 MB/s of noise in logcat.
+            if (sLogThrottle++ and 7 == 0) {
+                onLog(
+                    "YOLO frame ${bitmap.width}x${bitmap.height}: " +
+                        "raw_top_conf=%.4f raw_ge_thresh(%.2f)=%d final_det=%d".format(
+                            rawMaxConf, CONFIDENCE_THRESHOLD, rawAboveThreshold, detections.size
+                        )
+                )
+            }
+            return detections
+        }
+        // Non-empty detections: always log the top result.
+        val best = detections.first()
+        onLog(
+            "YOLO +hit '%s' conf=%.4f (raw_top=%.4f, raw_ge_thresh=%d) rect=[%.3f,%.3f,%.3f,%.3f]".format(
+                best.label, best.confidence, rawMaxConf, rawAboveThreshold,
+                best.rect.left, best.rect.top, best.rect.right, best.rect.bottom
+            )
+        )
         // Reverse the letterbox: model-space normalized rects come back in the
         // padded 640x640 coordinate frame.  Translate them back into the
         // original input `bitmap` so callers (OverlayView.drawDetections) can
@@ -182,6 +222,59 @@ private class YoloTfliteDetector(
     fun close() {
         interpreter.close()
     }
+
+    /** Cheap full-scan of the raw YOLO output tensor BEFORE decodePrediction's
+     *  CONFIDENCE_THRESHOLD filter / NMS.  Returns (max_conf_global, count_ge_threshold).
+     *
+     *  max_conf_global = over all 8400 anchors: max(objectness × best_class_score).
+     *  count_ge_threshold = how many boxes have (objectness × best_class_score)
+     *                       >= CONFIDENCE_THRESHOLD (pre-NMS / pre-letterbox reverse).
+     *
+     *  This is the single most useful diagnostic number for "偏一点就不能识别"
+     *  style complaints:
+     *   - max_conf_global=0.80 but count_ge_threshold=0 → threshold is too high
+     *   - max_conf_global=0.02 → model genuinely doesn't see the object
+     *     (different angle than training, background shift, lighting, etc.)
+     *   - count_ge_threshold > 10 but final_det=0 after NMS → IoU or letterbox
+     *     coordinate bug (would normally be caught by the Kotlin e2e test).
+     */
+    private fun scanRawMaxConf(
+        output: Array<FloatArray>, firstDim: Int, secondDim: Int
+    ): Pair<Float, Int> {
+        val attrsFirst = firstDim < secondDim
+        val boxCount = if (attrsFirst) secondDim else firstDim
+        val attrCount = if (attrsFirst) firstDim else secondDim
+        if (attrCount < 5) return 0f to 0
+        val classOffset = if (attrCount > labels.size + 4) 5 else 4
+
+        var maxConf = 0f
+        var count = 0
+        for (boxIndex in 0 until boxCount) {
+            // Read attrs inline (avoids FloatArray allocation per box — 8400
+            // allocations per frame would be ~400 KB/s of garbage even on
+            // throttled logging path).
+            val objectnessRaw = if (classOffset == 5) {
+                if (attrsFirst) output[4][boxIndex] else output[boxIndex][4]
+            } else 1f
+            val objectness = objectnessRaw.coerceIn(0f, 1f)
+            var bestClassScore = 0f
+            for (i in classOffset until attrCount) {
+                val s = if (attrsFirst) output[i][boxIndex] else output[boxIndex][i]
+                if (s > bestClassScore) bestClassScore = s
+            }
+            val conf = (objectness * bestClassScore).coerceIn(0f, 1f)
+            if (conf > maxConf) maxConf = conf
+            if (conf >= CONFIDENCE_THRESHOLD) count++
+        }
+        return maxConf to count
+    }
+
+    // Per-detector-instance counter for throttling the no-detection debug log.
+    // A companion object Int is shared across instances, which is fine for a
+    // single-instance controller but semantically clearer to keep inside the
+    // class as one counter per detector; Kotlin doesn't have Java-style
+    // instance-scope 'static so we just put it next to other private vals.
+    private var sLogThrottle: Int = 0
 
     private fun bitmapToInputBuffer(bitmap: Bitmap): ByteBuffer {
         val bytesPerChannel = if (inputType == DataType.FLOAT32) 4 else 1
@@ -323,7 +416,9 @@ private class YoloTfliteDetector(
                           "Expected first line of labels.txt to match dataset.yaml names[0].")
                 }
             }
-            return YoloTfliteDetector(interpreter, labels, width, height, inputLayout, inputTensor.dataType())
+            return YoloTfliteDetector(
+                interpreter, labels, width, height, inputLayout, inputTensor.dataType(), onLog
+            )
         }
     }
 }
