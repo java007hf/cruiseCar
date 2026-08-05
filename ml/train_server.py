@@ -70,14 +70,76 @@ def llm_chat(messages, temperature=0.3, max_tokens=1024):
         headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=120) as resp:
-        result = json.loads(resp.read().decode("utf-8"))
+        raw_body = resp.read().decode("utf-8")
+        try:
+            result = json.loads(raw_body)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"llm_chat: response from server is not valid JSON: {e}. "
+                f"First 500 chars of body: {raw_body[:500]!r}"
+            ) from e
+    # Attach the raw response body to result so callers can dump it on empty-content failures.
+    # We use a non-destructive dict key that won't conflict with the OpenAI schema.
+    result["_raw_body"] = raw_body
+    if "choices" not in result or not isinstance(result["choices"], list) or not result["choices"]:
+        raise RuntimeError(
+            f"llm_chat: response has no / empty 'choices' array. Full body first 800 chars: {raw_body[:800]!r}"
+        )
     choice = result["choices"][0]
     msg = choice.get("message", choice)
     content = msg.get("content") if isinstance(msg, dict) else None
+    finish = choice.get("finish_reason")
+    # --- Diagnostics for empty / None content with non-standard finish_reason ---
+    # llama.cpp multimodal bug manifests as: HTTP 200 + content="" (or null) +
+    # finish_reason="abort"/"error"/"stop" even though 0 tokens were produced.
+    # Previously we only checked finish_reason when content IS None; now we also
+    # surface the raw response structure when content is empty/whitespace so
+    # downstream failures (like "empty string") carry diagnostic breadcrumbs.
+    content_is_empty = False
     if content is None:
-        finish = choice.get("finish_reason")
-        if finish and finish not in ("stop", "eos", "length"):
-            raise RuntimeError(f"LLM refused or errored: finish_reason={finish!r}, message={msg!r}")
+        content_is_empty = True
+    elif isinstance(content, str):
+        if len(content.strip()) == 0:
+            content_is_empty = True
+    elif isinstance(content, list):
+        # Multi-part content: no text parts at all → effectively empty.
+        has_any_text = False
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text" and part.get("text"):
+                has_any_text = True
+                break
+        if not has_any_text:
+            content_is_empty = True
+    if content_is_empty:
+        # Synthesize a content value that encodes the raw response so that
+        # downstream code that records "raw_reply_preview" captures the cause.
+        # We prepend a sentinel + finish_reason + key fields, then truncate to 4000 chars.
+        snippet_parts = [
+            f"[EMPTY_CONTENT_DEBUG] finish_reason={finish!r}",
+        ]
+        if isinstance(msg, dict):
+            for k in ("tool_calls", "refusal", "reasoning_content"):
+                if k in msg and msg[k] is not None:
+                    snippet_parts.append(f"msg.{k}={str(msg[k])[:500]!r}")
+        if isinstance(result, dict):
+            for k in ("usage", "model", "id"):
+                if k in result and result[k] is not None:
+                    snippet_parts.append(f"resp.{k}={str(result[k])[:300]!r}")
+        snippet_parts.append(f"raw_body[:2000]={raw_body[:2000]!r}")
+        debug_snippet = " | ".join(snippet_parts)
+        # Also raise if finish_reason clearly indicates an error
+        if finish and finish not in ("stop", "eos", "length", None):
+            # Refused / errored → raise with full context so caller gets a clear failure.
+            raise RuntimeError(
+                f"LLM abnormal finish: finish_reason={finish!r}. "
+                f"Message keys: {list(msg.keys()) if isinstance(msg, dict) else type(msg)!r}. "
+                f"Debug: {debug_snippet[:2000]}"
+            )
+        # For "stop"/"eos" / unknown / None finish_reason with empty content → don't
+        # raise (preserves old behaviour of retrying via max_retries), but make the
+        # content field NON-EMPTY with the debug snippet so raw_reply_preview and
+        # failures sidecar files actually tell us *why* it was empty instead of "".
+        content = debug_snippet
     # Normalize content (collapse list-of-content-parts, coerce None to empty-ish, etc.)
     # into either a plain str or None. Normalization is shared with the mock-friendly
     # helper llm_run so tests / callers get consistent behavior regardless of whether
@@ -118,6 +180,227 @@ def _normalize_llm_content(content, *, choice=None, msg=None):
                 return alt
         return str(content)
     return content
+
+
+_JSON_TRAILING_COMMA_RE = None
+_JSON_MISSING_COMMA_RE = None
+_JSON_LINE_COMMENT_RE = None
+_JSON_BLOCK_COMMENT_RE = None
+
+
+def _compile_json_regexes():
+    """Lazily compile the small regex set used by _robust_json_parse."""
+    global _JSON_TRAILING_COMMA_RE, _JSON_MISSING_COMMA_RE, _JSON_LINE_COMMENT_RE, _JSON_BLOCK_COMMENT_RE
+    if _JSON_TRAILING_COMMA_RE is None:
+        import re
+        _JSON_TRAILING_COMMA_RE = re.compile(r',\s*([}\]])')
+        _JSON_MISSING_COMMA_RE = re.compile(r'([}\]])\s*([\[{])')
+        _JSON_LINE_COMMENT_RE = re.compile(r'//[^\n]*')
+        _JSON_BLOCK_COMMENT_RE = re.compile(r'/\*.*?\*/', flags=re.DOTALL)
+
+
+def _try_repair_json_string(candidate: str) -> str:
+    """Apply lightweight, safe text-level repairs to an almost-valid JSON string.
+
+    Order matters: comments first, then structural fixes, then trailing commas last.
+    Each regex is safe even on fully-valid JSON (idempotent-ish). Never attempt to
+    rewrite string contents (e.g. replace commas inside quotes); we only touch the
+    structural punctuation that sits between JSON tokens.
+    """
+    _compile_json_regexes()
+    s = candidate
+    # 1) Strip // line comments and /* */ block comments (LLM sometimes
+    #    appends " // note: I guessed the coords" style annotations).
+    s = _JSON_BLOCK_COMMENT_RE.sub('', s)
+    s = _JSON_LINE_COMMENT_RE.sub('', s)
+    # 2) Missing comma between adjacent containers: "][", "}{", "]}", "}["
+    #    e.g. `[[0.1,0.2,0.3,0.4] [0.5,0.6,0.7,0.8]]` → insert `,` between them.
+    s = _JSON_MISSING_COMMA_RE.sub(r'\1,\2', s)
+    # 3) Trailing comma before `}` or `]` — the #1 LLM JSON mistake.
+    #    e.g. `[1, 2, 3,]` → `[1, 2, 3]`; `{"a": 1,}` → `{"a": 1}`
+    s = _JSON_TRAILING_COMMA_RE.sub(r'\1', s)
+    # 4) Second pass: after removing comments, the above two fixes may have
+    #    introduced new fixable patterns (e.g. a comment sat between two arrays
+    #    → comment stripped, now we have `][` → apply missing-comma again).
+    s = _JSON_MISSING_COMMA_RE.sub(r'\1,\2', s)
+    s = _JSON_TRAILING_COMMA_RE.sub(r'\1', s)
+    return s
+
+
+def _robust_json_parse(candidate: str):
+    """json.loads with a repair fallback chain for LLM-typical malformations.
+
+    Returns (parsed_obj, repair_note_or_None). On full failure raises a
+    json.JSONDecodeError so callers retain a precise error message.
+    """
+    orig_err = None
+    # Fast path: candidate is already valid JSON (the 95% case).
+    try:
+        return json.loads(candidate), None
+    except json.JSONDecodeError as e:
+        orig_err = e
+    except Exception as e:
+        # Defensive: any other failure types (e.g. UnicodeDecodeError on weird inputs)
+        # wrap into JSONDecodeError-compatible form so downstream gets unified error path.
+        orig_err = json.JSONDecodeError(
+            f"Unexpected {type(e).__name__}: {e}", doc=str(candidate), pos=0,
+        )
+    # Slow path 1: text-level repairs then json.loads.
+    repaired = _try_repair_json_string(candidate)
+    if repaired != candidate:
+        try:
+            return json.loads(repaired), "text-repair"
+        except json.JSONDecodeError as e:
+            # Keep the original error for re-raise, unless the original had a
+            # more user-visible character position.
+            if orig_err is None:
+                orig_err = e
+    # Slow path 2: Python ast.literal_eval — it accepts trailing commas,
+    # single quotes, and Python numeric literals. Only run it if the candidate
+    # "looks like" a Python literal (starts with [ or {) to avoid surprising
+    # string-coercion behaviour.
+    stripped = candidate.strip()
+    if stripped and stripped[0] in '[{':
+        import ast
+        try:
+            val = ast.literal_eval(stripped)
+            if isinstance(val, (dict, list)):
+                return val, "ast.literal_eval"
+        except (ValueError, SyntaxError, MemoryError, RecursionError) as _e:
+            pass
+        except Exception:
+            pass
+    # All fall-throughs exhausted. Re-raise the *original* error so the
+    # caller-facing message still points at the actual user-visible syntax
+    # issue (not something introduced by our repair attempts).
+    if orig_err is not None:
+        raise orig_err
+    raise json.JSONDecodeError("Unable to parse candidate as JSON", doc=str(candidate), pos=0)
+
+
+def _extract_and_normalize_json(text: str, *, expected_schema: str = "boxes"):
+    """Shared robust JSON extractor for LLM replies. Handles:
+       - Markdown code fences (```json ... ``` / ``` ... ```)
+       - Extra prose / junk before or after the JSON payload
+       - Bare array [[x1,y1,x2,y2], ...] replies (no outer {"boxes": ...} wrapper)
+       - Nested object replies with a single known schema key.
+       - LLM-typical JSON malformations: trailing commas, missing ][ commas,
+         inline comments, single quotes (via ast.literal_eval fallback).
+
+    Returns (obj_or_None, error_msg_or_None). The returned obj is always normalized
+    so that the schema key (default "boxes") holds the list-of-boxes arrays.
+    """
+    if not text:
+        return None, "empty text"
+    t = text.strip()
+    # Strip markdown code fences: ```json ... ``` / ``` ... ```
+    if t.startswith("```"):
+        # Strip opening fence (possibly with language tag like ```json / ```JSON)
+        idx = t.find("\n")
+        if idx >= 0:
+            fence_line = t[:idx]
+            # Accept if fence is just backticks or backticks+identifier
+            if all(c == "`" or c.isalnum() or c == "_" or c == "-" for c in fence_line):
+                t = t[idx + 1:]
+        # Strip closing fence
+        if t.endswith("```"):
+            t = t[:-3]
+        t = t.strip()
+        # Some models output `json` tag without newline: ```json[[...]]```
+        if t.lower().startswith("json"):
+            t = t[4:].strip()
+    if not t:
+        return None, "empty after fence stripping"
+    # Preferred path: find JSON object braces { ... }
+    obj_start = t.find("{")
+    obj_end = t.rfind("}")
+    arr_start = t.find("[")
+    arr_end = t.rfind("]")
+    # Decide which payload to use first:
+    #  - If object present and object starts before array (or no array): try object first
+    #  - Else try array first, then fall back to object
+    try_object_first = (
+        obj_start >= 0
+        and obj_end > obj_start
+        and (arr_start < 0 or obj_start <= arr_start)
+    )
+    last_err = None
+    repair_used = None
+    if try_object_first:
+        candidate = t[obj_start:obj_end + 1]
+        try:
+            obj, note = _robust_json_parse(candidate)
+            repair_used = note or repair_used
+            if isinstance(obj, dict):
+                # Ensure the schema key exists; if dict has no schema key but has a single list value,
+                # treat it as boxes (e.g. model returned {"result": [[...]]} instead of {"boxes": [[...]]}).
+                if expected_schema not in obj:
+                    for _, v in obj.items():
+                        if (
+                            isinstance(v, list)
+                            and len(v) > 0
+                            and isinstance(v[0], (list, tuple))
+                            and len(v[0]) >= 4
+                        ):
+                            obj[expected_schema] = v
+                            break
+                if expected_schema not in obj:
+                    obj[expected_schema] = []
+                return obj, None
+        except json.JSONDecodeError as e:
+            last_err = f"object JSONDecodeError: {e}"
+        # Object path failed; fall through to array path (if an array exists)
+    if arr_start >= 0 and arr_end > arr_start:
+        candidate = t[arr_start:arr_end + 1]
+        try:
+            arr, note = _robust_json_parse(candidate)
+            repair_used = note or repair_used
+            if isinstance(arr, list):
+                # Either the array is a list of boxes (list of lists), or a single box (list of 4 numbers).
+                # Normalize both into the dict schema form.
+                if (
+                    len(arr) > 0
+                    and isinstance(arr[0], (list, tuple))
+                ):
+                    # List of boxes: [[0.1,0.2,0.3,0.4], ...]
+                    return {expected_schema: arr}, None
+                if (
+                    len(arr) == 4
+                    and all(isinstance(x, (int, float)) for x in arr)
+                ):
+                    # Single bare box: [0.1,0.2,0.3,0.4]
+                    return {expected_schema: [arr]}, None
+                return {expected_schema: []}, None
+        except json.JSONDecodeError as e:
+            last_err = (last_err + "; " if last_err else "") + f"array JSONDecodeError: {e}"
+    # Fallback: try object path if we haven't already (array-started-first case)
+    if not try_object_first and obj_start >= 0 and obj_end > obj_start:
+        candidate = t[obj_start:obj_end + 1]
+        try:
+            obj, note = _robust_json_parse(candidate)
+            repair_used = note or repair_used
+            if isinstance(obj, dict):
+                if expected_schema not in obj:
+                    for _, v in obj.items():
+                        if (
+                            isinstance(v, list)
+                            and len(v) > 0
+                            and isinstance(v[0], (list, tuple))
+                            and len(v[0]) >= 4
+                        ):
+                            obj[expected_schema] = v
+                            break
+                if expected_schema not in obj:
+                    obj[expected_schema] = []
+                return obj, None
+        except json.JSONDecodeError as e:
+            last_err = (last_err + "; " if last_err else "") + f"object JSONDecodeError: {e}"
+    # Nothing parsed
+    snippet = t[:120]
+    err = last_err or f"no JSON object/array found in reply. snippet: {snippet!r}"
+    if repair_used:
+        err = f"{err} (repair fallback used: {repair_used})"
+    return None, err
 
 
 def llm_health_probe(sample_image_path, probe_prompt, expected_schema="boxes"):
@@ -189,24 +472,23 @@ def llm_health_probe(sample_image_path, probe_prompt, expected_schema="boxes"):
             "    若仍为空，请检查 llama-server 侧是否有 token generation 报错 / 推理超时。",
             raw_len=0,
         )
-    start, end = text.find("{"), text.rfind("}")
-    if not (start >= 0 and end > start):
+    # Use the shared robust extractor: handles markdown fences + bare arrays + dict wrappers.
+    obj, parse_err = _extract_and_normalize_json(text, expected_schema=expected_schema)
+    if obj is None:
         snippet = text[:200]
         return False, _llm_vl_troubleshoot_text(
-            f"🚨 本地 LLM 返回了非 JSON 内容（没有 {{/}} 大括号），实际回复 ({len(text)} chars):\n    {snippet!r}",
+            f"🚨 本地 LLM 返回内容无法解析为有效 JSON (boxes schema)：{parse_err}\n"
+            f"    实际回复 ({len(text)} chars):\n    {snippet!r}",
             raw_len=len(text),
             raw_snippet=snippet,
         )
-    json_candidate = text[start:end + 1]
-    try:
-        obj = json.loads(json_candidate)
-    except json.JSONDecodeError as e:
-        return False, _llm_vl_troubleshoot_text(
-            f"🚨 本地 LLM 返回的 JSON 解析失败: {e}\n    内容片段: {json_candidate[:200]!r}",
-            raw_len=len(text),
-        )
     if expected_schema and not isinstance(obj, dict):
         return False, f"🚨 健康探测返回 JSON 顶层不是 object: {obj!r}"
+    # Extra sanity check: if we got boxes, verify at least one coord looks like a normalized float
+    # (if boxes is empty that's also valid — probe prompt may describe nothing in the 2x2 fixture).
+    boxes = obj.get(expected_schema, [])
+    if not isinstance(boxes, list):
+        return False, f"🚨 健康探测返回 {expected_schema!r} 字段不是 list: {boxes!r}"
     return True, "健康探测 OK"
 
 
@@ -340,27 +622,35 @@ def llm_detect_boxes(image_path, user_description, max_retries=2, *, temperature
                 last_error = f"attempt {attempt+1}: LLM returned None"
                 last_reply_preview = None
                 continue
-            last_reply_preview = raw[:200]
+            # Keep up to 4000 chars (max_tokens=1024 → ~4KB) so failure diagnostics retain context
+            last_reply_preview = raw[:4000]
             text = raw.strip()
-            # Strip markdown code fences if any
-            if text.startswith("```"):
-                text = text.strip("`")
-                if text.lower().startswith("json"):
-                    text = text[4:]
-                text = text.strip("`").strip()
+            # Catch the [EMPTY_CONTENT_DEBUG] sentinel produced by llm_chat when the server
+            # returned 0 tokens (llama.cpp multimodal KV cache overflow bug). Preserve the
+            # user-visible "empty string" error classification so consecutive_empty counter
+            # and had_llm_failure checks work as before, but attach the debug breadcrumbs
+            # (finish_reason, usage, raw_body) that llm_chat stitched into the content.
+            if text.startswith("[EMPTY_CONTENT_DEBUG]"):
+                last_error = (
+                    f"attempt {attempt+1}: LLM reply was empty string "
+                    f"(server-side 0-token generation; llama.cpp VLP pipeline likely hit KV cache / ctx-size limit). "
+                    f"Detail: {text[:2000]}"
+                )
+                continue
             # Defensive: guard against empty reply (e.g. LLM crashed, empty string response)
             if not text:
                 last_error = f"attempt {attempt+1}: LLM reply was empty string"
                 continue
-            # Try to find JSON object in messy output
-            start = text.find("{")
-            end = text.rfind("}")
-            if start >= 0 and end > start:
-                text = text[start:end + 1]
-            else:
-                last_error = f"attempt {attempt+1}: no JSON object braces found in reply ({len(text)} chars)"
+            # Use shared robust extractor: markdown fences + bare-array fallback both handled here.
+            obj, parse_err = _extract_and_normalize_json(text, expected_schema="boxes")
+            if obj is None:
+                last_error = f"attempt {attempt+1}: {parse_err}"
+                # On the final attempt, attach the full reply snippet to the error message so
+                # callers / failure sidecars capture the exact malformed content for inspection.
+                if attempt == max_retries:
+                    last_error = f"{last_error} | raw_content[:500]={text[:500]!r}"
                 continue
-            obj = json.loads(text)
+            # obj is guaranteed to be a dict with a "boxes" key by the extractor.
             boxes = []
             for b in obj.get("boxes", []):
                 coords = None
@@ -615,14 +905,14 @@ def auto_label_frames(frames_dir, labels_dir, class_name):
         dt = time.time() - t0
 
         had_llm_failure = bool(last_error and "empty string" in last_error) or bool(
-            last_error and ("returned None" in last_error or "JSONDecodeError" in last_error or "no JSON object braces" in last_error)
+            last_error and ("returned None" in last_error or "JSONDecodeError" in last_error or "no JSON object" in last_error or "found in reply" in last_error)
         )
         if had_llm_failure:
             llm_failures += 1
             consecutive_broken += 1
             consecutive_empty += 1 if (last_error and "empty string" in last_error) else 0
             diagnostics.append((img_path.name, last_error or "", raw_preview or ""))
-            # Save a diagnostic copy: JPG + sidecar .txt with error + preview + user description
+            # Save a diagnostic copy: JPG + sidecar .txt + full raw reply .raw.txt
             try:
                 shutil.copy2(img_path, failures_dir / img_path.name)
                 sidecar = failures_dir / f"{img_path.stem}.txt"
@@ -630,9 +920,14 @@ def auto_label_frames(frames_dir, labels_dir, class_name):
                     f"user_description: {class_name}",
                     f"final_pass_used: {final_pass_used}",
                     f"last_error: {last_error or ''}",
-                    f"raw_reply_preview: {raw_preview or ''}",
+                    f"raw_reply_first_4000_chars:",
+                    raw_preview or '',
                 ]
                 sidecar.write_text("\n".join(lines), encoding="utf-8")
+                # Also dump the full raw reply to a standalone file for copy-paste / inspection.
+                if raw_preview:
+                    raw_file = failures_dir / f"{img_path.stem}.raw_reply.txt"
+                    raw_file.write_text(raw_preview, encoding="utf-8")
             except Exception:
                 pass
             # Abort thresholds — if we're clearly not getting valid replies anymore, stop early
@@ -890,8 +1185,185 @@ def generate_yaml(dataset_dir, class_name, yaml_path):
         "val": "images/val",
         "names": {0: class_name},
     }
-    with open(yaml_path, "w") as f:
+    # Explicit UTF-8 so read_class_names (which reads UTF-8 below) can round-trip
+    # Chinese class names. Without this, Windows Python defaults to the active
+    # code page (e.g. GBK on zh-CN), and the UTF-8 reader drops/garbles chars.
+    with open(yaml_path, "w", encoding="utf-8") as f:
         yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
+
+
+def _read_text_any_encoding(path):
+    """Read a text file, trying UTF-8 first, then GBK/GB18030 on decode error.
+
+    Legacy dataset.yaml files (written before generate_yaml had explicit
+    UTF-8) defaulted to the Windows code page (GBK on zh-CN systems), so a
+    strict UTF-8 reader would silently drop every Chinese character via
+    errors="ignore" and return an empty class list. Trying GBK as fallback
+    lets us round-trip both encodings cleanly.
+    """
+    data = Path(path).read_bytes()
+    for enc in ("utf-8", "gbk", "gb18030", "latin-1"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def read_class_names(yaml_path):
+    """Return class names as an ordered list from a YOLO dataset.yaml (names: {id: name})."""
+    yaml_path = Path(yaml_path)
+    try:
+        text = _read_text_any_encoding(yaml_path)
+        cfg = yaml.safe_load(text) or {}
+        names = cfg.get("names")
+        if isinstance(names, list):
+            return [str(n).strip() for n in names if str(n).strip()]
+        if isinstance(names, dict):
+            items = sorted((int(k), str(v).strip()) for k, v in names.items())
+            return [v for _, v in items if v]
+    except Exception:
+        pass
+    return []
+
+
+def post_train_export(pt_path, yaml_path, output_dir, android_assets_dir=None, imgsz=640):
+    """Auto-export newly-trained .pt -> .onnx -> .tflite alongside labels.txt.
+
+    Runs after every training run. Failures are non-fatal (they do NOT mark the
+    overall training run as failed) — detailed logs are written so the user can
+    retry manually via `python export_to_tflite.py` if anything goes wrong.
+
+    Produces in output_dir/:
+      - detect.tflite
+      - labels.txt
+    If android_assets_dir is given the files are also copied there so a
+    subsequent gradlew build immediately packages the new weights.
+    """
+    pt_path = Path(pt_path)
+    yaml_path = Path(yaml_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_lines = []
+
+    def log(msg):
+        log_lines.append(str(msg))
+        print("[export]", msg)
+
+    log(f"Post-train export starting. pt={pt_path.name} out={output_dir}")
+    overall_ok = True
+
+    # ---- labels.txt ----
+    try:
+        classes = read_class_names(yaml_path)
+        if not classes:
+            # Fallback: parse names block manually with regex so even weird
+            # yaml loader quirks don't kill label generation.
+            import re
+            # Use same tolerant reader: legacy yaml files may be GBK-encoded.
+            text = _read_text_any_encoding(yaml_path)
+            found = {}
+            in_names = False
+            for line in text.splitlines():
+                s = line.rstrip()
+                if s.startswith("names:"):
+                    in_names = True
+                    continue
+                if in_names and s and not s[:1].isspace() and not s.startswith("#"):
+                    break
+                m = re.match(r"\s*(\d+)\s*:\s*(.+)", s)
+                if m:
+                    found[int(m.group(1))] = m.group(2).strip()
+            classes = [v for _, v in sorted(found.items())]
+        if not classes:
+            classes = ["object"]
+            log("WARN: could not resolve class names from yaml; falling back to ['object']")
+        labels_out = output_dir / "labels.txt"
+        labels_out.write_text("\n".join(classes) + "\n", encoding="utf-8")
+        log(f"labels.txt -> {labels_out} ({len(classes)} classes: {classes})")
+    except Exception as e:
+        overall_ok = False
+        log(f"ERROR writing labels.txt: {type(e).__name__}: {e}")
+        labels_out = None
+
+    # ---- .pt -> ONNX ----
+    onnx_path = None
+    try:
+        from ultralytics import YOLO
+        model = YOLO(str(pt_path))
+        onnx_out = model.export(format="onnx", imgsz=imgsz, opset=17, simplify=True)
+        onnx_path = Path(onnx_out)
+        log(f"ONNX export OK -> {onnx_path.name} ({onnx_path.stat().st_size/1024/1024:.1f} MB)")
+    except Exception as e:
+        overall_ok = False
+        log(f"ERROR onnx export: {type(e).__name__}: {e}")
+
+    # ---- ONNX -> TFLite ----
+    tflite_final = None
+    if onnx_path and onnx_path.exists():
+        tflite_tmp_dir = output_dir / f"_tflite_{pt_path.stem}"
+        if tflite_tmp_dir.exists():
+            try:
+                shutil.rmtree(tflite_tmp_dir)
+            except Exception:
+                pass
+        try:
+            import subprocess
+            res = subprocess.run(
+                [
+                    sys.executable, "-m", "onnx2tf",
+                    "-i", str(onnx_path),
+                    "-o", str(tflite_tmp_dir),
+                ],
+                capture_output=True, text=True, timeout=30 * 60,
+            )
+            if res.returncode != 0:
+                tail = (res.stdout or "")[-600:] + "\n---STDERR---\n" + (res.stderr or "")[-1200:]
+                raise RuntimeError(f"onnx2tf exit={res.returncode}\n{tail}")
+            candidates = list(tflite_tmp_dir.rglob("*.tflite"))
+            if not candidates:
+                raise RuntimeError(f"onnx2tf produced no .tflite in {tflite_tmp_dir}")
+            tflite_src = candidates[0]
+            tflite_final = output_dir / "detect.tflite"
+            shutil.copy2(tflite_src, tflite_final)
+            log(f"TFLite export OK -> {tflite_final.name} ({tflite_final.stat().st_size/1024/1024:.1f} MB)")
+            try:
+                shutil.rmtree(tflite_tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
+        except Exception as e:
+            overall_ok = False
+            log(f"ERROR tflite conversion: {type(e).__name__}: {e}")
+
+    # ---- Copy to Android assets ----
+    copied_to_android = False
+    if android_assets_dir and (tflite_final or labels_out):
+        try:
+            android_assets_dir = Path(android_assets_dir)
+            android_assets_dir.mkdir(parents=True, exist_ok=True)
+            if tflite_final and tflite_final.exists():
+                shutil.copy2(tflite_final, android_assets_dir / "detect.tflite")
+                copied_to_android = True
+            if labels_out and labels_out.exists():
+                shutil.copy2(labels_out, android_assets_dir / "labels.txt")
+                copied_to_android = True
+            if copied_to_android:
+                log(f"Copied new model+labels into Android assets: {android_assets_dir}")
+        except Exception as e:
+            log(f"WARN copying to android assets failed: {type(e).__name__}: {e}")
+
+    # Write consolidated sidecar report so user can eyeball what happened
+    report = output_dir / f"export_report_{pt_path.stem}.txt"
+    try:
+        report.write_text(
+            "\n".join(log_lines) +
+            f"\n\noverall: {'SUCCESS' if overall_ok else 'FAILED (see errors above)'}\n",
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+    return overall_ok, tflite_final, labels_out, copied_to_android
 
 
 def run_pipeline(video_path, class_name, config):
@@ -1016,11 +1488,50 @@ def run_pipeline(video_path, class_name, config):
         final_model_path = OUTPUTS_DIR / f"{class_name}_{run_id}.pt"
         shutil.copy2(str(best_model_path), str(final_model_path))
 
-        update_status("done", 100, "Training complete!", f"Model saved to: {final_model_path}")
+        # ------------------------------------------------------------------
+        # Auto-export pt -> tflite + labels.txt for immediate Android use.
+        # Export failures do NOT invalidate training (pt is still valid); we
+        # just annotate the status/result so the UI can surface them.
+        # ------------------------------------------------------------------
+        update_status(
+            "exporting", 95,
+            "Training complete. Converting .pt -> TFLite for Android...",
+            f"Starting post-train export: {final_model_path.name} -> detect.tflite + labels.txt",
+        )
+        android_assets = BASE_DIR.parent / "android-app" / "app" / "src" / "main" / "assets"
+        try:
+            export_ok, tflite_path, labels_path, copied_android = post_train_export(
+                pt_path=final_model_path,
+                yaml_path=yaml_path,
+                output_dir=OUTPUTS_DIR,
+                android_assets_dir=android_assets,
+                imgsz=imgsz,
+            )
+        except Exception as e:
+            export_ok, tflite_path, labels_path, copied_android = False, None, None, False
+            update_status("done", 100, "Training OK, but export failed.", f"post_train_export crashed: {type(e).__name__}: {e}")
+        else:
+            if export_ok:
+                msg = "Training + export complete!"
+                detail_bits = [f"Model saved: {final_model_path.name}", f"TFLite: {tflite_path.name if tflite_path else 'N/A'}"]
+                detail_bits.append(f"Labels: {labels_path.name if labels_path else 'N/A'}")
+                if copied_android:
+                    detail_bits.append("Auto-copied to android-app assets (ready for gradlew build)")
+                update_status("done", 100, msg, " | ".join(detail_bits))
+            else:
+                update_status(
+                    "done", 100,
+                    "Training OK, export partially failed. Check export_report txt.",
+                    f"pt model saved OK ({final_model_path.name}); tflite export had errors — see outputs/export_report_{final_model_path.stem}.txt",
+                )
 
         set_done({
             "model_path": str(final_model_path),
             "model_name": final_model_path.name,
+            "tflite_path": str(tflite_path) if tflite_path and tflite_path.exists() else None,
+            "labels_path": str(labels_path) if labels_path and labels_path.exists() else None,
+            "export_ok": bool(export_ok),
+            "copied_to_android_assets": bool(copied_android),
             "run_id": run_id,
             "frames": frame_count,
             "labeled": labeled_count,

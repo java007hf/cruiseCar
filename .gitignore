@@ -56,5 +56,9 @@ ml/outputs/**
 /yolo*.pt
 /yolov8s-worldv2.pt
 
+# Numpy calibration / intermediate tensors (onnx2tf INT8 calibration samples, inference caches, …).
+# Binary blobs regenerated from Python code; keeping them would bloat history with opaque float32 arrays.
+ml/**/*.npy
+
 # Android assets
 android-app/app/src/main/assets/target_object.jpg

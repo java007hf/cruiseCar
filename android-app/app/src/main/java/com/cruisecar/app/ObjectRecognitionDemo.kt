@@ -232,7 +232,24 @@ private class YoloTfliteDetector(
             }
 
             val labels = context.loadLabels()
-            onLog("Loaded YOLO model ${width}x$height $inputLayout labels=${labels.size}")
+            onLog("Loaded YOLO model ${width}x$height $inputLayout labels=${labels.size}: ${labels.joinToString(" / ")}")
+
+            // Sanity-check: label list size should match the number of class scores
+            // in the model output tensor. If they disagree, detections will still
+            // happen (bestClass is still a valid integer), but the displayed label
+            // text will be wrong for out-of-range class IDs — and the user will
+            // silently see "object_N" placeholders instead of real names.
+            val outShape = interpreter.getOutputTensor(0).shape()
+            if (outShape.size == 3 && outShape[0] == 1) {
+                val attrDim = minOf(outShape[1], outShape[2])
+                val classOffset = if (attrDim > labels.size + 4) 5 else 4
+                val modelClasses = attrDim - classOffset
+                if (modelClasses != labels.size) {
+                    onLog("WARN: model declares $modelClasses output classes but labels.txt has ${labels.size} entries. " +
+                          "Mismatched labels/dataset. Display names will be wrong for out-of-range class IDs. " +
+                          "Expected first line of labels.txt to match dataset.yaml names[0].")
+                }
+            }
             return YoloTfliteDetector(interpreter, labels, width, height, inputLayout, inputTensor.dataType())
         }
     }
@@ -245,10 +262,19 @@ private fun android.content.res.AssetFileDescriptor.mapModel(): MappedByteBuffer
 
 private fun Context.loadLabels(): List<String> =
     runCatching {
-        assets.open(LABELS_ASSET_NAME).bufferedReader().useLines { lines ->
+        // Explicit UTF-8: Android JVM default is already UTF-8, but being explicit
+        // documents intent + avoids any future charset-default surprises. The file
+        // is produced by train_server.py post_train_export() (also UTF-8), so the
+        // two ends are guaranteed byte-identical.
+        assets.open(LABELS_ASSET_NAME).bufferedReader(Charsets.UTF_8).useLines { lines ->
             lines.map { it.trim() }.filter { it.isNotEmpty() }.toList()
         }
-    }.getOrDefault(listOf("object"))
+    }.getOrDefault(
+        listOf("object").also {
+            android.util.Log.w("ObjectRecognitionDemo", "Missing or unreadable $LABELS_ASSET_NAME — falling back to label=['object']. " +
+                "TFLite detection will still work but display name is generic.")
+        }
+    )
 
 private fun List<ObjectDetection>.nms(iouThreshold: Float): List<ObjectDetection> {
     val selected = ArrayList<ObjectDetection>()
