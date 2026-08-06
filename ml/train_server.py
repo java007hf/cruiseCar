@@ -31,7 +31,7 @@ for d in [WEIGHTS_DIR, UPLOADS_DIR, EXTRACTIONS_DIR, DATASETS_DIR, OUTPUTS_DIR, 
     d.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024 * 1024
 
 state = {
     "status": "idle",
@@ -839,7 +839,7 @@ def reset_state():
     })
 
 
-def extract_frames(video_path, output_dir, fps=2):
+def extract_frames(video_path, output_dir, fps=2, start_index=0):
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {video_path}")
@@ -859,7 +859,7 @@ def extract_frames(video_path, output_dir, fps=2):
         if not ret:
             break
         if frame_idx % frame_interval == 0:
-            name = f"frame_{saved_idx + 1:04d}"
+            name = f"frame_{start_index + saved_idx + 1:04d}"
             cv2.imwrite(str(output_dir / f"{name}.jpg"), frame)
             extracted += 1
             saved_idx += 1
@@ -2101,10 +2101,14 @@ def run_post_train_smoke_test(pt_path, tflite_path, yaml_path, conf_thresh=0.20)
     return result
 
 
-def run_pipeline(video_path, class_name, config):
+def run_pipeline(video_paths, class_name, config):
     try:
         reset_state()
-        video_path = Path(video_path)
+        if isinstance(video_paths, (str, os.PathLike)):
+            video_paths = [video_paths]
+        video_paths = [Path(p) for p in (video_paths or [])]
+        if not video_paths:
+            raise RuntimeError("No video files provided")
 
         fps = config.get("fps", 2)
         epochs = config.get("epochs", 100)
@@ -2124,9 +2128,38 @@ def run_pipeline(video_path, class_name, config):
         for d in [frames_dir, labels_dir, images_dir, dataset_dir]:
             d.mkdir(parents=True, exist_ok=True)
 
-        update_status("extracting", 0, "Extracting frames from video...", f"Starting frame extraction (fps={fps})")
-        frame_count, width, height = extract_frames(video_path, frames_dir, fps=fps)
-        update_status("extracting", 100, f"Extracted {frame_count} frames", f"Extracted {frame_count} frames ({width}x{height})")
+        update_status(
+            "extracting",
+            0,
+            f"Extracting frames from {len(video_paths)} video(s)...",
+            f"Starting frame extraction from {len(video_paths)} video(s) (fps={fps})",
+        )
+        frame_count = 0
+        first_width, first_height = 0, 0
+        for idx, video_path in enumerate(video_paths, start=1):
+            progress = int((idx - 1) / max(1, len(video_paths)) * 100)
+            update_status(
+                "extracting",
+                progress,
+                f"Extracting video {idx}/{len(video_paths)}: {video_path.name}",
+                f"Extracting frames from {video_path}",
+            )
+            extracted, width, height = extract_frames(video_path, frames_dir, fps=fps, start_index=frame_count)
+            if first_width == 0 and first_height == 0:
+                first_width, first_height = width, height
+            frame_count += extracted
+            update_status(
+                "extracting",
+                int(idx / max(1, len(video_paths)) * 100),
+                f"Extracted {frame_count} frames from {idx}/{len(video_paths)} video(s)",
+                f"{video_path.name}: extracted {extracted} frames ({width}x{height})",
+            )
+        update_status(
+            "extracting",
+            100,
+            f"Extracted {frame_count} frames from {len(video_paths)} video(s)",
+            f"Extracted {frame_count} frames from {len(video_paths)} video(s); first video size {first_width}x{first_height}",
+        )
 
         update_status("labeling", 0, "Auto-labeling frames with LLM...", "Starting auto-labeling: LLM returns boxes per frame")
         labeled_count = auto_label_frames(frames_dir, labels_dir, class_name)
@@ -2394,6 +2427,7 @@ def run_pipeline(video_path, class_name, config):
             "run_id": run_id,
             "frames": frame_count,
             "labeled": labeled_count,
+            "videos": len(video_paths),
             "class_name": class_name,
             "smoke_test": smoke_result,
         }
@@ -2417,33 +2451,47 @@ def api_status():
 
 @app.route("/api/upload", methods=["POST"])
 def api_upload():
-    if "video" not in request.files:
+    files = request.files.getlist("videos")
+    if not files and "video" in request.files:
+        files = [request.files["video"]]
+    files = [f for f in files if f and f.filename]
+    if not files:
         return jsonify({"error": "No video file"}), 400
 
-    f = request.files["video"]
-    if not f.filename:
-        return jsonify({"error": "Empty filename"}), 400
-
-    ext = Path(f.filename).suffix.lower()
     allowed = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv", ".m4v"}
-    if ext not in allowed:
-        return jsonify({"error": f"Unsupported format: {ext}. Allowed: {', '.join(allowed)}"}), 400
-
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    video_path = UPLOADS_DIR / f"{run_id}{ext}"
-    f.save(str(video_path))
+    saved = []
+    for idx, f in enumerate(files, start=1):
+        ext = Path(f.filename).suffix.lower()
+        if ext not in allowed:
+            return jsonify({"error": f"Unsupported format: {ext}. Allowed: {', '.join(allowed)}"}), 400
+        video_path = UPLOADS_DIR / f"{run_id}_{idx:02d}{ext}"
+        f.save(str(video_path))
+        saved.append({"video_path": str(video_path), "filename": f.filename})
 
-    return jsonify({"video_path": str(video_path), "filename": f.filename})
+    return jsonify({
+        "video_paths": [item["video_path"] for item in saved],
+        "filenames": [item["filename"] for item in saved],
+        # Backward-compatible fields for old UI/client code.
+        "video_path": saved[0]["video_path"],
+        "filename": saved[0]["filename"],
+    })
 
 
 @app.route("/api/process", methods=["POST"])
 def api_process():
     data = request.get_json()
-    video_path = data.get("video_path")
+    video_paths = data.get("video_paths") or data.get("video_path")
     class_name = data.get("class_name", "object")
 
-    if not video_path or not Path(video_path).exists():
+    if isinstance(video_paths, (str, os.PathLike)):
+        video_paths = [video_paths]
+    video_paths = [str(p) for p in (video_paths or [])]
+    if not video_paths:
         return jsonify({"error": "Video file not found"}), 400
+    missing = [p for p in video_paths if not Path(p).exists()]
+    if missing:
+        return jsonify({"error": f"Video file not found: {missing[0]}"}), 400
 
     class_name = class_name.strip()
     if not class_name:
@@ -2462,7 +2510,7 @@ def api_process():
         "enable_manual_label": bool(data.get("enable_manual_label", True)),
     }
 
-    t = threading.Thread(target=run_pipeline, args=(video_path, class_name, config), daemon=True)
+    t = threading.Thread(target=run_pipeline, args=(video_paths, class_name, config), daemon=True)
     t.start()
 
     return jsonify({"status": "started"})
@@ -3021,17 +3069,17 @@ HTML_PAGE = """
 <body>
 <div class="container">
   <h1>🎯 YOLO 视频训练平台</h1>
-  <p class="subtitle">上传视频 → 自动标注 → 训练模型 → 输出 .pt</p>
+  <p class="subtitle">上传一个或多个视频 → 自动标注 → 训练模型 → 输出 .pt</p>
 
   <div class="card">
     <h2>1. 上传视频</h2>
     <div class="upload-area" id="uploadArea">
       <div class="icon">📹</div>
-      <p>点击选择视频文件，或拖拽到此处</p>
+      <p>点击选择一个或多个视频文件，或拖拽到此处</p>
       <p style="font-size:0.8rem;color:#666;margin-top:8px;">支持 MP4, AVI, MOV, MKV, WEBM 等格式</p>
       <div class="filename" id="fileName"></div>
     </div>
-    <input type="file" id="videoFile" accept="video/*">
+    <input type="file" id="videoFile" accept="video/*" multiple>
   </div>
 
   <div class="card">
@@ -3213,7 +3261,7 @@ HTML_PAGE = """
 </div>
 
 <script>
-let videoPath = null;
+let videoPaths = [];
 let statusPoller = null;
 
 const uploadArea = document.getElementById('uploadArea');
@@ -3258,9 +3306,17 @@ async function checkLLMStatus() {
 }
 
 function handleFile() {
-  const f = videoFile.files[0];
-  if (f) {
-    fileName.textContent = `📎 ${f.name} (${(f.size / 1024 / 1024).toFixed(1)} MB)`;
+  const files = Array.from(videoFile.files || []);
+  if (files.length) {
+    const totalMB = files.reduce((sum, f) => sum + f.size, 0) / 1024 / 1024;
+    if (files.length === 1) {
+      const f = files[0];
+      fileName.textContent = `📎 ${f.name} (${(f.size / 1024 / 1024).toFixed(1)} MB)`;
+    } else {
+      const names = files.slice(0, 3).map(f => f.name).join('、');
+      const suffix = files.length > 3 ? `前 3 个 / 共 ${files.length} 个视频` : `${files.length} 个视频`;
+      fileName.textContent = `📎 已选择 ${suffix}（共 ${totalMB.toFixed(1)} MB）：${names}`;
+    }
     uploadArea.style.borderColor = '#4caf50';
   }
 }
@@ -3303,13 +3359,14 @@ async function startPipeline() {
   btn.textContent = '⏳ 处理中...';
 
   const formData = new FormData();
-  formData.append('video', videoFile.files[0]);
+  Array.from(videoFile.files).forEach(f => formData.append('videos', f));
 
   try {
     const uploadResp = await fetch('/api/upload', { method: 'POST', body: formData });
     const uploadData = await uploadResp.json();
     if (uploadData.error) throw new Error(uploadData.error);
-    videoPath = uploadData.video_path;
+    videoPaths = uploadData.video_paths || (uploadData.video_path ? [uploadData.video_path] : []);
+    if (!videoPaths.length) throw new Error('上传成功但未返回视频路径');
 
     document.getElementById('progressSection').classList.add('active');
     document.getElementById('logArea').innerHTML = '';
@@ -3318,7 +3375,7 @@ async function startPipeline() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        video_path: videoPath,
+        video_paths: videoPaths,
         class_name: className,
         fps: parseFloat(document.getElementById('fps').value),
         epochs: parseInt(document.getElementById('epochs').value),
@@ -3379,7 +3436,7 @@ function updateUI(data) {
   if (data.status === 'done' && data.result) {
     document.getElementById('resultSection').classList.add('active');
     document.getElementById('resultInfo').innerHTML =
-      `类别: <b>${data.result.class_name}</b> | 抽帧: ${data.result.frames} | 标注: ${data.result.labeled}`;
+      `类别: <b>${data.result.class_name}</b> | 视频: ${data.result.videos || 1} | 抽帧: ${data.result.frames} | 标注: ${data.result.labeled}`;
     document.getElementById('downloadBtn').href = '/api/download/' + encodeURIComponent(data.result.model_name);
     document.getElementById('startBtn').disabled = false;
     document.getElementById('startBtn').textContent = '🚀 重新训练';
@@ -3398,7 +3455,7 @@ async function resetPipeline() {
 }
 
 function resetUI() {
-  videoPath = null;
+  videoPaths = [];
   videoFile.value = '';
   fileName.textContent = '';
   uploadArea.style.borderColor = '';
