@@ -63,7 +63,7 @@ class MainActivity : Activity() {
     private fun showRoleScreen() {
         val layout = rootLayout()
         layout.addView(title("CruiseCar $appVersionLabel"))
-        layout.addView(button("OpenCV 物品识别 Demo") { showObjectRecognitionDemoScreen() })
+        layout.addView(button("YOLO 物品识别 Demo") { showObjectRecognitionDemoScreen() })
         layout.addView(button("发送端") { showSenderScreen() })
         layout.addView(button("接收端") { showReceiverScreen() })
         setContentView(withLog(layout))

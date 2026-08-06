@@ -12,6 +12,7 @@ from pathlib import Path
 from datetime import datetime
 
 import cv2
+import numpy as np
 import yaml
 from flask import Flask, request, jsonify, send_file, Response
 from ultralytics import YOLO
@@ -24,8 +25,9 @@ EXTRACTIONS_DIR = BASE_DIR / "extractions"  # extracted raw frame JPGs (original
 DATASETS_DIR = BASE_DIR / "datasets"  # train/val image + label splits + dataset.yaml per run
 OUTPUTS_DIR = BASE_DIR / "outputs"   # training run folders and final .pt exports
 TMP_DIR = BASE_DIR / "_tmp"             # transient temp files (e.g. shutil rmtree helpers etc.)
+TEST_DIR = BASE_DIR / "test"            # user-provided real-world images → post-train smoke test
 
-for d in [WEIGHTS_DIR, UPLOADS_DIR, EXTRACTIONS_DIR, DATASETS_DIR, OUTPUTS_DIR, TMP_DIR]:
+for d in [WEIGHTS_DIR, UPLOADS_DIR, EXTRACTIONS_DIR, DATASETS_DIR, OUTPUTS_DIR, TMP_DIR, TEST_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
@@ -1548,6 +1550,557 @@ def post_train_export(pt_path, yaml_path, output_dir, android_assets_dir=None, i
     return overall_ok, tflite_final, labels_out, copied_to_android
 
 
+# ---------------------------------------------------------------------------
+# Post-train smoke test: run the fresh PT + TFLite model on every image in
+# TEST_DIR (ml/test/*.jpg).  Produces side-by-side annotated PNGs and a
+# short report so the user can immediately eyeball whether the model can
+# actually detect the object on real-world photos (not just training frames).
+# ---------------------------------------------------------------------------
+def _draw_boxes_cv2(img_bgr, boxes_xyxy_norm, confs, class_names, colors=None):
+    """Draw YOLO detection boxes on a BGR image.  boxes_xyxy_norm are 0..1."""
+    import cv2
+    h, w = img_bgr.shape[:2]
+    if colors is None:
+        colors = [(0, 255, 0), (0, 165, 255), (255, 0, 255), (0, 255, 255), (255, 128, 0)]
+    for i, (box, conf) in enumerate(zip(boxes_xyxy_norm, confs)):
+        cls_id = 0  # single-class pipeline
+        color = colors[cls_id % len(colors)]
+        x1 = int(max(0, min(w - 1, round(box[0] * w))))
+        y1 = int(max(0, min(h - 1, round(box[1] * h))))
+        x2 = int(max(0, min(w - 1, round(box[2] * w))))
+        y2 = int(max(0, min(h - 1, round(box[3] * h))))
+        cv2.rectangle(img_bgr, (x1, y1), (x2, y2), color, 2)
+        label = ""
+        if class_names and 0 <= cls_id < len(class_names):
+            label = class_names[cls_id]
+        text = f"{label} {conf:.2f}" if label else f"{conf:.2f}"
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+        cv2.rectangle(img_bgr, (x1, max(0, y1 - th - 8)), (x1 + tw + 6, y1), color, -1)
+        cv2.putText(img_bgr, text, (x1 + 3, max(0, y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
+    return img_bgr
+
+
+def _letterbox_np(img_rgb, target=640, color=(114, 114, 114)):
+    """letterbox + return (canvas_rgb_float32_0_1, r, dw, dh, orig_h, orig_w)."""
+    import cv2
+    h, w = img_rgb.shape[:2]
+    r = min(target / h, target / w)
+    new_w, new_h = int(round(w * r)), int(round(h * r))
+    dw, dh = (target - new_w) / 2.0, (target - new_h) / 2.0
+    resized = cv2.resize(img_rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    canvas = np.full((target, target, 3), color, dtype=np.uint8)
+    top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+    left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+    canvas[top:top + new_h, left:left + new_w] = resized
+    return canvas.astype(np.float32) / 255.0, r, dw, dh, h, w
+
+
+def _scale_boxes_back_xyxy(xyxy_pixels, r, dw, dh, orig_h, orig_w, input_sz=640):
+    """Inverse of letterbox: xyxy in input canvas pixels → 0..1 normalized on orig image."""
+    # pixels on canvas → subtract padding → divide by r → normalize
+    x1_p, y1_p, x2_p, y2_p = xyxy_pixels.T
+    x1_i = (x1_p - dw) / r
+    y1_i = (y1_p - dh) / r
+    x2_i = (x2_p - dw) / r
+    y2_i = (y2_p - dh) / r
+    return np.stack([
+        np.clip(x1_i / orig_w, 0.0, 1.0),
+        np.clip(y1_i / orig_h, 0.0, 1.0),
+        np.clip(x2_i / orig_w, 0.0, 1.0),
+        np.clip(y2_i / orig_h, 0.0, 1.0),
+    ], axis=1)
+
+
+def _nms_xyxy(boxes_xyxy, confs, iou_thr=0.45):
+    """Very small class-agnostic NMS (numpy).  boxes_xyxy: (N,4) any coord system."""
+    if len(boxes_xyxy) == 0:
+        return np.zeros(0, dtype=int)
+    x1 = boxes_xyxy[:, 0]; y1 = boxes_xyxy[:, 1]
+    x2 = boxes_xyxy[:, 2]; y2 = boxes_xyxy[:, 3]
+    areas = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
+    order = confs.argsort()[::-1]
+    keep = []
+    while order.size > 0:
+        i = order[0]
+        keep.append(int(i))
+        if order.size == 1:
+            break
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+        ww = np.maximum(0.0, xx2 - xx1)
+        hh = np.maximum(0.0, yy2 - yy1)
+        inter = ww * hh
+        union = areas[i] + areas[order[1:]] - inter
+        iou = np.where(union > 0, inter / union, 0.0)
+        inds = np.where(iou <= iou_thr)[0]
+        order = order[inds + 1]
+    return np.array(keep, dtype=int)
+
+
+# Inline worker script source — executed via SYSTEM Python (has TF installed) as
+# a subprocess so we never try to import tensorflow inside the training .venv.
+# The job JSON describes images + paths; this worker writes job.json.result.json
+# containing raw detections (boxes+confs).  The caller (.venv with good cv2)
+# handles the actual cv2.imwrite / drawing because the system Python's cv2
+# build (4.13.0) is broken on this machine for numpy array drawing.
+_TFL_SMOKE_WORKER_SRC = r'''
+import sys, os, json, shutil
+from pathlib import Path
+import numpy as np
+
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+import warnings
+warnings.filterwarnings("ignore")
+import tensorflow as tf
+
+
+def letterbox(img_rgb, target=640, color=(114,114,114)):
+    # img_rgb is numpy (H,W,3) uint8
+    import cv2 as _cv2
+    h, w = img_rgb.shape[:2]
+    r = min(target / h, target / w)
+    new_w, new_h = int(round(w * r)), int(round(h * r))
+    dw, dh = (target - new_w) / 2.0, (target - new_h) / 2.0
+    resized = _cv2.resize(img_rgb, (new_w, new_h), interpolation=_cv2.INTER_LINEAR)
+    canvas = np.full((target, target, 3), color, dtype=np.uint8)
+    top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+    left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+    canvas[top:top+new_h, left:left+new_w] = resized
+    return canvas.astype(np.float32) / 255.0, r, dw, dh, h, w
+
+
+def main(job_path):
+    import cv2 as _cv2
+    job = json.loads(Path(job_path).read_text(encoding="utf-8"))
+    tflite_src = Path(job["tflite_path"])
+    ascii_dir = Path(job["ascii_dir"]); ascii_dir.mkdir(parents=True, exist_ok=True)
+    conf_thr = float(job.get("conf_thresh", 0.20))
+
+    ascii_dst = ascii_dir / "worker_smoke.tflite"
+    shutil.copy2(str(tflite_src), str(ascii_dst))
+    interp = tf.lite.Interpreter(model_path=str(ascii_dst))
+    interp.allocate_tensors()
+    in_det = interp.get_input_details()[0]
+    out_det = interp.get_output_details()[0]
+    print(f"[worker] in={list(in_det['shape'])} {in_det['dtype'].__name__} "
+          f"out={list(out_det['shape'])} {out_det['dtype'].__name__}", flush=True)
+
+    target_sz = int(in_det["shape"][1]) if in_det["shape"][1] > 1 else 640
+
+    per_image = []
+    for img_desc in job["images"]:
+        img_path = Path(img_desc["path"])
+        stem = img_desc["stem"]
+        name = img_path.name
+        res = {"name": name, "stem": stem,
+               "tflite": None,
+               # Raw results for caller-side drawing:
+               "_boxes_xyxy_norm": None, "_confs": None}
+        try:
+            img_bgr = _cv2.imread(str(img_path))
+            if img_bgr is None:
+                raise IOError("cv2.imread None: " + str(img_path))
+            img_rgb = _cv2.cvtColor(img_bgr, _cv2.COLOR_BGR2RGB)
+            canvas, r, dw, dh, oh, ow = letterbox(img_rgb, target=target_sz)
+            inp = np.expand_dims(canvas, 0)
+            if in_det["dtype"] == np.uint8:
+                q = in_det.get("quantization") or (1.0, 0)
+                s, zp = q if q and q[0] != 0 else (1.0, 0)
+                inp = np.clip((inp / s) + zp, 0, 255).astype(np.uint8)
+            elif in_det["dtype"] == np.float16:
+                inp = inp.astype(np.float16)
+            else:
+                inp = inp.astype(np.float32)
+            interp.set_tensor(in_det["index"], inp)
+            interp.invoke()
+            raw = interp.get_tensor(out_det["index"])[0]  # (5,8400) or (8400,5)
+            if raw.shape[0] == 5 and raw.shape[1] == 8400:
+                raw = raw.T  # -> (8400, 5)
+            if raw.shape[1] >= 4:
+                xywh_pix = raw[:, :4]
+                scores = raw[:, 4:].max(axis=1) if raw.shape[1] > 4 else np.zeros(raw.shape[0])
+            else:
+                xywh_pix = np.zeros((0,4)); scores = np.zeros(0)
+            mask = scores >= conf_thr
+            keep = np.where(mask)[0]
+            boxes_norm = np.zeros((0,4)); cs = np.zeros(0)
+            if keep.size:
+                bp = xywh_pix[keep]; c_sel = scores[keep]
+                x1p = bp[:,0] - bp[:,2]/2
+                y1p = bp[:,1] - bp[:,3]/2
+                x2p = bp[:,0] + bp[:,2]/2
+                y2p = bp[:,1] + bp[:,3]/2
+                xyxy_pix = np.stack([x1p,y1p,x2p,y2p], axis=1)
+                # --- class-agnostic NMS (numpy, self-contained) ---
+                areas = np.maximum(0, xyxy_pix[:,2]-xyxy_pix[:,0]) * np.maximum(0, xyxy_pix[:,3]-xyxy_pix[:,1])
+                order = c_sel.argsort()[::-1]
+                nms_keep = []
+                while order.size > 0:
+                    i = order[0]; nms_keep.append(int(i))
+                    if order.size == 1: break
+                    xx1 = np.maximum(xyxy_pix[i,0], xyxy_pix[order[1:],0])
+                    yy1 = np.maximum(xyxy_pix[i,1], xyxy_pix[order[1:],1])
+                    xx2 = np.minimum(xyxy_pix[i,2], xyxy_pix[order[1:],2])
+                    yy2 = np.minimum(xyxy_pix[i,3], xyxy_pix[order[1:],3])
+                    ww = np.maximum(0, xx2-xx1); hh = np.maximum(0, yy2-yy1)
+                    inter = ww*hh
+                    union = areas[i] + areas[order[1:]] - inter
+                    iou = np.where(union>0, inter/union, 0.0)
+                    order = order[np.where(iou<=0.45)[0] + 1]
+                if len(nms_keep):
+                    nk = np.array(nms_keep)
+                    xyxy_pix = xyxy_pix[nk]; c_sel = c_sel[nk]
+                    # Scale boxes back to 0..1 normalized on original image
+                    x1i = (xyxy_pix[:,0] - dw) / r
+                    y1i = (xyxy_pix[:,1] - dh) / r
+                    x2i = (xyxy_pix[:,2] - dw) / r
+                    y2i = (xyxy_pix[:,3] - dh) / r
+                    boxes_norm = np.stack([
+                        np.clip(x1i/ow, 0.0, 1.0),
+                        np.clip(y1i/oh, 0.0, 1.0),
+                        np.clip(x2i/ow, 0.0, 1.0),
+                        np.clip(y2i/oh, 0.0, 1.0),
+                    ], axis=1)
+                    cs = c_sel
+
+            top = float(cs.max()) if cs.size else 0.0
+            count = int(cs.size)
+            res["tflite"] = {
+                "count": count, "top_conf": top,
+                "confs": [round(float(c), 4) for c in cs],
+            }
+            res["_boxes_xyxy_norm"] = boxes_norm.tolist() if cs.size else []
+            res["_confs"] = [round(float(c), 4) for c in cs]
+            print(f"[worker] {name}: count={count} top={top:.4f}", flush=True)
+        except Exception as e:
+            import traceback
+            print(f"[worker] {name}: FAILED {type(e).__name__}: {e}", flush=True)
+            traceback.print_exc()
+            res["tflite"] = {"error": f"{type(e).__name__}: {e}"}
+        per_image.append(res)
+
+    resp = {"per_image": per_image}
+    Path(str(job_path) + ".result.json").write_text(json.dumps(resp, ensure_ascii=False), encoding="utf-8")
+    print("[worker] DONE", flush=True)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: worker.py <job.json>", file=sys.stderr); sys.exit(2)
+    main(sys.argv[1])
+'''
+
+
+def run_post_train_smoke_test(pt_path, tflite_path, yaml_path, conf_thresh=0.20):
+    """Smoke-test fresh PT + TFLite on every image in TEST_DIR.
+
+    Returns a dict with {report_path, output_dir, per_image: [...], has_images: bool}.
+    Failures are non-fatal: any error is logged into the report and the
+    function returns with partial results instead of raising.
+    """
+    import cv2
+    pt_path = Path(pt_path)
+    if yaml_path is not None:
+        yaml_path = Path(yaml_path)
+    tflite_path = Path(tflite_path) if tflite_path else None
+
+    test_images = sorted([p for p in TEST_DIR.glob("*.jpg")] +
+                         [p for p in TEST_DIR.glob("*.jpeg")] +
+                         [p for p in TEST_DIR.glob("*.png")])
+    result = {
+        "report_path": None,
+        "output_dir": None,
+        "per_image": [],
+        "has_images": bool(test_images),
+        "pt_ok": False,
+        "tflite_ok": False,
+    }
+    if not test_images:
+        return result
+
+    run_id = pt_path.stem.split("_")[-1] if "_" in pt_path.stem else pt_path.stem
+    out_dir = OUTPUTS_DIR / f"smoke_{run_id}" if run_id else OUTPUTS_DIR / "smoke_test"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    result["output_dir"] = str(out_dir)
+
+    class_names = []
+    if yaml_path and yaml_path.exists():
+        try:
+            class_names = read_class_names(yaml_path)
+        except Exception:
+            class_names = []
+    if not class_names:
+        class_names = [pt_path.stem.split("_")[0] if "_" in pt_path.stem else "object"]
+
+    log_lines = [
+        f"Post-train smoke test — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"  PT model:    {pt_path} (exists={pt_path.exists()})",
+        f"  TFLite model: {tflite_path} (exists={tflite_path.exists() if tflite_path else 'N/A'})",
+        f"  YAML names:  {class_names}",
+        f"  Test images: {len(test_images)} in {TEST_DIR}",
+        "",
+    ]
+
+    # -------------------- PT inference (ultralytics) --------------------
+    pt_results_per_img = {}
+    try:
+        from ultralytics import YOLO as _YOLO
+        model_pt = _YOLO(str(pt_path))
+        result["pt_ok"] = True
+        log_lines.append("[PT] Loaded OK")
+    except Exception as e:
+        log_lines.append(f"[PT] Load FAILED: {type(e).__name__}: {e}")
+        model_pt = None
+
+    # -------------------- TFLite inference (Interpreter, float32) --------------------
+    # NOTE: we deliberately do NOT import tensorflow in the main process, because the
+    # venv used for ultralytics training typically doesn't have TF installed. Instead
+    # we shell out to the system Python (py -3.x) that we know has TF/onnx2tf from the
+    # post_train_export flow.  Failures here are non-fatal (TFLite section just stays
+    # None); PT section above still always runs inside .venv.
+    tfl_ready = {"subproc": False, "py": None}
+    if tflite_path and tflite_path.exists():
+        sys_py_candidates = [
+            r"C:\Users\Administrator\AppData\Local\Programs\Python\Python310\python.exe",
+            r"C:\Python310\python.exe",
+        ]
+        sys_py = None
+        for cand in sys_py_candidates:
+            if Path(cand).exists():
+                sys_py = cand
+                break
+        if sys_py is None:
+            # fallback: try `py -3.10 -c ""` on PATH
+            import shutil as _sh_which
+            py_launcher = _sh_which.which("py")
+            if py_launcher:
+                sys_py = py_launcher  # caller must add -3.10
+                tfl_ready["py_flags"] = ["-3.10"]
+            else:
+                tfl_ready = {"subproc": False, "py": None}
+                log_lines.append("[TFLite] Skipped: cannot locate system Python 3.10 with TensorFlow")
+        if sys_py is not None:
+            tfl_ready = {
+                "subproc": True,
+                "py": sys_py,
+                "py_flags": tfl_ready.get("py_flags", []),
+                "run_id": run_id,
+                "tflite_path": str(tflite_path),
+                "out_dir": str(out_dir),
+                "class_names": class_names,
+                "conf_thresh": conf_thresh,
+            }
+            result["tflite_ok"] = True  # optimistic; subproc will write per-result files
+            log_lines.append(f"[TFLite] Will run via subprocess: {sys_py} {tfl_ready.get('py_flags', [])}")
+        else:
+            result["tflite_ok"] = False
+
+    # -------------------- Per-image loop --------------------
+    for img_path in test_images:
+        name = img_path.name
+        img_stem = img_path.stem
+        log_lines.append(f"\n---- {name} ----")
+        per = {"name": name, "stem": img_stem, "src_path": str(img_path), "pt": None, "tflite": None}
+
+        # Load image once (shared)
+        try:
+            img_bgr = cv2.imread(str(img_path))
+            if img_bgr is None:
+                raise IOError(f"cv2.imread returned None for {img_path}")
+        except Exception as e:
+            log_lines.append(f"  Image load FAILED: {type(e).__name__}: {e}")
+            result["per_image"].append(per)
+            continue
+
+        # --- PT ---
+        if model_pt is not None:
+            try:
+                res = model_pt.predict(
+                    source=str(img_path),
+                    conf=conf_thresh,
+                    iou=0.45,
+                    verbose=False,
+                )[0]
+                boxes_xyxy_norm = []
+                confs = []
+                if len(res.boxes) > 0:
+                    xywhn = res.boxes.xywhn.cpu().numpy()
+                    confs_arr = res.boxes.conf.cpu().numpy()
+                    for xywh, c in zip(xywhn, confs_arr):
+                        cx, cy, bw, bh = xywh
+                        x1 = max(0.0, cx - bw / 2)
+                        y1 = max(0.0, cy - bh / 2)
+                        x2 = min(1.0, cx + bw / 2)
+                        y2 = min(1.0, cy + bh / 2)
+                        boxes_xyxy_norm.append([x1, y1, x2, y2])
+                        confs.append(float(c))
+                boxes_xyxy_norm = np.array(boxes_xyxy_norm).reshape(-1, 4) if boxes_xyxy_norm else np.zeros((0, 4))
+                confs = np.array(confs)
+                top = float(confs.max()) if confs.size else 0.0
+                count = len(confs)
+                per["pt"] = {"count": count, "top_conf": top, "confs": [round(float(c), 4) for c in confs]}
+                log_lines.append(f"  PT:     {count} box(es), top_conf={top:.4f}")
+                # Draw
+                annotated_pt = img_bgr.copy()
+                annotated_pt = _draw_boxes_cv2(annotated_pt, boxes_xyxy_norm, confs, class_names,
+                                               colors=[(0, 200, 0)])
+                pt_out = out_dir / f"{img_stem}_pt.jpg"
+                cv2.imwrite(str(pt_out), annotated_pt, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+                per["pt"]["out_path"] = str(pt_out)
+            except Exception as e:
+                log_lines.append(f"  PT inference FAILED: {type(e).__name__}: {e}")
+                per["pt"] = {"error": f"{type(e).__name__}: {e}"}
+
+        result["per_image"].append(per)
+
+    # --- TFLite subprocess (batch all images at once) ---
+    if tfl_ready.get("subproc"):
+        try:
+            log_lines.append("\n[TFLite] Running subprocess inference...")
+            py = tfl_ready["py"]
+            flags = tfl_ready.get("py_flags", [])
+            # Build a JSON job description file
+            job = {
+                "tflite_path": tfl_ready["tflite_path"],
+                "conf_thresh": tfl_ready["conf_thresh"],
+                "ascii_dir": str(OUTPUTS_DIR / "tflite_ascii"),
+                "images": [{"path": str(p), "stem": p.stem} for p in test_images],
+            }
+            job_path = TMP_DIR / f"tfl_smoke_{tfl_ready['run_id'] or 'latest'}.json"
+            job_path.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
+            # Subprocess script (inline) is located at TMP_DIR/_tfl_smoke_worker.py
+            worker = TMP_DIR / "_tfl_smoke_worker.py"
+            worker.write_text(_TFL_SMOKE_WORKER_SRC, encoding="utf-8")
+            import subprocess as _sp
+            cmd = [py, *flags, str(worker), str(job_path)]
+            log_lines.append(f"[TFLite] cmd: {' '.join(cmd)}")
+            proc = _sp.run(cmd, capture_output=True, text=True, timeout=600)
+            if proc.stdout.strip():
+                log_lines.append(f"[TFLite] stdout:\n{proc.stdout.strip()}")
+            if proc.returncode != 0:
+                result["tflite_ok"] = False
+                log_lines.append(f"[TFLite] subprocess FAILED rc={proc.returncode}")
+                if proc.stderr.strip():
+                    log_lines.append(f"[TFLite] stderr:\n{proc.stderr.strip()}")
+            else:
+                # Parse result JSON written by worker to job_path.result.json
+                resp_path = Path(str(job_path) + ".result.json")
+                if resp_path.exists():
+                    try:
+                        resp = json.loads(resp_path.read_text(encoding="utf-8"))
+                    except Exception as e2:
+                        log_lines.append(f"[TFLite] Failed to parse result JSON: {e2}")
+                        resp = None
+                    if resp:
+                        # Merge raw boxes + draw TFLite annotation + composite comparison
+                        # all in THIS process (.venv cv2) because system Python's cv2
+                        # numpy array drawing is broken on this machine.
+                        tfl_name_to_per = {
+                            (per.get("name") or ""): per for per in resp.get("per_image", [])
+                        }
+                        for p in result["per_image"]:
+                            w_per = tfl_name_to_per.get(p["name"])
+                            if not w_per:
+                                continue
+                            p["tflite"] = w_per.get("tflite")
+                            if isinstance(p["tflite"], dict) and "error" in p["tflite"]:
+                                continue
+                            boxes_norm = w_per.get("_boxes_xyxy_norm") or []
+                            confs = w_per.get("_confs") or []
+                            if not isinstance(boxes_norm, list):
+                                boxes_norm = []
+                            if not isinstance(confs, list):
+                                confs = []
+                            try:
+                                img_bgr = cv2.imread(str(Path(p["src_path"])))
+                                if img_bgr is None:
+                                    continue
+                                annotated_tfl = _draw_boxes_cv2(
+                                    img_bgr.copy(),
+                                    np.array(boxes_norm, dtype=np.float32) if len(boxes_norm) else np.zeros((0,4), dtype=np.float32),
+                                    np.array(confs, dtype=np.float32) if len(confs) else np.zeros(0, dtype=np.float32),
+                                    class_names=class_names,
+                                    colors=[(0, 128, 255)])
+                                tfl_out = out_dir / f"{p['stem']}_tflite.jpg"
+                                cv2.imwrite(str(tfl_out), annotated_tfl, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+                                if isinstance(p.get("tflite"), dict):
+                                    p["tflite"]["out_path"] = str(tfl_out)
+                                # Now build the PT vs TFLite side-by-side composite
+                                pt_path = p.get("pt", {}).get("out_path") if isinstance(p.get("pt"), dict) else None
+                                if pt_path and Path(pt_path).exists():
+                                    a = cv2.imread(str(pt_path))
+                                    b = cv2.imread(str(tfl_out))
+                                    if a is not None and b is not None:
+                                        hm = max(a.shape[0], b.shape[0])
+                                        def fit(im, H):
+                                            if im.shape[0] == H:
+                                                return im
+                                            r = H / im.shape[0]
+                                            return cv2.resize(im, (int(im.shape[1]*r), H), interpolation=cv2.INTER_LINEAR)
+                                        a2 = fit(a, hm)
+                                        b2 = fit(b, hm)
+                                        pt_info = p.get("pt", {})
+                                        tfl_info = p.get("tflite", {}) if isinstance(p.get("tflite"), dict) else {}
+                                        pt_count = pt_info.get("count", 0) if isinstance(pt_info, dict) else 0
+                                        pt_top = pt_info.get("top_conf", 0.0) if isinstance(pt_info, dict) else 0.0
+                                        tf_count = tfl_info.get("count", 0) if isinstance(tfl_info, dict) else 0
+                                        tf_top = tfl_info.get("top_conf", 0.0) if isinstance(tfl_info, dict) else 0
+                                        def cap(im, txt):
+                                            hh, ww = im.shape[:2]
+                                            c = np.full((40, ww, 3), (240,240,240), dtype=np.uint8)
+                                            cv2.putText(c, txt, (10, 28),
+                                                        cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0,0,0), 2)
+                                            return np.concatenate([c, im], axis=0)
+                                        a3 = cap(a2, f"PyTorch PT  (boxes={pt_count}, top={pt_top:.3f})")
+                                        b3 = cap(b2, f"TFLite      (boxes={tf_count}, top={tf_top:.3f})")
+                                        combo = np.concatenate([a3, b3], axis=1)
+                                        combo_out = out_dir / f"{p['stem']}_compare.jpg"
+                                        cv2.imwrite(str(combo_out), combo, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+                                        p["compare_path"] = str(combo_out)
+                            except Exception as e_draw:
+                                log_lines.append(f"[TFLite] Draw error for {p['name']}: {type(e_draw).__name__}: {e_draw}")
+                        tf_hits_count = 0
+                        for p in result["per_image"]:
+                            tf = p.get("tflite") or {}
+                            if isinstance(tf, dict) and "error" not in tf and tf.get("count", 0) > 0:
+                                tf_hits_count += 1
+                        result["tflite_hits"] = tf_hits_count
+                        if "error" not in resp:
+                            log_lines.append(f"[TFLite] Subprocess completed OK ({tf_hits_count}/{len(test_images)} hits)")
+        except Exception as e:
+            log_lines.append(f"[TFLite] Subprocess orchestration FAILED: {type(e).__name__}: {e}")
+            import traceback
+            log_lines.append("    " + "\n    ".join(traceback.format_exc().splitlines()[-5:]))
+            result["tflite_ok"] = False
+
+    # ---- summary block ----
+    log_lines.append("\n==== SUMMARY ====")
+    pt_ok_n = sum(1 for p in result["per_image"]
+                  if isinstance(p.get("pt"), dict) and "error" not in p["pt"] and p["pt"].get("count", 0) > 0)
+    if "tflite_hits" not in result:
+        tf_ok_n = sum(1 for p in result["per_image"]
+                      if isinstance(p.get("tflite"), dict) and "error" not in p["tflite"] and p["tflite"].get("count", 0) > 0)
+    else:
+        tf_ok_n = result["tflite_hits"]
+    log_lines.append(f"  PT hits:     {pt_ok_n}/{len(test_images)} images had >=1 box above {conf_thresh}")
+    log_lines.append(f"  TFLite hits: {tf_ok_n}/{len(test_images)} images had >=1 box above {conf_thresh}")
+    result["pt_hits"] = pt_ok_n
+    result["tflite_hits"] = tf_ok_n
+    result["total_images"] = len(test_images)
+
+    report_path = out_dir / f"smoke_report_{run_id or 'latest'}.txt"
+    try:
+        report_path.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+        result["report_path"] = str(report_path)
+    except Exception:
+        pass
+    return result
+
+
 def run_pipeline(video_path, class_name, config):
     try:
         reset_state()
@@ -1781,15 +2334,57 @@ def run_pipeline(video_path, class_name, config):
                 detail_bits.append(f"Labels: {labels_path.name if labels_path else 'N/A'}")
                 if copied_android:
                     detail_bits.append("Auto-copied to android-app assets (ready for gradlew build)")
-                update_status("done", 100, msg, " | ".join(detail_bits))
+                update_status("done", 97, msg, " | ".join(detail_bits))
             else:
                 update_status(
-                    "done", 100,
+                    "done", 97,
                     "Training OK, export partially failed. Check export_report txt.",
                     f"pt model saved OK ({final_model_path.name}); tflite export had errors — see outputs/export_report_{final_model_path.stem}.txt",
                 )
 
-        set_done({
+        # ------------------------------------------------------------------
+        # Post-train smoke test on real-world images in ml/test/ (if any).
+        # Failures here are 100% non-fatal — we just add the result to the
+        # overall status/result so the user can review.
+        # ------------------------------------------------------------------
+        smoke_result = None
+        try:
+            update_status(
+                "smoke_testing", 98,
+                "Running smoke test on ml/test/ images...",
+                "Running PT + TFLite inference on user-provided test images",
+            )
+            conf_thresh = float(config.get("conf_threshold", 0.20))
+            smoke_result = run_post_train_smoke_test(
+                pt_path=final_model_path,
+                tflite_path=tflite_path,
+                yaml_path=yaml_path,
+                conf_thresh=conf_thresh,
+            )
+            if smoke_result.get("has_images"):
+                pt_hits = smoke_result.get("pt_hits", 0)
+                tf_hits = smoke_result.get("tflite_hits", 0)
+                total = smoke_result.get("total_images", 0)
+                out_dir = smoke_result.get("output_dir") or ""
+                rep = smoke_result.get("report_path") or ""
+                msg_smoke = (
+                    f"Smoke test: PT {pt_hits}/{total}, TFLite {tf_hits}/{total} "
+                    f"(threshold {conf_thresh})."
+                )
+                detail_smoke = (
+                    f"Outputs in {out_dir}; report {rep}"
+                )
+                update_status("done", 100, msg_smoke, detail_smoke)
+            else:
+                # no test images → just keep existing done status at 100
+                pass
+        except Exception as e:
+            # never let smoke test bring down the overall pipeline
+            smoke_result = {"error": f"{type(e).__name__}: {e}"}
+            import traceback
+            traceback.print_exc()
+
+        done_payload = {
             "model_path": str(final_model_path),
             "model_name": final_model_path.name,
             "tflite_path": str(tflite_path) if tflite_path and tflite_path.exists() else None,
@@ -1800,7 +2395,9 @@ def run_pipeline(video_path, class_name, config):
             "frames": frame_count,
             "labeled": labeled_count,
             "class_name": class_name,
-        })
+            "smoke_test": smoke_result,
+        }
+        set_done(done_payload)
 
     except Exception as e:
         set_error(str(e))
