@@ -3,7 +3,9 @@ package com.cruisecar.app
 import android.Manifest
 import android.app.Activity
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Color
 import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.util.Log
@@ -11,7 +13,6 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
-import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -36,11 +37,8 @@ class MainActivity : Activity() {
     private var senderLayout: LinearLayout? = null
     private var receiverVideoRenderer: SurfaceViewRenderer? = null
     private var receiverLayout: LinearLayout? = null
+    private var receiverEspStatusView: TextView? = null
     private var smartFollow: SmartFollowController? = null
-    private var objectDemoController: ObjectRecognitionDemoController? = null
-    private var objectDemoPreview: CameraPreviewView? = null
-    private var objectDemoOverlay: ObjectRecognitionOverlayView? = null
-    private var objectDemoStatus: TextView? = null
     private var webRtcCall: WebRtcCall? = null
     private lateinit var logView: TextView
     private var connectedReceiverHost: String? = null
@@ -52,6 +50,7 @@ class MainActivity : Activity() {
     private var senderCameraButton: Button? = null
     private var lastSenderState: GamepadState? = null
     private var lastSenderAtMs: Long = 0
+    private var backAction: (() -> Unit)? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -61,93 +60,36 @@ class MainActivity : Activity() {
     }
 
     private fun showRoleScreen() {
+        backAction = null
         val layout = rootLayout()
         layout.addView(title("CruiseCar $appVersionLabel"))
-        layout.addView(button("YOLO 物品识别 Demo") { showObjectRecognitionDemoScreen() })
+        layout.addView(button("调试台 (识别 + 遥控)") {
+            startActivity(Intent(this, DebugActivity::class.java))
+        })
         layout.addView(button("发送端") { showSenderScreen() })
         layout.addView(button("接收端") { showReceiverScreen() })
         setContentView(withLog(layout))
     }
 
-    private fun showObjectRecognitionDemoScreen() {
-        releaseObjectRecognitionDemo()
-
-        val layout = rootLayout()
-        layout.addView(title("OpenCV 物品识别 Demo"))
-
-        val previewFrame = FrameLayout(this)
-        val preview = CameraPreviewView(this)
-        val overlay = ObjectRecognitionOverlayView(this)
-        objectDemoPreview = preview
-        objectDemoOverlay = overlay
-        previewFrame.addView(preview, FrameLayout.LayoutParams(-1, -1))
-        previewFrame.addView(overlay, FrameLayout.LayoutParams(-1, -1))
-        layout.addView(previewFrame, LinearLayout.LayoutParams(-1, 0, 2.4f))
-
-        objectDemoStatus = TextView(this).apply {
-            text = "OpenCV demo idle"
-            textSize = 16f
-            gravity = Gravity.CENTER_HORIZONTAL
-        }
-        layout.addView(objectDemoStatus)
-        layout.addView(button("开始识别") { startObjectRecognitionDemo() })
-        layout.addView(button("停止识别") { stopObjectRecognitionDemo() })
-        layout.addView(button("返回") {
-            releaseObjectRecognitionDemo()
-            showRoleScreen()
-        })
-
-        setContentView(withLog(layout))
-        preview.start()
-    }
-
-    private fun startObjectRecognitionDemo() {
-        objectDemoController?.stop()
-        objectDemoController = ObjectRecognitionDemoController(
-            context = this,
-            frameProvider = { objectDemoPreview?.snapshot(416, 416) },
-            onDetections = { detections ->
-                runOnUiThread {
-                    objectDemoOverlay?.setDetections(detections)
-                    objectDemoStatus?.text = "Detected ${detections.size} object(s)"
-                }
-            }
-        ).also { controller ->
-            controller.start { msg -> log(msg) }
-        }
-    }
-
-    private fun stopObjectRecognitionDemo() {
-        objectDemoController?.stop()
-        objectDemoController = null
-        objectDemoOverlay?.setDetections(emptyList())
-        objectDemoStatus?.text = "OpenCV demo stopped"
-    }
-
-    private fun releaseObjectRecognitionDemo() {
-        stopObjectRecognitionDemo()
-        objectDemoPreview?.stop()
-        objectDemoPreview = null
-        objectDemoOverlay = null
-        objectDemoStatus = null
-    }
-
     private fun showSenderScreen() {
+        backAction = {
+            releaseSenderCall()
+            senderVideoArea = null
+            senderLayout = null
+            showRoleScreen()
+        }
         val layout = rootLayout()
         senderLayout = layout
         layout.addView(title("发送端多模式控制"))
 
-        val videoArea = FrameLayout(this)
+        val videoArea = VideoGamepadView(this)
         senderVideoArea = videoArea
         val remoteVideo = createSenderVideoRenderer(videoArea)
-        val gamepad = GamepadView(this).apply {
-            onStateChanged = { state ->
-                if (senderMode == ControlMode.MANUAL) {
-                    sendFromGamepad(state)
-                }
+        videoArea.onStateChanged = { state ->
+            if (senderMode == ControlMode.MANUAL) {
+                sendFromGamepad(state)
             }
         }
-        videoArea.addView(gamepad, FrameLayout.LayoutParams(-1, -1))
         layout.addView(videoArea, LinearLayout.LayoutParams(-1, 0, 2.4f))
 
         layout.addView(button("扫描接收端并连接") {
@@ -186,15 +128,13 @@ class MainActivity : Activity() {
         layout.addView(senderCameraButton)
         layout.addView(button("停止 / 回中") { sendFromGamepad(GamepadState(), force = true) })
         layout.addView(button("返回") {
-            releaseSenderCall()
-            senderVideoArea = null
-            senderLayout = null
-            showRoleScreen()
+            backAction?.invoke()
         })
         setContentView(withLog(layout))
     }
 
     private fun showReceiverScreen() {
+        backAction = { stopReceiverServices(); receiverLayout = null; showRoleScreen() }
         val layout = rootLayout()
         receiverLayout = layout
         layout.addView(title("接收端多模式中转"))
@@ -203,25 +143,34 @@ class MainActivity : Activity() {
         cameraPreview = preview
         layout.addView(preview, LinearLayout.LayoutParams(-1, 0, 1.5f))
 
-        val addressInput = EditText(this)
-        addressInput.hint = "ESP32 蓝牙地址，例如 AA:BB:CC:DD:EE:FF"
-        layout.addView(addressInput)
-        layout.addView(button("自动扫描并连接 ESP32") {
-            connectEsp32ByScan()
-        })
-        layout.addView(button("连接 ESP32 SPP") {
-            Thread {
-                try {
-                    bluetooth.connect(addressInput.text.toString().trim()) { log(it) }
-                } catch (e: Exception) {
-                    log("Bluetooth connect failed: ${e.message}")
-                }
-            }.start()
-        })
+        receiverEspStatusView = TextView(this).apply {
+            text = "未连接"
+            textSize = 14f
+            gravity = Gravity.CENTER_HORIZONTAL
+            setTextColor(Color.rgb(200, 60, 60))
+        }
+        layout.addView(receiverEspStatusView)
+
+        val blePairing = Esp32BlePairing(
+            this, bluetooth,
+            onLog = { log(it) },
+            onToast = { msg -> Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() },
+            onConnected = { updateReceiverEspStatus(true) }
+        )
+
+        layout.addView(button("自动扫描并连接 ESP32") { connectEsp32ByScan() })
+        layout.addView(button("BLE 扫描附近设备") { blePairing.start() })
         layout.addView(button("启动接收服务") { startReceiverServices() })
 
         setContentView(withLog(layout))
         preview.start()
+    }
+
+    private fun updateReceiverEspStatus(connected: Boolean) {
+        receiverEspStatusView?.apply {
+            text = if (connected) "已连接" else "未连接"
+            setTextColor(if (connected) Color.rgb(60, 180, 60) else Color.rgb(200, 60, 60))
+        }
     }
 
     private fun connectEsp32ByScan() {
@@ -229,8 +178,10 @@ class MainActivity : Activity() {
             try {
                 bluetooth.connectFirstByName(this, BluetoothSppClient.ESP32_DEVICE_NAME) { log(it) }
                 log("ESP32 auto-connect ready")
+                runOnUiThread { updateReceiverEspStatus(true) }
             } catch (e: Exception) {
                 log("ESP32 auto-connect failed: ${e.message}")
+                runOnUiThread { updateReceiverEspStatus(false) }
             }
         }.start()
     }
@@ -566,8 +517,15 @@ class MainActivity : Activity() {
     private fun threadName(): String =
         "${Thread.currentThread().name}/${Thread.currentThread().id}"
 
+    override fun onBackPressed() {
+        if (backAction != null) {
+            backAction!!.invoke()
+        } else {
+            super.onBackPressed()
+        }
+    }
+
     override fun onDestroy() {
-        releaseObjectRecognitionDemo()
         stopReceiverServices()
         controlClient.close()
         bluetooth.close()

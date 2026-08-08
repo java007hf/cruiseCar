@@ -40,12 +40,22 @@ class GamepadView(context: Context) : View(context) {
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> handleDown(event.actionIndex, event)
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+                parent?.requestDisallowInterceptTouchEvent(true)
+                handleDown(event.actionIndex, event)
+            }
             MotionEvent.ACTION_MOVE -> {
+                parent?.requestDisallowInterceptTouchEvent(true)
                 updateSticks(event)
             }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> handleUp(event.actionIndex, event)
-            MotionEvent.ACTION_CANCEL -> resetControls()
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
+                handleUp(event.actionIndex, event)
+                parent?.requestDisallowInterceptTouchEvent(false)
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                resetControls()
+                parent?.requestDisallowInterceptTouchEvent(false)
+            }
         }
         invalidate()
         emitState()

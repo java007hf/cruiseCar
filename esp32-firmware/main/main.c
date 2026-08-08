@@ -7,6 +7,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "driver/gpio.h"
 #include "esp_bt.h"
 #include "esp_bt_defs.h"
 #include "esp_bt_device.h"
@@ -17,6 +18,7 @@
 #include "esp_hid_common.h"
 #include "esp_hidh.h"
 #include "esp_hidh_gattc.h"
+#include "esp_check.h"
 #include "esp_log.h"
 #include "esp_spp_api.h"
 #include "nvs_flash.h"
@@ -25,6 +27,7 @@
 #include "esp_hid_gap.h"
 
 #define DEVICE_NAME "CruiseCar-ESP32"
+#define LED_GPIO GPIO_NUM_2
 #define SPP_SERVER_NAME "CruiseCar-SPP"
 #define PACKET_SIZE 10
 #define SCAN_SECONDS 8
@@ -37,6 +40,7 @@ static size_t rx_len;
 static volatile bool spp_connected;
 static volatile bool hidh_opening;
 static volatile bool hidh_connected;
+static volatile TickType_t led_cmd_tick;   /* tick of last received command, 0 = none */
 #if CONTROL_VERBOSE_LOG
 static bool have_prev_buttons;
 static uint32_t prev_buttons;
@@ -203,6 +207,7 @@ static void apply_gamepad_state(const char *source, const gamepad_state_t *state
 #if CONTROL_VERBOSE_LOG
     log_button_changes(state->buttons);
 #endif
+    led_cmd_tick = xTaskGetTickCount();
     car_control_update(state->lx, state->ly, state->rx, state->ry, state->buttons);
 }
 
@@ -383,6 +388,100 @@ static void start_spp_server(void)
     ESP_ERROR_CHECK(esp_spp_enhanced_init(&spp_cfg));
 }
 
+/* ---- BLE advertising (discovery only; communication stays on Classic BT SPP) ---- */
+
+#if CONFIG_BT_BLE_ENABLED
+static void start_ble_adv(void)
+{
+    esp_ble_adv_data_t adv_data = {
+        .set_scan_rsp        = false,
+        .include_name        = true,
+        .include_txpower     = false,
+        .min_interval        = 0x0020,
+        .max_interval        = 0x0040,
+        .appearance          = 0x0000,
+        .manufacturer_len    = 0,
+        .p_manufacturer_data = NULL,
+        .service_data_len    = 0,
+        .p_service_data      = NULL,
+        .service_uuid_len    = 0,
+        .p_service_uuid      = NULL,
+        .flag                = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT),
+    };
+
+    esp_ble_gap_set_device_name(DEVICE_NAME);
+    esp_ble_gap_config_adv_data(&adv_data);
+
+    esp_ble_adv_params_t adv_params = {
+        .adv_int_min        = 0x20,   /* 20   ms */
+        .adv_int_max        = 0x40,   /* 40   ms */
+        .adv_type           = ADV_TYPE_IND,
+        .own_addr_type      = BLE_ADDR_TYPE_PUBLIC,
+        .channel_map        = ADV_CHNL_ALL,
+        .adv_filter_policy  = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
+    };
+    esp_ble_gap_start_advertising(&adv_params);
+    ESP_LOGI(TAG, "BLE advertising started (name: %s)", DEVICE_NAME);
+}
+#endif
+
+/* ---- Indicator LED (GPIO 2) ---- */
+/* 未配对: 持续闪烁  |  配对后: 灭  |  收到指令: 闪一下再灭 */
+
+static inline bool any_connected(void)
+{
+    return spp_connected || hidh_connected || hidh_opening;
+}
+
+static void indicator_led_task(void *arg)
+{
+    (void)arg;
+    TickType_t blink_toggle_tick = 0;
+    bool blink_on = false;
+
+    while (true) {
+        TickType_t now = xTaskGetTickCount();
+
+        if (!any_connected()) {
+            /* not paired → blink every 500 ms */
+            if ((now - blink_toggle_tick) >= pdMS_TO_TICKS(500)) {
+                blink_on = !blink_on;
+                gpio_set_level(LED_GPIO, blink_on ? 1 : 0);
+                blink_toggle_tick = now;
+            }
+        } else {
+            /* paired → flash 80 ms on command, else off */
+            if (led_cmd_tick != 0 && (now - led_cmd_tick) < pdMS_TO_TICKS(80)) {
+                gpio_set_level(LED_GPIO, 1);
+            } else {
+                gpio_set_level(LED_GPIO, 0);
+                if (led_cmd_tick != 0) {
+                    led_cmd_tick = 0;
+                }
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+static void indicator_led_init(void)
+{
+    gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << LED_GPIO),
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&cfg);
+    gpio_set_level(LED_GPIO, 0);
+
+    BaseType_t ok = xTaskCreate(indicator_led_task, "indicator_led", 2048, NULL, 1, NULL);
+    ESP_RETURN_VOID_ON_FALSE(ok == pdPASS, TAG, "create indicator LED task");
+    ESP_LOGI(TAG, "indicator LED on GPIO %d ready", LED_GPIO);
+}
+
 static void start_hid_host(void)
 {
 #if CONFIG_BT_BLE_ENABLED
@@ -408,11 +507,15 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     ESP_ERROR_CHECK(car_control_init());
+    indicator_led_init();
 
     ESP_LOGI(TAG, "Starting ESP32 SPP + HID gamepad receiver");
     ESP_ERROR_CHECK(esp_hid_gap_init(HID_HOST_MODE));
     start_hid_host();
     start_spp_server();
+#if CONFIG_BT_BLE_ENABLED
+    start_ble_adv();
+#endif
 
     const uint8_t *addr = esp_bt_dev_get_address();
     ESP_LOGI(TAG, "Bluetooth device name: %s", DEVICE_NAME);

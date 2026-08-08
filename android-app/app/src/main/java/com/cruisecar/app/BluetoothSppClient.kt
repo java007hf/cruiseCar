@@ -16,8 +16,9 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
 class BluetoothSppClient {
-    private var socket: BluetoothSocket? = null
-    private var output: OutputStream? = null
+    @Volatile private var socket: BluetoothSocket? = null
+    @Volatile private var output: OutputStream? = null
+    @Volatile private var connected = false
 
     @SuppressLint("MissingPermission")
     fun connect(address: String, onLog: (String) -> Unit) {
@@ -28,6 +29,7 @@ class BluetoothSppClient {
         adapter.cancelDiscovery()
         socket?.connect()
         output = socket?.outputStream
+        connected = true
         onLog("Bluetooth SPP connected: $address")
     }
 
@@ -112,6 +114,7 @@ class BluetoothSppClient {
         adapter.cancelDiscovery()
         socket?.connect()
         output = socket?.outputStream
+        connected = true
         onLog("Bluetooth SPP connected: ${device.name ?: device.address}")
     }
 
@@ -120,9 +123,10 @@ class BluetoothSppClient {
         output?.flush()
     }
 
-    fun isConnected(): Boolean = socket?.isConnected == true && output != null
+    fun isConnected(): Boolean = connected
 
     fun close() {
+        connected = false
         output = null
         socket?.close()
         socket = null
