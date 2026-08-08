@@ -1,0 +1,1 @@
+C:\Espressif\tools\python\v6.0.1\venv\Scripts\python.exe C:\esp\v6.0.1\esp-idf\tools\idf.py -B build_codex -p COM4 monitor

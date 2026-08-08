@@ -406,7 +406,11 @@ static void start_ble_adv(void)
         .p_service_data      = NULL,
         .service_uuid_len    = 0,
         .p_service_uuid      = NULL,
-        .flag                = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT),
+        /* 本设备是双模(同时跑 BLE 发现 + Classic SPP), 不能声明 BR/EDR 不支持,
+           否则 Android 会把设备判定为纯 LE, 导致 RFCOMM(SPP) 连接失败。 */
+        .flag                = (ESP_BLE_ADV_FLAG_GEN_DISC |
+                                 ESP_BLE_ADV_FLAG_DMT_CONTROLLER_SPT |
+                                 ESP_BLE_ADV_FLAG_DMT_HOST_SPT),
     };
 
     esp_ble_gap_set_device_name(DEVICE_NAME);

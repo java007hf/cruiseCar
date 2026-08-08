@@ -11,6 +11,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 
 /**
  * 复用组件：BLE 扫描发现 CruiseCar-ESP32，弹出设备列表供选择，
@@ -24,6 +25,7 @@ class Esp32BlePairing(
     private val onConnected: () -> Unit
 ) {
     private val targetName = BluetoothSppClient.ESP32_DEVICE_NAME
+    private val TAG = "Esp32BlePairing"
     private val devices = LinkedHashMap<String, BluetoothDevice>() // addr → device
     private var scanning = false
     private var scanner: android.bluetooth.le.BluetoothLeScanner? = null
@@ -121,14 +123,41 @@ class Esp32BlePairing(
 
     private fun connect(device: BluetoothDevice) {
         Thread {
+            val addr = device.address
+            val typeStr = when (device.type) {
+                BluetoothDevice.DEVICE_TYPE_CLASSIC -> "CLASSIC"
+                BluetoothDevice.DEVICE_TYPE_DUAL -> "DUAL"
+                BluetoothDevice.DEVICE_TYPE_LE -> "LE"
+                BluetoothDevice.DEVICE_TYPE_UNKNOWN -> "UNKNOWN"
+                else -> "?${device.type}"
+            }
+            val bondStr = when (device.bondState) {
+                BluetoothDevice.BOND_BONDED -> "BONDED"
+                BluetoothDevice.BOND_BONDING -> "BONDING"
+                BluetoothDevice.BOND_NONE -> "NONE"
+                else -> "?${device.bondState}"
+            }
+            onLog("选中设备: $addr name=${device.name} type=$typeStr bond=$bondStr")
+            Log.d(TAG, "connect() selected addr=$addr type=$typeStr bond=$bondStr")
             try {
-                val addr = device.address
-                onLog("通过 BLE 发现 → Classic BT SPP 连接: $addr")
+                onLog("连接选中的设备 (Classic SPP): $addr")
                 bluetooth.connect(addr) { msg -> onLog(msg) }
                 onLog("ESP32 SPP 连接成功: $addr")
                 activity.runOnUiThread { onConnected() }
+                return@Thread
             } catch (e: Exception) {
-                onLog("ESP32 连接失败 (BLE发现后): ${e.message}")
+                Log.e(TAG, "直连选中设备失败，改按同地址 Classic 扫描", e)
+                onLog("直连失败 (${e.message})，改用 Classic 按同一地址重连...")
+            }
+            // 兜底：按"同一地址"做 Classic 扫描后连接，绝不连到别的/旧的同名已配对设备。
+            try {
+                val name = device.name ?: BluetoothSppClient.ESP32_DEVICE_NAME
+                bluetooth.connectByClassicScan(activity, addr, name) { msg -> onLog(msg) }
+                onLog("ESP32 SPP 连接成功 (同地址 Classic): $addr")
+                activity.runOnUiThread { onConnected() }
+            } catch (e2: Exception) {
+                Log.e(TAG, "同地址 Classic 重连也失败", e2)
+                onLog("连接失败 (${e2.message})，请重新扫描并选择设备")
             }
         }.start()
     }

@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.Build
+import android.util.Log
 import java.io.OutputStream
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
@@ -20,19 +21,62 @@ class BluetoothSppClient {
     @Volatile private var output: OutputStream? = null
     @Volatile private var connected = false
 
+    private fun deviceTypeStr(type: Int): String = when (type) {
+        BluetoothDevice.DEVICE_TYPE_CLASSIC -> "CLASSIC"
+        BluetoothDevice.DEVICE_TYPE_DUAL -> "DUAL"
+        BluetoothDevice.DEVICE_TYPE_LE -> "LE"
+        BluetoothDevice.DEVICE_TYPE_UNKNOWN -> "UNKNOWN"
+        else -> "?$type"
+    }
+
+    private fun bondStr(state: Int): String = when (state) {
+        BluetoothDevice.BOND_BONDED -> "BONDED"
+        BluetoothDevice.BOND_BONDING -> "BONDING"
+        BluetoothDevice.BOND_NONE -> "NONE"
+        else -> "?$state"
+    }
+
+    private fun dumpDevice(device: BluetoothDevice?) {
+        if (device == null) {
+            Log.d(TAG, "device=null")
+            return
+        }
+        Log.d(TAG, "device addr=${device.address} name=${device.name} " +
+                "type=${deviceTypeStr(device.type)} bond=${bondStr(device.bondState)}")
+    }
+
     @SuppressLint("MissingPermission")
     fun connect(address: String, onLog: (String) -> Unit) {
         close()
         val adapter = BluetoothAdapter.getDefaultAdapter() ?: throw IllegalStateException("Bluetooth unavailable")
         val device = adapter.getRemoteDevice(address)
-        socket = device.createRfcommSocketToServiceRecord(SPP_UUID)
+        dumpDevice(device)
+        onLog("SPP: 创建 insecure socket addr=$address uuid=$SPP_UUID")
+        Log.d(TAG, "createInsecureRfcommSocketToServiceRecord begin")
+        socket = device.createInsecureRfcommSocketToServiceRecord(SPP_UUID)
+        Log.d(TAG, "socket created, cancelDiscovery...")
+        onLog("SPP: socket 已创建, cancelDiscovery ...")
         adapter.cancelDiscovery()
-        socket?.connect()
+        val t0 = System.currentTimeMillis()
+        try {
+            onLog("SPP: socket.connect() ...")
+            Log.d(TAG, "socket.connect() begin")
+            socket?.connect()
+            Log.d(TAG, "socket.connect() done in ${System.currentTimeMillis() - t0}ms")
+        } catch (e: Exception) {
+            Log.e(TAG, "socket.connect() FAILED after ${System.currentTimeMillis() - t0}ms", e)
+            onLog("SPP: connect 失败: ${e.message}")
+            throw e
+        }
         output = socket?.outputStream
         connected = true
         onLog("Bluetooth SPP connected: $address")
     }
 
+    /**
+     * 自动扫描连接：先扫描活着的设备(不再优先用旧配对)，
+     * 找不到再退而求其次连已配对设备(可能处于不可发现模式)。
+     */
     @SuppressLint("MissingPermission")
     fun connectFirstByName(
         context: Context,
@@ -42,18 +86,43 @@ class BluetoothSppClient {
     ) {
         close()
         val adapter = BluetoothAdapter.getDefaultAdapter() ?: throw IllegalStateException("Bluetooth unavailable")
-
-        adapter.bondedDevices
-            ?.firstOrNull { it.name == targetName }
-            ?.let { device ->
-                onLog("Found paired ESP32: ${device.name} ${device.address}")
-                connectDevice(adapter, device, onLog)
-                return
-            }
-
-        onLog("Scanning Bluetooth devices for $targetName")
+        onLog("Classic 扫描 $targetName 中(不再优先用旧配对)...")
+        Log.d(TAG, "scan-first for '$targetName'")
         val found = discoverByName(context.applicationContext, adapter, targetName, discoveryTimeoutMs, onLog)
-            ?: throw IllegalStateException("$targetName not found")
+        if (found != null) {
+            connectDevice(adapter, found, onLog)
+            return
+        }
+        // 扫描未命中：兜底尝试已配对设备(可能处于不可发现模式)
+        val bonded = adapter.bondedDevices?.firstOrNull { it.name == targetName }
+        if (bonded != null) {
+            dumpDevice(bonded)
+            onLog("扫描未找到，回退到已配对设备: ${bonded.name} ${bonded.address}")
+            Log.d(TAG, "fallback to bonded device")
+            connectDevice(adapter, bonded, onLog)
+            return
+        }
+        throw IllegalStateException("$targetName not found")
+    }
+
+    /**
+     * 连接用户在 BLE 里明确选中的那台设备：用 Classic 扫描并按地址匹配，
+     * 避免连到别的/旧的同名已配对设备。
+     */
+    @SuppressLint("MissingPermission")
+    fun connectByClassicScan(
+        context: Context,
+        address: String,
+        targetName: String = ESP32_DEVICE_NAME,
+        discoveryTimeoutMs: Long = 12000,
+        onLog: (String) -> Unit
+    ) {
+        close()
+        val adapter = BluetoothAdapter.getDefaultAdapter() ?: throw IllegalStateException("Bluetooth unavailable")
+        onLog("Classic 扫描同地址 $address 中...")
+        Log.d(TAG, "connectByClassicScan address=$address")
+        val found = discoverByAddress(context.applicationContext, adapter, address, discoveryTimeoutMs, onLog)
+            ?: throw IllegalStateException("address $address not found in Classic scan")
         connectDevice(adapter, found, onLog)
     }
 
@@ -64,6 +133,28 @@ class BluetoothSppClient {
         targetName: String,
         timeoutMs: Long,
         onLog: (String) -> Unit
+    ): BluetoothDevice? = discover(context, adapter, timeoutMs, onLog) { device ->
+        device.name == targetName
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun discoverByAddress(
+        context: Context,
+        adapter: BluetoothAdapter,
+        address: String,
+        timeoutMs: Long,
+        onLog: (String) -> Unit
+    ): BluetoothDevice? = discover(context, adapter, timeoutMs, onLog) { device ->
+        device.address.equals(address, ignoreCase = true)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun discover(
+        context: Context,
+        adapter: BluetoothAdapter,
+        timeoutMs: Long,
+        onLog: (String) -> Unit,
+        match: (BluetoothDevice) -> Boolean
     ): BluetoothDevice? {
         val found = AtomicReference<BluetoothDevice?>()
         val done = CountDownLatch(1)
@@ -76,9 +167,9 @@ class BluetoothSppClient {
                 when (intent.action) {
                     BluetoothDevice.ACTION_FOUND -> {
                         val device = intent.bluetoothDeviceExtra() ?: return
-                        val name = device.name ?: return
-                        onLog("Bluetooth found: $name ${device.address}")
-                        if (name == targetName) {
+                        dumpDevice(device)
+                        onLog("Classic 发现: ${device.name} ${device.address} type=${deviceTypeStr(device.type)}")
+                        if (match(device)) {
                             found.set(device)
                             adapter.cancelDiscovery()
                             done.countDown()
@@ -110,9 +201,23 @@ class BluetoothSppClient {
 
     @SuppressLint("MissingPermission")
     private fun connectDevice(adapter: BluetoothAdapter, device: BluetoothDevice, onLog: (String) -> Unit) {
-        socket = device.createRfcommSocketToServiceRecord(SPP_UUID)
+        dumpDevice(device)
+        onLog("SPP: 创建 insecure socket addr=${device.address} uuid=$SPP_UUID")
+        Log.d(TAG, "createInsecureRfcommSocketToServiceRecord begin")
+        socket = device.createInsecureRfcommSocketToServiceRecord(SPP_UUID)
+        Log.d(TAG, "socket created, cancelDiscovery...")
         adapter.cancelDiscovery()
-        socket?.connect()
+        val t0 = System.currentTimeMillis()
+        try {
+            onLog("SPP: socket.connect() ...")
+            Log.d(TAG, "socket.connect() begin")
+            socket?.connect()
+            Log.d(TAG, "socket.connect() done in ${System.currentTimeMillis() - t0}ms")
+        } catch (e: Exception) {
+            Log.e(TAG, "socket.connect() FAILED after ${System.currentTimeMillis() - t0}ms", e)
+            onLog("SPP: connect 失败: ${e.message}")
+            throw e
+        }
         output = socket?.outputStream
         connected = true
         onLog("Bluetooth SPP connected: ${device.name ?: device.address}")
@@ -133,6 +238,7 @@ class BluetoothSppClient {
     }
 
     companion object {
+        private const val TAG = "BtSppClient"
         const val ESP32_DEVICE_NAME = "CruiseCar-ESP32"
         val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
     }

@@ -12,9 +12,11 @@ import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import java.util.concurrent.Executors
+import kotlin.math.roundToInt
 
 /**
  * 独立 Debug 入口：整合 YOLO 物体识别 Demo + ESP32 蓝牙连接测试 + 小车控制。
@@ -48,6 +50,9 @@ class DebugActivity : Activity() {
     private var lastGamepadState: GamepadState? = null
     private var lastGamepadAtMs: Long = 0
 
+    // ---- 最大速度(百分比) ----
+    private var maxSpeedPercent = 100
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         log("DebugActivity started")
@@ -74,8 +79,30 @@ class DebugActivity : Activity() {
 
         val videoGamepad = VideoGamepadView(this)
         videoGamepad.setBackground(previewFrame)
-        videoGamepad.onStateChanged = { state -> sendGamepadState(state) }
+        videoGamepad.onStateChanged = { state -> sendGamepadState(scaledState(state)) }
         root.addView(videoGamepad, LinearLayout.LayoutParams(-1, dp(420)))
+
+        // ---------- 遥控设置 ----------
+        root.addView(subtitle("遥控设置"))
+        val speedLabel = TextView(this).apply {
+            text = "最大速度: 100%"
+            textSize = 14f
+            setTextColor(Color.WHITE)
+        }
+        root.addView(speedLabel)
+        val speedSeek = SeekBar(this).apply {
+            max = 100
+            progress = 100
+        }
+        speedSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                maxSpeedPercent = maxOf(progress, 10)
+                speedLabel.text = "最大速度: $maxSpeedPercent%"
+            }
+            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+        })
+        root.addView(speedSeek, LinearLayout.LayoutParams(-1, LinearLayout.LayoutParams.WRAP_CONTENT))
 
         yoloStatus = textLabel("YOLO idle")
         root.addView(yoloStatus)
@@ -199,6 +226,26 @@ class DebugActivity : Activity() {
                 log("发送失败: ${e.message}")
             }
         }
+    }
+
+    // ---------------------------------------------------------------
+    //  最大速度缩放：按百分比压缩各轴相对中点的偏移，封顶小车速度
+    // ---------------------------------------------------------------
+
+    private fun scaledState(state: GamepadState): GamepadState {
+        val f = maxSpeedPercent / 100.0
+        return GamepadState(
+            lx = scaleAxis(state.lx, f),
+            ly = scaleAxis(state.ly, f),
+            rx = scaleAxis(state.rx, f),
+            ry = scaleAxis(state.ry, f),
+            buttons = state.buttons
+        )
+    }
+
+    private fun scaleAxis(axis: Int, f: Double): Int {
+        val v = (axis - 128) * f + 128
+        return v.roundToInt().coerceIn(0, 255)
     }
 
     // ---------------------------------------------------------------

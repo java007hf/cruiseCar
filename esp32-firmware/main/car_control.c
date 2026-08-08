@@ -41,6 +41,9 @@
 #define ENCODER_PCNT_LOW_LIMIT -30000
 #define ENCODER_GLITCH_FILTER_NS 1000
 #define CONTROL_LOOP_MS 50
+/* 指令超时保护(failsafe): 超过该时间未收到新控制指令, 自动停车,
+   防止遥控端停发/断流后小车保持最后一条指令一直行驶。 */
+#define CONTROL_TIMEOUT_MS 500
 #define ENCODER_STRAIGHT_TOLERANCE 10
 #define ENCODER_BALANCE_KP 1
 #define ENCODER_BALANCE_MAX_CORRECTION 20
@@ -53,6 +56,7 @@ static volatile int target_right_cmd;
 static volatile int target_throttle;
 static volatile int target_steering;
 static volatile uint32_t target_buttons;
+static volatile TickType_t last_cmd_tick;
 static pcnt_unit_handle_t left_encoder;
 static pcnt_unit_handle_t right_encoder;
 
@@ -147,6 +151,7 @@ void car_control_stop(void)
     target_steering = 0;
     target_buttons = 0;
     brake_until_tick = 0;
+    last_cmd_tick = 0;
     motor_coast(LEFT_AIN1, LEFT_AIN2, LEFT_PWM_CHANNEL);
     motor_coast(RIGHT_BIN1, RIGHT_BIN2, RIGHT_PWM_CHANNEL);
     motors_running = false;
@@ -266,6 +271,7 @@ void car_control_update(uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry, uint32_t
     (void)rx;
     (void)ry;
 
+    last_cmd_tick = xTaskGetTickCount();
     int throttle = axis_to_signed(ly, true);
     int steering = (axis_to_signed(lx, true) * STEERING_PERCENT) / 100;
     int left = clamp_int(throttle + steering, -127, 127);
@@ -306,6 +312,15 @@ static void motor_control_task(void *arg)
 
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(CONTROL_LOOP_MS));
+
+        /* 指令超时保护: 持续运动但很久没收到新指令, 立即停车 */
+        if ((target_left_cmd != 0 || target_right_cmd != 0) &&
+            (xTaskGetTickCount() - last_cmd_tick) > pdMS_TO_TICKS(CONTROL_TIMEOUT_MS)) {
+            ESP_LOGW(TAG, "command timeout %" PRIu32 " ms, failsafe stop",
+                     (uint32_t)(xTaskGetTickCount() - last_cmd_tick));
+            car_control_stop();
+            continue;
+        }
 
         int left_count = 0;
         int right_count = 0;

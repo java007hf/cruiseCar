@@ -150,7 +150,7 @@ class GamepadView(context: Context) : View(context) {
     private fun isInsideStick(x: Float, y: Float, cx: Float, cy: Float): Boolean =
         hypot(x - cx, y - cy) <= stickRadius() * 1.35f
 
-    private fun stickRadius(): Float = min(width, height) * 0.11f
-    private fun stickCenterY(): Float = height * 0.74f
+    private fun stickRadius(): Float = min(width, height) * 0.18f
+    private fun stickCenterY(): Float = height * 0.70f
     private fun leftCenterX(): Float = width * 0.22f
 }
