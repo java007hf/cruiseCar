@@ -192,8 +192,12 @@ class MainActivity : Activity() {
             when (frame) {
                 is ControlFrame.Gamepad -> {
                     if (receiverMode == ControlMode.MANUAL) {
-                        bluetooth.send(packet)
-                        log("Forwarded: ${packet.toHexLine()}")
+                        if (bluetooth.isConnected()) {
+                            bluetooth.send(packet)
+                            log("Forwarded: ${packet.toHexLine()}")
+                        } else {
+                            runOnUiThread { updateReceiverEspStatus(false) }
+                        }
                     }
                 }
                 is ControlFrame.Mode -> runOnUiThread {

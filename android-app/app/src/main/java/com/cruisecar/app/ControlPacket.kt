@@ -1,5 +1,7 @@
 package com.cruisecar.app
 
+import kotlin.math.roundToInt
+
 sealed class ControlFrame {
     data class Gamepad(val state: GamepadState) : ControlFrame()
     data class Mode(val mode: ControlMode) : ControlFrame()
@@ -26,14 +28,15 @@ data class GamepadState(
     val buttons: Int = 0
 ) {
     fun toPacket(): ByteArray {
+        val f = CarSettings.maxSpeedPercent / 100.0
         val packet = ByteArray(ControlProtocol.PACKET_SIZE)
         packet[0] = ControlProtocol.HEADER_0.toByte()
         packet[1] = ControlProtocol.HEADER_1.toByte()
         packet[2] = ControlProtocol.TYPE_GAMEPAD.toByte()
-        packet[3] = lx.coerceIn(0, 255).toByte()
-        packet[4] = ly.coerceIn(0, 255).toByte()
-        packet[5] = rx.coerceIn(0, 255).toByte()
-        packet[6] = ry.coerceIn(0, 255).toByte()
+        packet[3] = scaleAxis(lx, f).toByte()
+        packet[4] = scaleAxis(ly, f).toByte()
+        packet[5] = scaleAxis(rx, f).toByte()
+        packet[6] = scaleAxis(ry, f).toByte()
         packet[7] = (buttons and 0xFF).toByte()
         packet[8] = ((buttons ushr 8) and 0xFF).toByte()
         packet[9] = ControlProtocol.checksum(packet)
@@ -41,6 +44,19 @@ data class GamepadState(
     }
 
     fun toHexLine(): String = toPacket().toHexLine()
+}
+
+/**
+ * 全局小车设置：最大速度百分比(10~100)，默认 30%。
+ * demo/发送端/接收端 只要经 GamepadState.toPacket() 发指令都会受此限制。
+ */
+object CarSettings {
+    @Volatile var maxSpeedPercent: Int = 30
+}
+
+private fun scaleAxis(axis: Int, f: Double): Int {
+    val v = (axis - 128) * f + 128
+    return v.roundToInt().coerceIn(0, 255)
 }
 
 object ModeCommand {

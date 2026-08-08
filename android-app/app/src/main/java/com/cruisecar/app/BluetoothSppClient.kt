@@ -10,6 +10,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.os.Build
 import android.util.Log
+import java.io.IOException
 import java.io.OutputStream
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
@@ -223,9 +224,22 @@ class BluetoothSppClient {
         onLog("Bluetooth SPP connected: ${device.name ?: device.address}")
     }
 
-    fun send(packet: ByteArray) {
-        output?.write(packet)
-        output?.flush()
+    /**
+     * 发送数据包，返回是否成功。
+     * 失败时(蓝牙断开/写异常)会标记 connected=false 并打日志，不再向上抛 IOException，
+     * 避免调用方在裸线程(如 TCP 控制服务端)上未捕获异常导致崩溃。
+     */
+    fun send(packet: ByteArray): Boolean {
+        if (!connected) return false
+        return try {
+            output?.write(packet)
+            output?.flush()
+            true
+        } catch (e: IOException) {
+            Log.e(TAG, "send failed, marking disconnected: ${e.message}")
+            connected = false
+            false
+        }
     }
 
     fun isConnected(): Boolean = connected

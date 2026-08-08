@@ -41,7 +41,11 @@ class ControlServer(private val port: Int, private val onFrame: (ByteArray, Cont
                 val packet = frame.copyOf()
                 val parsed = ControlProtocol.parse(packet)
                 if (parsed != null) {
-                    onFrame(packet, parsed)
+                    try {
+                        onFrame(packet, parsed)
+                    } catch (e: Exception) {
+                        onLog("Frame handling error: ${e.message}")
+                    }
                 } else {
                     onLog("Dropped invalid control frame: ${packet.toHexLine()}")
                 }
