@@ -82,6 +82,11 @@ class ControlClient {
         output?.flush()
     }
 
+    fun sendServo(index: Int = 0, angle: Int) {
+        output?.write(ServoCommand.packet(index, angle))
+        output?.flush()
+    }
+
     fun isConnected(): Boolean = socket?.isConnected == true && output != null
 
     fun close() {

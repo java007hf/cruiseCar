@@ -16,6 +16,7 @@ import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import org.webrtc.SurfaceViewRenderer
@@ -50,6 +51,11 @@ class MainActivity : Activity() {
     private var senderCameraButton: Button? = null
     private var lastSenderState: GamepadState? = null
     private var lastSenderAtMs: Long = 0
+    /* 舵机命令合并: 只保留"最新目标角度", 同一时刻最多排 1 个发送任务,
+       避免拖动 SeekBar 时大量 onProgressChanged 把队列撑爆导致延迟累积。 */
+    private var senderServoTargetAngle = 90
+    private var senderServoSendScheduled = false
+    private val senderServoLock = Any()
     private var backAction: (() -> Unit)? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -126,6 +132,33 @@ class MainActivity : Activity() {
         layout.addView(senderVideoButton)
         senderCameraButton = button(senderCameraButtonText()) { toggleSenderCamera() }
         layout.addView(senderCameraButton)
+
+        // ---------- 舵机控制 ----------
+        layout.addView(TextView(this).apply {
+            text = "舵机控制 (GPIO18)"
+            textSize = 18f
+            gravity = Gravity.CENTER_HORIZONTAL
+        })
+        val servoLabel = TextView(this).apply {
+            text = "舵机角度: 90°"
+            textSize = 14f
+            gravity = Gravity.CENTER_HORIZONTAL
+        }
+        layout.addView(servoLabel)
+        val servoSeek = SeekBar(this).apply {
+            max = 180
+            progress = 90
+        }
+        servoSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                servoLabel.text = "舵机角度: $progress°"
+                if (fromUser) sendServoToReceiver(progress)
+            }
+            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+        })
+        layout.addView(servoSeek, LinearLayout.LayoutParams(-1, LinearLayout.LayoutParams.WRAP_CONTENT))
+
         layout.addView(button("停止 / 回中") { sendFromGamepad(GamepadState(), force = true) })
         layout.addView(button("返回") {
             backAction?.invoke()
@@ -456,6 +489,36 @@ class MainActivity : Activity() {
                 }
             } catch (e: Exception) {
                 log("Send failed: ${e.message}")
+            }
+        }
+    }
+
+    private fun sendServoToReceiver(angle: Int) {
+        /* 合并: 只记录最新角度; 若已有待发送的 flush 任务则跳过排程,
+           等该任务发送时自然会带上最新值。这样队列里最多 1 个待发任务,
+           延迟被限制在"一次 TCP 写"以内, 不会随拖动时长累积。 */
+        val shouldSchedule: Boolean
+        synchronized(senderServoLock) {
+            senderServoTargetAngle = angle
+            shouldSchedule = !senderServoSendScheduled
+            senderServoSendScheduled = true
+        }
+        if (!shouldSchedule) return
+
+        senderExecutor.execute {
+            val target = synchronized(senderServoLock) {
+                senderServoSendScheduled = false
+                senderServoTargetAngle
+            }
+            try {
+                if (controlClient.isConnected()) {
+                    controlClient.sendServo(angle = target)
+                    log("舵机指令已发送: idx=0 angle=$target")
+                } else {
+                    log("未连接接收端: 请先扫描并连接接收端")
+                }
+            } catch (e: Exception) {
+                log("舵机发送失败: ${e.message}")
             }
         }
     }

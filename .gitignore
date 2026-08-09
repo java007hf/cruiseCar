@@ -68,3 +68,6 @@ ml/**/*.npy
 
 # Android assets
 android-app/app/src/main/assets/target_object.jpg
+
+# ---- esp32-firmware: CMake build output (regenerable, never track) ----
+esp32-firmware/build_codex/
