@@ -44,6 +44,20 @@
 /* 指令超时保护(failsafe): 超过该时间未收到新控制指令, 自动停车,
    防止遥控端停发/断流后小车保持最后一条指令一直行驶。 */
 #define CONTROL_TIMEOUT_MS 500
+
+/* ---- 舵机(Servo) ----
+   注意: 经典 ESP32 的 GPIO 34/35/36/39 为输入专用, 不能输出 PWM。
+   默认使用 GPIO 18(可输出且空闲); 改线后只需改 SERVO_GPIO。 */
+#define SERVO_GPIO GPIO_NUM_18
+#define SERVO_PWM_CHANNEL LEDC_CHANNEL_2
+#define SERVO_PWM_TIMER LEDC_TIMER_1
+#define SERVO_PWM_MODE LEDC_LOW_SPEED_MODE
+#define SERVO_PWM_FREQ_HZ 50
+#define SERVO_RES_BITS 16          /* 16-bit 占空比分辨率 */
+#define SERVO_MIN_US 500           /* 0°  对应脉宽 */
+#define SERVO_MAX_US 2500          /* 180° 对应脉宽 */
+#define SERVO_PERIOD_US 20000      /* 50Hz 周期 */
+#define SERVO_DEFAULT_ANGLE 90
 #define ENCODER_STRAIGHT_TOLERANCE 10
 #define ENCODER_BALANCE_KP 1
 #define ENCODER_BALANCE_MAX_CORRECTION 20
@@ -266,6 +280,47 @@ static esp_err_t motor_init(void)
     return ESP_OK;
 }
 
+static esp_err_t servo_init(void)
+{
+    ledc_timer_config_t timer_config = {
+        .speed_mode = SERVO_PWM_MODE,
+        .duty_resolution = SERVO_RES_BITS,
+        .timer_num = SERVO_PWM_TIMER,
+        .freq_hz = SERVO_PWM_FREQ_HZ,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+    ESP_RETURN_ON_ERROR(ledc_timer_config(&timer_config), TAG, "configure servo PWM timer");
+
+    ledc_channel_config_t channel = {
+        .gpio_num = SERVO_GPIO,
+        .speed_mode = SERVO_PWM_MODE,
+        .channel = SERVO_PWM_CHANNEL,
+        .intr_type = LEDC_INTR_DISABLE,
+        .timer_sel = SERVO_PWM_TIMER,
+        .duty = 0,
+        .hpoint = 0,
+    };
+    ESP_RETURN_ON_ERROR(ledc_channel_config(&channel), TAG, "configure servo PWM channel");
+
+    ESP_LOGI(TAG, "servo on GPIO %d ready (50Hz, %d-bit)", SERVO_GPIO, SERVO_RES_BITS);
+    return ESP_OK;
+}
+
+void car_control_servo_set(uint8_t index, uint16_t angle_deg)
+{
+    (void)index; /* 当前仅一路舵机(索引 0); 预留多路扩展 */
+    if (angle_deg > 180) {
+        angle_deg = 180;
+    }
+    uint32_t pulse_us = SERVO_MIN_US +
+                        (uint32_t)(angle_deg * (SERVO_MAX_US - SERVO_MIN_US)) / 180;
+    uint32_t max_duty = (1u << SERVO_RES_BITS) - 1;
+    uint32_t duty = (pulse_us * max_duty) / SERVO_PERIOD_US;
+
+    ledc_set_duty(SERVO_PWM_MODE, SERVO_PWM_CHANNEL, duty);
+    ledc_update_duty(SERVO_PWM_MODE, SERVO_PWM_CHANNEL);
+}
+
 void car_control_update(uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry, uint32_t buttons)
 {
     (void)rx;
@@ -405,6 +460,10 @@ esp_err_t car_control_init(void)
 {
     ESP_RETURN_ON_ERROR(motor_init(), TAG, "init motors");
     ESP_RETURN_ON_ERROR(encoder_init(), TAG, "init encoders");
+    ESP_RETURN_ON_ERROR(servo_init(), TAG, "init servo");
+
+    /* 上电把舵机先归到默认角度, 避免随机占位 */
+    car_control_servo_set(0, SERVO_DEFAULT_ANGLE);
 
     BaseType_t ok = xTaskCreate(motor_control_task, "motor_control", 3 * 1024, NULL, 4, NULL);
     ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "create motor control task");

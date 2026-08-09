@@ -121,6 +121,28 @@ class DebugActivity : Activity() {
         root.addView(button("BLE 扫描附近设备") { blePairing.start() })
         root.addView(button("断开 ESP32") { disconnectEsp32() })
 
+        // ---------- 舵机控制 ----------
+        root.addView(subtitle("舵机控制 (GPIO18)"))
+        val servoLabel = TextView(this).apply {
+            text = "舵机角度: 90°"
+            textSize = 14f
+            setTextColor(Color.WHITE)
+        }
+        root.addView(servoLabel)
+        val servoSeek = SeekBar(this).apply {
+            max = 180
+            progress = 90
+        }
+        servoSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                servoLabel.text = "舵机角度: $progress°"
+                if (fromUser) sendServo(progress)
+            }
+            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+        })
+        root.addView(servoSeek, LinearLayout.LayoutParams(-1, LinearLayout.LayoutParams.WRAP_CONTENT))
+
         // ---------- log ----------
         root.addView(separator())
         root.addView(subtitle("日志"))
@@ -220,6 +242,23 @@ class DebugActivity : Activity() {
                 log("发送: lx=${state.lx} ly=${state.ly} → ${packet.toHexLine()}")
             } catch (e: Exception) {
                 log("发送失败: ${e.message}")
+            }
+        }
+    }
+
+    private fun sendServo(angle: Int) {
+        if (!bluetooth.isConnected()) {
+            toast("请先连接 ESP32")
+            updateEspStatus(false)
+            return
+        }
+        controlExecutor.execute {
+            try {
+                val packet = ServoCommand.packet(angle = angle)
+                bluetooth.send(packet)
+                log("舵机: angle=$angle → ${packet.toHexLine()}")
+            } catch (e: Exception) {
+                log("舵机发送失败: ${e.message}")
             }
         }
     }

@@ -200,6 +200,14 @@ class MainActivity : Activity() {
                         }
                     }
                 }
+                is ControlFrame.Servo -> {
+                    if (bluetooth.isConnected()) {
+                        bluetooth.send(packet)
+                        log("Forwarded servo: idx=${frame.index} angle=${frame.angle}")
+                    } else {
+                        runOnUiThread { updateReceiverEspStatus(false) }
+                    }
+                }
                 is ControlFrame.Mode -> runOnUiThread {
                     when (frame.mode) {
                         ControlMode.VIDEO_CALL -> setReceiverVideoEnabled(true)

@@ -5,6 +5,7 @@ import kotlin.math.roundToInt
 sealed class ControlFrame {
     data class Gamepad(val state: GamepadState) : ControlFrame()
     data class Mode(val mode: ControlMode) : ControlFrame()
+    data class Servo(val index: Int, val angle: Int) : ControlFrame()
 }
 
 enum class ControlMode(val wireValue: Int, val label: String) {
@@ -71,12 +72,27 @@ object ModeCommand {
     }
 }
 
+object ServoCommand {
+    fun packet(index: Int = 0, angle: Int): ByteArray {
+        val angleClamped = angle.coerceIn(0, 180)
+        val packet = ByteArray(ControlProtocol.PACKET_SIZE)
+        packet[0] = ControlProtocol.HEADER_0.toByte()
+        packet[1] = ControlProtocol.HEADER_1.toByte()
+        packet[2] = ControlProtocol.TYPE_SERVO.toByte()
+        packet[3] = (index and 0xFF).toByte()
+        packet[4] = angleClamped.toByte()
+        packet[9] = ControlProtocol.checksum(packet)
+        return packet
+    }
+}
+
 object ControlProtocol {
     const val PACKET_SIZE = 10
     const val HEADER_0 = 0xAA
     const val HEADER_1 = 0x55
     const val TYPE_GAMEPAD = 0x01
     const val TYPE_MODE = 0x02
+    const val TYPE_SERVO = 0x03
 
     fun parse(packet: ByteArray): ControlFrame? {
         if (packet.size != PACKET_SIZE) return null
@@ -95,6 +111,10 @@ object ControlProtocol {
                 )
             )
             TYPE_MODE -> ControlFrame.Mode(ControlMode.fromWire(packet[3].toInt() and 0xFF))
+            TYPE_SERVO -> ControlFrame.Servo(
+                index = packet[3].toInt() and 0xFF,
+                angle = (packet[4].toInt() and 0xFF).coerceIn(0, 180)
+            )
             else -> null
         }
     }

@@ -79,6 +79,24 @@ static bool parse_spp_packet(const uint8_t *packet, gamepad_state_t *state)
     return true;
 }
 
+/* 舵机控制包: 0xAA 0x55 0x03 [index] [angle 0~180] [res] [res] [res] [res] [checksum] */
+static bool parse_servo_packet(const uint8_t *packet, uint8_t *index, uint16_t *angle)
+{
+    if (packet[0] != 0xAA || packet[1] != 0x55 || packet[2] != 0x03) {
+        return false;
+    }
+    if (checksum(packet) != packet[9]) {
+        return false;
+    }
+    *index = packet[3];
+    uint16_t a = packet[4];
+    if (a > 180) {
+        a = 180;
+    }
+    *angle = a;
+    return true;
+}
+
 static bool parse_xiaomi_gamepad_report(const uint8_t *data, uint16_t len, gamepad_state_t *state)
 {
     if (len < 20) {
@@ -230,11 +248,26 @@ static void feed_spp_bytes(const uint8_t *data, size_t len)
         }
         rx_buffer[rx_len++] = data[i];
         if (rx_len == PACKET_SIZE) {
-            gamepad_state_t state;
-            if (parse_spp_packet(rx_buffer, &state)) {
-                apply_gamepad_state("spp", &state);
+            if (checksum(rx_buffer) != rx_buffer[9]) {
+                ESP_LOGW(TAG, "invalid SPP checksum");
+            } else if (rx_buffer[2] == 0x01) {
+                gamepad_state_t state;
+                if (parse_spp_packet(rx_buffer, &state)) {
+                    apply_gamepad_state("spp", &state);
+                } else {
+                    ESP_LOGW(TAG, "bad gamepad packet");
+                }
+            } else if (rx_buffer[2] == 0x03) {
+                uint8_t sidx = 0;
+                uint16_t sangle = 0;
+                if (parse_servo_packet(rx_buffer, &sidx, &sangle)) {
+                    car_control_servo_set(sidx, sangle);
+                    ESP_LOGI(TAG, "spp servo idx=%u angle=%u", sidx, sangle);
+                } else {
+                    ESP_LOGW(TAG, "bad servo packet");
+                }
             } else {
-                ESP_LOGW(TAG, "invalid SPP control packet");
+                ESP_LOGW(TAG, "unknown SPP packet type 0x%02x", rx_buffer[2]);
             }
             rx_len = 0;
         }
