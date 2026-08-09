@@ -27,6 +27,13 @@ class DebugActivity : Activity() {
     private val tag = "DebugActivity"
     private val bluetooth = BluetoothSppClient()
     private val controlExecutor = Executors.newSingleThreadExecutor()
+    /* 舵机独立线程: 与手柄发送隔离, 手柄流量再大也不会拖慢舵机实时性 */
+    private val servoExecutor = Executors.newSingleThreadExecutor()
+    /* 舵机命令合并: 只保留"最新目标角度", 同一时刻最多排 1 个发送任务,
+       避免拖动 SeekBar 时上百次 onProgressChanged 把队列撑爆导致延迟累积。 */
+    private var servoTargetAngle = 90
+    private var servoSendScheduled = false
+    private val servoSendLock = Any()
     private val blePairing = Esp32BlePairing(
         this, bluetooth,
         onLog = { log(it) },
@@ -252,11 +259,26 @@ class DebugActivity : Activity() {
             updateEspStatus(false)
             return
         }
-        controlExecutor.execute {
+        /* 合并: 只记录最新角度; 若已有待发送的 flush 任务则跳过排程,
+           等该任务发送时自然会带上最新值。这样队列里最多 1 个待发任务,
+           延迟被限制在"一次蓝牙写"以内, 不会随拖动时长累积。 */
+        val shouldSchedule: Boolean
+        synchronized(servoSendLock) {
+            servoTargetAngle = angle
+            shouldSchedule = !servoSendScheduled
+            servoSendScheduled = true
+        }
+        if (!shouldSchedule) return
+
+        servoExecutor.execute {
+            val target = synchronized(servoSendLock) {
+                servoSendScheduled = false
+                servoTargetAngle
+            }
             try {
-                val packet = ServoCommand.packet(angle = angle)
+                val packet = ServoCommand.packet(angle = target)
                 bluetooth.send(packet)
-                log("舵机: angle=$angle → ${packet.toHexLine()}")
+                log("舵机: angle=$target → ${packet.toHexLine()}")
             } catch (e: Exception) {
                 log("舵机发送失败: ${e.message}")
             }
@@ -371,6 +393,7 @@ class DebugActivity : Activity() {
         yoloStatus = null
         bluetooth.close()
         controlExecutor.shutdownNow()
+        servoExecutor.shutdownNow()
         super.onDestroy()
     }
 }
