@@ -6,6 +6,8 @@ sealed class ControlFrame {
     data class Gamepad(val state: GamepadState) : ControlFrame()
     data class Mode(val mode: ControlMode) : ControlFrame()
     data class Servo(val index: Int, val angle: Int) : ControlFrame()
+    data class Status(val espConnected: Boolean, val mode: ControlMode) : ControlFrame()
+    data class Command(val code: Int) : ControlFrame()
 }
 
 enum class ControlMode(val wireValue: Int, val label: String) {
@@ -86,6 +88,33 @@ object ServoCommand {
     }
 }
 
+/** 接收端 → 发送端 的状态回报: [3]=ESP32是否已连接(0/1), [4]=接收端当前模式 */
+object StatusCommand {
+    fun packet(espConnected: Boolean, mode: ControlMode): ByteArray {
+        val packet = ByteArray(ControlProtocol.PACKET_SIZE)
+        packet[0] = ControlProtocol.HEADER_0.toByte()
+        packet[1] = ControlProtocol.HEADER_1.toByte()
+        packet[2] = ControlProtocol.TYPE_STATUS.toByte()
+        packet[3] = (if (espConnected) 1 else 0).toByte()
+        packet[4] = mode.wireValue.toByte()
+        packet[9] = ControlProtocol.checksum(packet)
+        return packet
+    }
+}
+
+/** 发送端 → 接收端 的指令: [3]=命令码(CMD_*) */
+object ControlCommand {
+    fun packet(code: Int): ByteArray {
+        val packet = ByteArray(ControlProtocol.PACKET_SIZE)
+        packet[0] = ControlProtocol.HEADER_0.toByte()
+        packet[1] = ControlProtocol.HEADER_1.toByte()
+        packet[2] = ControlProtocol.TYPE_CMD.toByte()
+        packet[3] = (code and 0xFF).toByte()
+        packet[9] = ControlProtocol.checksum(packet)
+        return packet
+    }
+}
+
 object ControlProtocol {
     const val PACKET_SIZE = 10
     const val HEADER_0 = 0xAA
@@ -93,6 +122,9 @@ object ControlProtocol {
     const val TYPE_GAMEPAD = 0x01
     const val TYPE_MODE = 0x02
     const val TYPE_SERVO = 0x03
+    const val TYPE_STATUS = 0x04
+    const val TYPE_CMD = 0x05
+    const val CMD_CONNECT_ESP32 = 0x01
 
     fun parse(packet: ByteArray): ControlFrame? {
         if (packet.size != PACKET_SIZE) return null
@@ -115,6 +147,11 @@ object ControlProtocol {
                 index = packet[3].toInt() and 0xFF,
                 angle = (packet[4].toInt() and 0xFF).coerceIn(0, 180)
             )
+            TYPE_STATUS -> ControlFrame.Status(
+                espConnected = (packet[3].toInt() and 0xFF) != 0,
+                mode = ControlMode.fromWire(packet[4].toInt() and 0xFF)
+            )
+            TYPE_CMD -> ControlFrame.Command(packet[3].toInt() and 0xFF)
             else -> null
         }
     }

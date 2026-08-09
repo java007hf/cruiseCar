@@ -57,7 +57,7 @@
 #define SERVO_MIN_US 500           /* 0°  对应脉宽 */
 #define SERVO_MAX_US 2500          /* 180° 对应脉宽 */
 #define SERVO_PERIOD_US 20000      /* 50Hz 周期 */
-#define SERVO_DEFAULT_ANGLE 90
+#define SERVO_DEFAULT_ANGLE 130     /* 默认 130° 起位, 保护舵机行程 */
 #define ENCODER_STRAIGHT_TOLERANCE 10
 #define ENCODER_BALANCE_KP 1
 #define ENCODER_BALANCE_MAX_CORRECTION 20

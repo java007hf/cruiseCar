@@ -83,6 +83,7 @@ class DebugActivity : Activity() {
         val videoGamepad = VideoGamepadView(this)
         videoGamepad.setBackground(previewFrame)
         videoGamepad.onStateChanged = { state -> sendGamepadState(state) }
+        videoGamepad.onServoChanged = { angle -> sendServo(angle) }
         root.addView(videoGamepad, LinearLayout.LayoutParams(-1, dp(420)))
 
         // ---------- 遥控设置(全局生效: 发送端/接收端也受此限制) ----------
@@ -127,28 +128,6 @@ class DebugActivity : Activity() {
         root.addView(button("自动扫描连接") { connectEsp32ByScan() })
         root.addView(button("BLE 扫描附近设备") { blePairing.start() })
         root.addView(button("断开 ESP32") { disconnectEsp32() })
-
-        // ---------- 舵机控制 ----------
-        root.addView(subtitle("舵机控制 (GPIO18)"))
-        val servoLabel = TextView(this).apply {
-            text = "舵机角度: 90°"
-            textSize = 14f
-            setTextColor(Color.WHITE)
-        }
-        root.addView(servoLabel)
-        val servoSeek = SeekBar(this).apply {
-            max = 180
-            progress = 90
-        }
-        servoSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                servoLabel.text = "舵机角度: $progress°"
-                if (fromUser) sendServo(progress)
-            }
-            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
-            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
-        })
-        root.addView(servoSeek, LinearLayout.LayoutParams(-1, LinearLayout.LayoutParams.WRAP_CONTENT))
 
         // ---------- log ----------
         root.addView(separator())

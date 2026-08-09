@@ -8,6 +8,8 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.net.wifi.WifiManager
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.Gravity
 import android.view.View
@@ -16,11 +18,13 @@ import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
-import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import org.webrtc.SurfaceViewRenderer
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
 
 class MainActivity : Activity() {
     private val tag = "CruiseCar"
@@ -30,8 +34,15 @@ class MainActivity : Activity() {
     private val controlClient = ControlClient()
     private val bluetooth = BluetoothSppClient()
     private val senderExecutor = Executors.newSingleThreadExecutor()
+    /* 舵机发送独立线程: 与手柄发送隔离, 手柄流量再大也不会拖慢舵机实时性 */
+    private val senderServoExecutor = Executors.newSingleThreadExecutor()
     private var discoveryResponder: DiscoveryResponder? = null
     private var controlServer: ControlServer? = null
+    /* 接收端转发独立线程: 把蓝牙写从 TCP 读取线程挪开, 避免 ESP32 蓝牙写阻塞
+       时反向压垮发送端 TCP(导致舵机/手柄指令在发送端排队、延迟累积)。 */
+    private val forwardExecutor = Executors.newSingleThreadExecutor()
+    /* 接收端状态回报 + ESP32 心跳的定时任务(1Hz) */
+    private val receiverReporter: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
     private var cameraPreview: CameraPreviewView? = null
     private var senderVideoRenderer: SurfaceViewRenderer? = null
     private var senderVideoArea: FrameLayout? = null
@@ -39,6 +50,8 @@ class MainActivity : Activity() {
     private var receiverVideoRenderer: SurfaceViewRenderer? = null
     private var receiverLayout: LinearLayout? = null
     private var receiverEspStatusView: TextView? = null
+    /* 接收端 → 发送端 状态回报定时任务句柄, stopReceiverServices 时取消 */
+    private var receiverReporterTask: ScheduledFuture<*>? = null
     private var smartFollow: SmartFollowController? = null
     private var webRtcCall: WebRtcCall? = null
     private lateinit var logView: TextView
@@ -47,13 +60,15 @@ class MainActivity : Activity() {
     private var receiverMode = ControlMode.MANUAL
     private var senderVideoEnabled = false
     private var senderVideoButton: Button? = null
+    private var senderReceiverStatusView: TextView? = null
     private var senderCameraFacing = WebRtcCall.CameraFacing.FRONT
     private var senderCameraButton: Button? = null
     private var lastSenderState: GamepadState? = null
     private var lastSenderAtMs: Long = 0
     /* 舵机命令合并: 只保留"最新目标角度", 同一时刻最多排 1 个发送任务,
-       避免拖动 SeekBar 时大量 onProgressChanged 把队列撑爆导致延迟累积。 */
-    private var senderServoTargetAngle = 90
+       避免拖动竖向舵机控件时大量回调把队列撑爆导致延迟累积。发送走独立线程,
+       不与手柄发送争用同一执行器, 降低端到端延迟。 */
+    private var senderServoTargetAngle = 130
     private var senderServoSendScheduled = false
     private val senderServoLock = Any()
     private var backAction: (() -> Unit)? = null
@@ -92,11 +107,48 @@ class MainActivity : Activity() {
         senderVideoArea = videoArea
         val remoteVideo = createSenderVideoRenderer(videoArea)
         videoArea.onStateChanged = { state ->
+            if (senderMode != ControlMode.MANUAL) {
+                /* 用户在非手动模式下操作了摇杆(lx/ly 有实际输入), 自动退出智能模式回到手动遥控 */
+                val controlling = state.lx != 128 || state.ly != 128 || state.buttons != 0
+                if (!controlling) return@onStateChanged
+                val exited = senderMode
+                senderMode = ControlMode.MANUAL
+                sendMode(ControlMode.MANUAL)
+                toast("已退出 ${exited.label} 模式，切换为手动遥控")
+            }
             if (senderMode == ControlMode.MANUAL) {
                 sendFromGamepad(state)
             }
         }
+        videoArea.onServoChanged = { angle -> sendServoToReceiver(angle) }
         layout.addView(videoArea, LinearLayout.LayoutParams(-1, 0, 2.4f))
+
+        /* 接收端状态(ESP32 连接态 + 接收端当前模式)由接收端 1Hz 回传, 此处展示 */
+        senderReceiverStatusView = TextView(this).apply {
+            text = "接收端：未连接"
+            textSize = 14f
+            gravity = Gravity.CENTER_HORIZONTAL
+            setTextColor(Color.rgb(200, 60, 60))
+        }
+        layout.addView(senderReceiverStatusView)
+
+        /* 发送端被动感知接收端状态; 接收端断开时回退 UI */
+        controlClient.onStatus = { espConnected, mode ->
+            runOnUiThread {
+                senderReceiverStatusView?.apply {
+                    text = "ESP32：${if (espConnected) "已连接" else "未连接"}  |  接收端模式：${mode.label}"
+                    setTextColor(if (espConnected) Color.rgb(60, 180, 60) else Color.rgb(200, 60, 60))
+                }
+            }
+        }
+        controlClient.onReceiverGone = {
+            runOnUiThread {
+                senderReceiverStatusView?.apply {
+                    text = "接收端：已断开"
+                    setTextColor(Color.rgb(200, 60, 60))
+                }
+            }
+        }
 
         layout.addView(button("扫描接收端并连接") {
             Thread {
@@ -117,6 +169,15 @@ class MainActivity : Activity() {
             }.start()
         })
 
+        layout.addView(button("远程连接 ESP32") {
+            if (controlClient.isConnected()) {
+                controlClient.sendCommand(ControlCommand.CMD_CONNECT_ESP32)
+                log("已向接收端下发指令：自动扫描并连接 ESP32")
+            } else {
+                log("未连接接收端，无法远程触发 ESP32 连接")
+            }
+        })
+
         val modeRow = row()
         modeRow.addView(button("实时视频") { startSenderVideoMode() }, weightParams())
         modeRow.addView(button("智能跟随") { sendMode(ControlMode.SMART_FOLLOW, remoteVideo) }, weightParams())
@@ -124,7 +185,6 @@ class MainActivity : Activity() {
         layout.addView(modeRow)
         modeRow.visibility = View.GONE
         val driveModeRow = row()
-        driveModeRow.addView(button("手动遥控") { sendMode(ControlMode.MANUAL, remoteVideo) }, weightParams())
         driveModeRow.addView(button("智能跟随") { sendMode(ControlMode.SMART_FOLLOW, remoteVideo) }, weightParams())
         driveModeRow.addView(button("智能巡逻") { sendMode(ControlMode.PATROL, remoteVideo) }, weightParams())
         layout.addView(driveModeRow)
@@ -132,32 +192,6 @@ class MainActivity : Activity() {
         layout.addView(senderVideoButton)
         senderCameraButton = button(senderCameraButtonText()) { toggleSenderCamera() }
         layout.addView(senderCameraButton)
-
-        // ---------- 舵机控制 ----------
-        layout.addView(TextView(this).apply {
-            text = "舵机控制 (GPIO18)"
-            textSize = 18f
-            gravity = Gravity.CENTER_HORIZONTAL
-        })
-        val servoLabel = TextView(this).apply {
-            text = "舵机角度: 90°"
-            textSize = 14f
-            gravity = Gravity.CENTER_HORIZONTAL
-        }
-        layout.addView(servoLabel)
-        val servoSeek = SeekBar(this).apply {
-            max = 180
-            progress = 90
-        }
-        servoSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                servoLabel.text = "舵机角度: $progress°"
-                if (fromUser) sendServoToReceiver(progress)
-            }
-            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
-            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
-        })
-        layout.addView(servoSeek, LinearLayout.LayoutParams(-1, LinearLayout.LayoutParams.WRAP_CONTENT))
 
         layout.addView(button("停止 / 回中") { sendFromGamepad(GamepadState(), force = true) })
         layout.addView(button("返回") {
@@ -226,8 +260,10 @@ class MainActivity : Activity() {
                 is ControlFrame.Gamepad -> {
                     if (receiverMode == ControlMode.MANUAL) {
                         if (bluetooth.isConnected()) {
-                            bluetooth.send(packet)
-                            log("Forwarded: ${packet.toHexLine()}")
+                            forwardExecutor.execute {
+                                bluetooth.send(packet)
+                                log("Forwarded: ${packet.toHexLine()}")
+                            }
                         } else {
                             runOnUiThread { updateReceiverEspStatus(false) }
                         }
@@ -235,8 +271,10 @@ class MainActivity : Activity() {
                 }
                 is ControlFrame.Servo -> {
                     if (bluetooth.isConnected()) {
-                        bluetooth.send(packet)
-                        log("Forwarded servo: idx=${frame.index} angle=${frame.angle}")
+                        forwardExecutor.execute {
+                            bluetooth.send(packet)
+                            log("Forwarded servo: idx=${frame.index} angle=${frame.angle}")
+                        }
                     } else {
                         runOnUiThread { updateReceiverEspStatus(false) }
                     }
@@ -248,14 +286,34 @@ class MainActivity : Activity() {
                         else -> applyReceiverDriveMode(frame.mode)
                     }
                 }
+                is ControlFrame.Command -> {
+                    /* 发送端远程触发: 自动扫描并连接 ESP32 */
+                    if (frame.code == ControlCommand.CMD_CONNECT_ESP32) {
+                        log("收到发送端指令：远程连接 ESP32")
+                        connectEsp32ByScan()
+                    }
+                }
             }
         }.also { it.start { msg -> log(msg) } }
+
+        /* 1Hz 向所有已连接发送端回传状态(ESP32 连接态 + 接收端当前模式),
+           这样发送端能被动感知接收端及 ESP32 的状态, 无需轮询。 */
+        receiverReporterTask = receiverReporter.scheduleAtFixedRate({
+            try {
+                controlServer?.send(StatusCommand.packet(bluetooth.isConnected(), receiverMode))
+            } catch (e: Exception) {
+                log("Status report failed: ${e.message}")
+            }
+        }, 0, 1, TimeUnit.SECONDS)
+
         log("Receiver services ready: control=$controlPort webrtc-signal=$videoPort")
     }
 
     private fun stopReceiverServices() {
         smartFollow?.stop()
         smartFollow = null
+        receiverReporterTask?.cancel(false)
+        receiverReporterTask = null
         discoveryResponder?.stop()
         controlServer?.stop()
         discoveryResponder = null
@@ -505,7 +563,7 @@ class MainActivity : Activity() {
         }
         if (!shouldSchedule) return
 
-        senderExecutor.execute {
+        senderServoExecutor.execute {
             val target = synchronized(senderServoLock) {
                 senderServoSendScheduled = false
                 senderServoTargetAngle
@@ -584,6 +642,12 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun toast(message: String) {
+        runOnUiThread {
+            Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+        }
+    }
+
     private fun logError(message: String, error: Throwable) {
         Log.e(tag, "$message on ${threadName()}: ${error.message}", error)
         log("$message: ${error.message}")
@@ -606,6 +670,9 @@ class MainActivity : Activity() {
         bluetooth.close()
         webRtcCall?.release()
         senderExecutor.shutdownNow()
+        senderServoExecutor.shutdownNow()
+        forwardExecutor.shutdownNow()
+        receiverReporter.shutdownNow()
         super.onDestroy()
     }
 }

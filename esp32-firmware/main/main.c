@@ -33,6 +33,9 @@
 #define SCAN_SECONDS 8
 #define RESCAN_DELAY_MS 3000
 #define CONTROL_VERBOSE_LOG 0
+/* 若 SPP 已"连接"但超过此时长没有任何数据到达, 判定为上一次(非正常)断连未被
+   栈上报, 强制复位连接态并重启 SPP 服务, 避免卡在"假连接"(灯不闪且无法重连)。 */
+#define SPP_STALE_MS 3000
 
 static const char *TAG = "cruise_car";
 static uint8_t rx_buffer[PACKET_SIZE];
@@ -41,6 +44,7 @@ static volatile bool spp_connected;
 static volatile bool hidh_opening;
 static volatile bool hidh_connected;
 static volatile TickType_t led_cmd_tick;   /* tick of last received command, 0 = none */
+static volatile TickType_t spp_last_data_tick; /* tick of last SPP byte received, 0 = none */
 #if CONTROL_VERBOSE_LOG
 static bool have_prev_buttons;
 static uint32_t prev_buttons;
@@ -238,6 +242,7 @@ static void maybe_stop_after_disconnect(void)
 
 static void feed_spp_bytes(const uint8_t *data, size_t len)
 {
+    spp_last_data_tick = xTaskGetTickCount();
     for (size_t i = 0; i < len; i++) {
         if (rx_len == 0 && data[i] != 0xAA) {
             continue;
@@ -301,6 +306,13 @@ static void spp_callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
     default:
         break;
     }
+}
+
+/* 重启 SPP 服务, 让接收端在(非正常)断连后可以重新发起连接。 */
+static void spp_rearm(void)
+{
+    ESP_LOGI(TAG, "re-arming SPP server");
+    esp_spp_start_srv(ESP_SPP_SEC_NONE, ESP_SPP_ROLE_SLAVE, 0, SPP_SERVER_NAME);
 }
 
 static void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id, void *event_data)
@@ -478,6 +490,15 @@ static void indicator_led_task(void *arg)
 
     while (true) {
         TickType_t now = xTaskGetTickCount();
+
+        /* 假连接看门狗: 已"连接"却长时间无数据 → 视为上次非正常断连未被栈上报,
+           复位连接态并重启 SPP 服务, 使接收端可以重新连接。 */
+        if (spp_connected && (now - spp_last_data_tick) > pdMS_TO_TICKS(SPP_STALE_MS)) {
+            ESP_LOGW(TAG, "SPP stale (no data for %ums), assuming dead link", SPP_STALE_MS);
+            spp_connected = false;
+            maybe_stop_after_disconnect();
+            spp_rearm();
+        }
 
         if (!any_connected()) {
             /* not paired → blink every 500 ms */
