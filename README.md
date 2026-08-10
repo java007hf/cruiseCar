@@ -1,5 +1,7 @@
 # CruiseCar
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 Smart cruise car project with two subprojects:
 
 - `android-app`: Android 6.0+ Kotlin app. It can run as a sender controller or a receiver mounted on the car.
@@ -7,25 +9,25 @@ Smart cruise car project with two subprojects:
 
 ## Hardware Requirements
 
-| 设备/模块 | 数量 | 用途说明 |
+| Device / Module | Qty | Purpose |
 | --- | ---: | --- |
-| ESP32 开发板 | 1 | 小车主控，负责接收 Android 接收端转发的控制包，并输出电机/舵机控制信号。 |
-| TB6612 双路电机驱动模块 | 1 | 驱动左右两路直流减速电机，支持正反转和 PWM 调速。 |
-| 520 减速电机 | 2 | 左右驱动轮动力来源；如使用带编码器版本，可接入 E1/E2 编码器反馈。 |
-| 双层/多孔小车底盘 | 1 | 固定 ESP32、电机驱动、电池、手机支架等硬件。 |
-| 车轮 | 2 | 与 520 减速电机连接，提供小车行走能力。 |
-| 万向轮/支撑轮 | 1 | 用于保持底盘平衡。 |
-| 电池/电池盒 | 1 | 给电机驱动、ESP32 等硬件供电；电机电源建议与逻辑电源按模块要求正确接线并共地。 |
-| Android 手机（接收端） | 1 | 安装在车体上，负责视频采集、目标检测/跟随，并通过蓝牙或 TCP 链路把控制指令转发给 ESP32。 |
-| Android 手机（发送端） | 1 | 作为遥控端，显示摇杆/视频画面并发送控制指令。 |
-| 手机支架/固定件 | 1 | 将接收端手机固定在车体前部，作为车载摄像头使用。 |
-| 杜邦线/排线/螺丝铜柱 | 若干 | 用于模块接线与结构固定。 |
-| 舵机（如 SG90/兼容 180° 舵机） | 1（可选） | 当前固件预留 GPIO18 输出 50Hz PWM，可用于摄像头俯仰或其他机械结构控制。 |
-| 蓝牙手柄 | 1（可选） | ESP32 HID Host 路径可直接接入手柄控制，Android SPP 路径也可同时保留。 |
+| ESP32 development board | 1 | Main controller. Receives control packets forwarded by the Android receiver and outputs motor/servo control signals. |
+| TB6612 dual-channel motor driver | 1 | Drives the left and right DC geared motors with direction control and PWM speed control. |
+| 520 geared DC motor | 2 | Left/right drive motors. Encoder versions can be connected to E1/E2 feedback inputs. |
+| Double-layer / perforated car chassis | 1 | Mounts ESP32, motor driver, battery, phone holder, and other hardware. |
+| Wheels | 2 | Connected to the 520 geared motors for movement. |
+| Caster / support wheel | 1 | Keeps the chassis balanced. |
+| Battery / battery holder | 1 | Powers the motor driver and ESP32. Follow module voltage requirements and share ground where required. |
+| Android phone (receiver) | 1 | Mounted on the car for video capture, object detection/following, and forwarding control commands to ESP32 over Bluetooth/TCP paths. |
+| Android phone (sender) | 1 | Remote controller that shows joystick/video UI and sends control commands. |
+| Phone holder / mounting parts | 1 | Holds the receiver phone at the front of the car as the onboard camera. |
+| Dupont wires / ribbon cables / screws / standoffs | Several | Wiring and mechanical mounting. |
+| Servo, e.g. SG90 or compatible 180° servo | 1 (optional) | Firmware reserves GPIO18 for 50Hz PWM, usable for camera tilt or other mechanisms. |
+| Bluetooth gamepad | 1 (optional) | Can control the car directly through the ESP32 HID Host path while keeping the Android SPP path available. |
 
 ## Project Appearance
 
-当前项目外观如下：接收端 Android 手机固定在小车前部作为车载摄像头，ESP32、电机驱动、电池和接线模块固定在多孔底盘上，左右两侧为 520 减速电机驱动车轮，后部/底部使用支撑轮保持平衡。
+Current physical build: the receiver Android phone is mounted at the front as the onboard camera; ESP32, motor driver, battery, and wiring modules are fixed on a perforated chassis; two side wheels are driven by 520 geared motors; a support wheel keeps the chassis balanced.
 
 ![CruiseCar project appearance](docs/images/cruisecar-appearance.jpeg)
 
