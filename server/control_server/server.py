@@ -1,0 +1,259 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+from dataclasses import dataclass
+from typing import Any
+
+from server.common.config import ServerConfig, load_config
+from server.common.protocol import PACKET_SIZE, FrameType, packet_to_hex, parse_packet
+from server.common.store import Store
+
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ReceiverSession:
+    device_id: str
+    writer: asyncio.StreamWriter
+    remote_addr: str
+    connected_at: float
+
+
+@dataclass
+class SenderSession:
+    sender_id: str
+    target_device_id: str
+    writer: asyncio.StreamWriter
+    remote_addr: str
+    connected_at: float
+
+
+class ConnectionHub:
+    def __init__(self, store: Store, config: ServerConfig):
+        self.store = store
+        self.config = config
+        self.receivers: dict[str, ReceiverSession] = {}
+        self.senders: dict[str, SenderSession] = {}
+        self._lock = asyncio.Lock()
+
+    async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        remote_addr = self._remote_addr(writer)
+        role = "unknown"
+        identity = ""
+        try:
+            hello = await asyncio.wait_for(reader.readline(), timeout=5)
+            if not hello:
+                return
+            meta = json.loads(hello.decode("utf-8"))
+            role = str(meta.get("role", "")).lower()
+
+            if role == "receiver":
+                identity = await self._register_receiver(meta, writer, remote_addr)
+                await self._receiver_loop(identity, reader)
+            elif role == "sender":
+                identity = await self._register_sender(meta, writer, remote_addr)
+                await self._sender_loop(identity, reader)
+            else:
+                await self._write_json(writer, {"ok": False, "error": "role must be receiver or sender"})
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            await self._write_json(writer, {"ok": False, "error": "first line must be json handshake"})
+        except PermissionError as exc:
+            await self._write_json(writer, {"ok": False, "error": str(exc)})
+        except asyncio.IncompleteReadError:
+            logger.info("%s %s disconnected", role, identity)
+        except Exception:
+            logger.exception("client error role=%s identity=%s", role, identity)
+        finally:
+            await self._disconnect(role, identity)
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def send_to_receiver(self, device_id: str, packet: bytes) -> bool:
+        session = self.receivers.get(device_id)
+        if not session:
+            return False
+        try:
+            session.writer.write(packet)
+            await session.writer.drain()
+            return True
+        except Exception:
+            await self._disconnect("receiver", device_id)
+            return False
+
+    async def flush_pending(self, device_id: str) -> int:
+        sent = 0
+        for command in self.store.take_pending_commands(device_id):
+            if await self.send_to_receiver(device_id, command["packet"]):
+                sent += 1
+                self.store.add_event(
+                    direction="manager_to_receiver",
+                    packet_hex=command["packet_hex"],
+                    device_id=device_id,
+                )
+            else:
+                break
+        return sent
+
+    async def _register_receiver(self, meta: dict[str, Any], writer: asyncio.StreamWriter, remote_addr: str) -> str:
+        device_id = str(meta.get("device_id") or meta.get("device-id") or "").strip()
+        if not device_id:
+            raise PermissionError("missing device_id")
+        self._check_token(self.store.get_receiver(device_id), meta.get("token"))
+        self.store.upsert_receiver(device_id, str(meta.get("name", "")), str(meta.get("token", "")))
+
+        async with self._lock:
+            old = self.receivers.get(device_id)
+            if old and old.writer is not writer:
+                old.writer.close()
+            self.receivers[device_id] = ReceiverSession(device_id, writer, remote_addr, time.time())
+        self.store.set_receiver_online(device_id, True, remote_addr)
+        await self._write_json(writer, {"ok": True, "role": "receiver", "device_id": device_id})
+        await self.flush_pending(device_id)
+        logger.info("receiver online device_id=%s addr=%s", device_id, remote_addr)
+        return device_id
+
+    async def _register_sender(self, meta: dict[str, Any], writer: asyncio.StreamWriter, remote_addr: str) -> str:
+        sender_id = str(meta.get("sender_id") or meta.get("client_id") or meta.get("client-id") or "").strip()
+        target_device_id = str(meta.get("target_device_id") or meta.get("device_id") or meta.get("device-id") or "").strip()
+        if not sender_id:
+            raise PermissionError("missing sender_id")
+        if not target_device_id:
+            raise PermissionError("missing target_device_id")
+        self._check_token(self.store.get_sender(sender_id), meta.get("token"))
+        self.store.upsert_sender(
+            sender_id,
+            str(meta.get("name", "")),
+            str(meta.get("token", "")),
+            target_device_id,
+        )
+
+        async with self._lock:
+            self.senders[sender_id] = SenderSession(sender_id, target_device_id, writer, remote_addr, time.time())
+        self.store.set_sender_online(sender_id, True, remote_addr)
+        await self._write_json(
+            writer,
+            {"ok": True, "role": "sender", "sender_id": sender_id, "target_device_id": target_device_id},
+        )
+        logger.info("sender online sender_id=%s target=%s addr=%s", sender_id, target_device_id, remote_addr)
+        return sender_id
+
+    async def _receiver_loop(self, device_id: str, reader: asyncio.StreamReader) -> None:
+        while True:
+            packet = await reader.readexactly(PACKET_SIZE)
+            parsed = parse_packet(packet)
+            packet_hex = packet_to_hex(packet)
+            if parsed is None:
+                self.store.add_event("receiver_invalid", packet_hex, device_id=device_id)
+                continue
+
+            if parsed.frame_type == FrameType.STATUS:
+                self.store.update_receiver_status(
+                    device_id,
+                    bool(parsed.payload.get("esp_connected")),
+                    str(parsed.payload.get("mode", "manual")),
+                )
+                await self._broadcast_status(device_id, packet)
+
+            self.store.add_event(
+                "receiver_to_server",
+                packet_hex,
+                device_id=device_id,
+                frame_type=parsed.frame_type.name.lower(),
+                payload=parsed.payload,
+            )
+            await self.flush_pending(device_id)
+
+    async def _sender_loop(self, sender_id: str, reader: asyncio.StreamReader) -> None:
+        while True:
+            packet = await reader.readexactly(PACKET_SIZE)
+            parsed = parse_packet(packet)
+            packet_hex = packet_to_hex(packet)
+            session = self.senders.get(sender_id)
+            target_device_id = session.target_device_id if session else ""
+            if parsed is None:
+                self.store.add_event("sender_invalid", packet_hex, device_id=target_device_id, sender_id=sender_id)
+                continue
+
+            delivered = await self.send_to_receiver(target_device_id, packet)
+            if not delivered:
+                self.store.enqueue_command(target_device_id, packet, packet_hex)
+            self.store.add_event(
+                "sender_to_receiver" if delivered else "sender_to_queue",
+                packet_hex,
+                device_id=target_device_id,
+                sender_id=sender_id,
+                frame_type=parsed.frame_type.name.lower(),
+                payload=parsed.payload,
+            )
+
+    async def _broadcast_status(self, device_id: str, packet: bytes) -> None:
+        stale: list[str] = []
+        for sender_id, sender in self.senders.items():
+            if sender.target_device_id != device_id:
+                continue
+            try:
+                sender.writer.write(packet)
+                await sender.writer.drain()
+            except Exception:
+                stale.append(sender_id)
+        for sender_id in stale:
+            await self._disconnect("sender", sender_id)
+
+    async def _disconnect(self, role: str, identity: str) -> None:
+        if not identity:
+            return
+        async with self._lock:
+            if role == "receiver" and self.receivers.pop(identity, None):
+                self.store.set_receiver_online(identity, False)
+                logger.info("receiver offline device_id=%s", identity)
+            elif role == "sender" and self.senders.pop(identity, None):
+                self.store.set_sender_online(identity, False)
+                logger.info("sender offline sender_id=%s", identity)
+
+    def _check_token(self, row: dict[str, Any] | None, token: Any) -> None:
+        expected = (row or {}).get("token") or self.config.auth_token
+        if expected and str(token or "") != str(expected):
+            raise PermissionError("invalid token")
+
+    @staticmethod
+    async def _write_json(writer: asyncio.StreamWriter, payload: dict[str, Any]) -> None:
+        writer.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+        await writer.drain()
+
+    @staticmethod
+    def _remote_addr(writer: asyncio.StreamWriter) -> str:
+        peer = writer.get_extra_info("peername")
+        if isinstance(peer, tuple) and len(peer) >= 2:
+            return f"{peer[0]}:{peer[1]}"
+        return str(peer or "")
+
+
+class ControlServer:
+    def __init__(self, config: ServerConfig | None = None, store: Store | None = None):
+        self.config = config or load_config()
+        self.store = store or Store(self.config.database_path)
+        self.hub = ConnectionHub(self.store, self.config)
+
+    async def start(self) -> None:
+        server = await asyncio.start_server(self.hub.handle_client, self.config.host, self.config.control_port)
+        sockets = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])
+        logger.info("control_server listening on %s", sockets)
+        async with server:
+            await server.serve_forever()
+
+
+async def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    await ControlServer().start()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
