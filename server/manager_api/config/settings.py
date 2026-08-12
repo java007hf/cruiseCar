@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
+ROOT_DIR = Path(__file__).resolve().parents[2]
 
 
 @dataclass(frozen=True)
@@ -13,6 +13,7 @@ class ServerConfig:
     control_port: int
     webrtc_port: int
     manager_port: int
+    manager_web_port: int
     database_path: Path
     auth_token: str
     heartbeat_timeout_seconds: int
@@ -28,6 +29,7 @@ def load_config() -> ServerConfig:
         control_port=int(os.getenv("CRUISECAR_CONTROL_PORT", "42110")),
         webrtc_port=int(os.getenv("CRUISECAR_WEBRTC_PORT", "42112")),
         manager_port=int(os.getenv("CRUISECAR_MANAGER_PORT", "8088")),
+        manager_web_port=int(os.getenv("CRUISECAR_MANAGER_WEB_PORT", "8089")),
         database_path=Path(
             os.getenv("CRUISECAR_DB", str(ROOT_DIR / "cruisecar.db"))
         ),

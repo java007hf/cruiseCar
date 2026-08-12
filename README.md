@@ -6,7 +6,7 @@ Smart cruise car project with three runtime subprojects:
 
 - `android-app`: Android 6.0+ Kotlin app. It can run as a sender controller or a receiver mounted on the car.
 - `esp32-firmware`: ESP-IDF firmware. ESP32 exposes a Classic Bluetooth SPP service, parses controller packets, and drives the TB6612 motor controller with encoder feedback.
-- `server`: Python remote-control gateway. It provides lightweight TCP control + WebRTC signaling relay, and an optional full manager API / embedded manager web UI for account-based device management.
+- `server`: Python remote-control gateway. It provides lightweight TCP control + WebRTC signaling relay, and optional full-mode `manager_api` + separately served `manager_web` for account-based device management.
 
 ## Hardware Requirements
 
@@ -69,7 +69,7 @@ The app can be started in three network modes from the home screen:
 
 - **LAN sender / LAN receiver**: the original local-network flow. The sender discovers receivers with UDP broadcast, then connects directly to the receiver phone on TCP `42101`; WebRTC signaling is also direct to the receiver phone on TCP `42102`.
 - **Server Light sender / receiver**: both phones manually enter the same server IP/domain and the receiver `device_id`. The receiver and sender each open an outbound TCP connection to `server:42110`; no account, manager API, database UI, or manager-web login is required. This is useful for Tailscale/ZeroTier/ngrok or a minimal public VPS.
-- **Server Full sender / receiver**: both phones log in with the same account through the manager API. The receiver joins the account as a managed device, and the sender queries the device list, selects a receiver, then controls it through `control_server`. This mode also exposes a small embedded manager-web page at the manager API root.
+- **Server Full sender / receiver**: both phones log in with the same account through the manager API. The receiver joins the account as a managed device, and the sender queries the device list, selects a receiver, then controls it through `control_server`. This mode also starts a small `manager_web` service separately from `manager_api`, similar to xiaozhi's split `manager-api` / `manager-web` layout.
 
 In server modes, WebRTC **media** still uses WebRTC's ICE path between the two Android devices whenever possible; the Python server only relays signaling (`offer`, `answer`, and ICE candidates) on TCP `42112`. For restrictive NAT/firewall environments, add a TURN server to the WebRTC ICE server list so media can fall back to TURN relay.
 
@@ -78,11 +78,13 @@ In server modes, WebRTC **media** still uses WebRTC's ICE path between the two A
 The Python server has two deployment modes, similar to `xiaozhi-esp32-server`:
 
 ```bash
-# Lightweight deployment: control relay + WebRTC signaling relay only.
-CRUISECAR_DEPLOYMENT=light python3 -m server.app
+cd server
 
-# Full deployment: lightweight services + manager-api + embedded manager-web.
-CRUISECAR_DEPLOYMENT=full python3 -m server.app
+# Lightweight deployment: control relay + WebRTC signaling relay only.
+CRUISECAR_DEPLOYMENT=light python3 -m control_server.server
+
+# Full deployment: lightweight services + manager-api + manager-web.
+CRUISECAR_DEPLOYMENT=full python3 -m control_server.server
 ```
 
 Environment variables:
@@ -92,15 +94,16 @@ CRUISECAR_DEPLOYMENT=light|full   # default: light
 CRUISECAR_HOST=0.0.0.0
 CRUISECAR_CONTROL_PORT=42110      # sender/receiver TCP control relay
 CRUISECAR_WEBRTC_PORT=42112       # WebRTC signaling relay
-CRUISECAR_MANAGER_PORT=8088       # manager-api / manager-web in full mode
+CRUISECAR_MANAGER_PORT=8088       # manager-api in full mode
+CRUISECAR_MANAGER_WEB_PORT=8089   # manager-web in full mode
 CRUISECAR_DB=server/cruisecar.db  # SQLite database path
 CRUISECAR_AUTH_TOKEN=             # optional global token for lightweight deployments
 ```
 
-Full-mode manager API / web UI:
+Full-mode manager API:
 
 ```text
-GET  /                         embedded manager-web
+GET  /                         manager-api service info
 POST /api/auth/login           login or auto-register account
 POST /api/receivers            add/update receiver under the logged-in account
 GET  /api/receivers            list receivers visible to the account
@@ -109,7 +112,7 @@ GET  /api/senders
 GET  /api/events?limit=100
 ```
 
-Open `http://server-ip:8088/` to use the embedded manager-web for login, receiver registration, device list, and event inspection.
+Open `http://server-ip:8089/` to use `manager_web` for login, receiver registration, device list, and event inspection. The web page calls `manager_api` on `http://server-ip:8088`.
 
 ## Directory Layout
 
@@ -131,10 +134,12 @@ Open `http://server-ip:8088/` to use the embedded manager-web for login, receive
 │   ├── main/
 │   └── scripts/
 ├── server/
-│   ├── app.py                  # starts light/full deployment
-│   ├── common/                 # config, packet protocol, SQLite store
-│   ├── control_server/         # TCP control relay + WebRTC signaling relay
-│   └── manager_api/            # manager API and embedded manager-web
+│   ├── control_server/         # TCP control relay + WebRTC signaling relay; service entrypoint
+│   ├── manager_api/            # full-mode HTTP API + config/protocol/storage
+│   │   ├── config/             # server settings
+│   │   ├── protocol/           # 10-byte control packet helpers
+│   │   └── storage/            # SQLite store
+│   └── manager_web/            # full-mode web UI, served separately from manager_api
 └── ml/
     ├── train_server.py          # web-based training platform (Flask + multimodal LLM + YOLO)
     ├── auto_label_orange.py     # helper used to bootstrap labels from the orange can region
@@ -195,7 +200,8 @@ LAN mode:
 Server mode:
   42110 TCP control relay
   42112 TCP WebRTC signaling relay
-  8088  HTTP manager-api / embedded manager-web (full mode only)
+  8088  HTTP manager-api (full mode only)
+  8089  HTTP manager-web (full mode only)
 ```
 
 ## Control Packet
@@ -287,7 +293,8 @@ JAVA_HOME=/path/to/jdk17 ./gradlew :app:assembleDebug
 Python server:
 
 ```bash
-python3 -m server.app
+cd server
+python3 -m control_server.server
 ```
 
 ESP32:

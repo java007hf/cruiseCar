@@ -6,13 +6,15 @@ import logging
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlparse
 
-from server.common.config import ServerConfig, load_config
-from server.common.protocol import packet_from_command, packet_to_hex, parse_packet
-from server.common.store import Store
-from server.control_server.server import ConnectionHub
+from manager_api.config.settings import ServerConfig, load_config
+from manager_api.protocol.control_protocol import packet_from_command, packet_to_hex, parse_packet
+from manager_api.storage.store import Store
+
+if TYPE_CHECKING:
+    from control_server.server import ConnectionHub
 
 
 logger = logging.getLogger(__name__)
@@ -64,7 +66,7 @@ class ManagerApi:
                 if path == "/health":
                     self._send_json({"ok": True, "service": "manager-api"})
                 elif path == "/":
-                    self._send_html(api.manager_web_html())
+                    self._send_json({"ok": True, "service": "manager-api", "manager_web_url": api.manager_web_url()})
                 elif path == "/api/receivers":
                     user = self._current_user()
                     data = api.store.list_receivers_for_user(user["username"]) if user else api.store.list_receivers()
@@ -168,14 +170,6 @@ class ManagerApi:
                 self.end_headers()
                 self.wfile.write(data)
 
-            def _send_html(self, html: str, status: HTTPStatus = HTTPStatus.OK) -> None:
-                data = html.encode("utf-8")
-                self.send_response(status.value)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-
             @staticmethod
             def _required(body: dict[str, Any], key: str) -> str:
                 value = str(body.get(key, "")).strip()
@@ -185,22 +179,8 @@ class ManagerApi:
 
         return Handler
 
-    @staticmethod
-    def manager_web_html() -> str:
-        return """<!doctype html><html><head><meta charset='utf-8'><title>CruiseCar Manager</title>
-<style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;margin:28px;background:#f7f7f7}input,button{font-size:15px;padding:8px;margin:4px}table{border-collapse:collapse;background:white;margin-top:12px}td,th{border:1px solid #ddd;padding:8px 12px}pre{background:#111;color:#0f0;padding:12px;white-space:pre-wrap}</style></head>
-<body><h2>CruiseCar Manager</h2>
-<div>账号 <input id='u' placeholder='username'> 密码 <input id='p' type='password' placeholder='password'><button onclick='login()'>登录/注册</button></div>
-<div>Token <input id='t' style='width:520px' placeholder='login token'></div>
-<h3>加入接收端</h3><input id='did' placeholder='device_id'><input id='dn' placeholder='name'><button onclick='addReceiver()'>加入</button>
-<h3>接收端列表</h3><button onclick='loadReceivers()'>刷新</button><div id='devices'></div><h3>事件</h3><button onclick='loadEvents()'>刷新事件</button><pre id='log'></pre>
-<script>
-async function api(path,opt={}){opt.headers=Object.assign({'Content-Type':'application/json'},opt.headers||{});let tok=document.getElementById('t').value;if(tok)opt.headers.Authorization='Bearer '+tok;let r=await fetch(path,opt);let j=await r.json();if(!j.ok)throw new Error(j.error||'failed');return j.data||j}
-async function login(){let d=await api('/api/auth/login',{method:'POST',body:JSON.stringify({username:u.value,password:p.value})});t.value=d.token;loadReceivers()}
-async function addReceiver(){await api('/api/receivers',{method:'POST',body:JSON.stringify({device_id:did.value,name:dn.value})});loadReceivers()}
-async function loadReceivers(){let rows=await api('/api/receivers');devices.innerHTML='<table><tr><th>ID</th><th>名称</th><th>在线</th><th>ESP32</th><th>模式</th><th>地址</th></tr>'+rows.map(x=>`<tr><td>${x.device_id}</td><td>${x.name||''}</td><td>${x.online}</td><td>${x.esp_connected}</td><td>${x.mode}</td><td>${x.remote_addr||''}</td></tr>`).join('')+'</table>'}
-async function loadEvents(){let rows=await api('/api/events?limit=50');log.textContent=JSON.stringify(rows,null,2)}
-</script></body></html>"""
+    def manager_web_url(self) -> str:
+        return f"http://{self.config.host}:{self.config.manager_web_port}/"
 
     def dispatch_command(self, device_id: str, command: dict[str, Any]) -> dict[str, Any]:
         if not self.store.get_receiver(device_id):

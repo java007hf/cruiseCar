@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from server.common.config import ServerConfig, load_config
+from manager_api.config.settings import ServerConfig, load_config
 
 
 logger = logging.getLogger(__name__)
@@ -153,4 +153,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-

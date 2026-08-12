@@ -6,7 +6,7 @@
 
 - `android-app`：Android 6.0+ Kotlin 应用，可作为发送端遥控器，也可作为安装在车上的接收端。
 - `esp32-firmware`：ESP-IDF 固件。ESP32 暴露 Classic Bluetooth SPP 服务，解析控制包，并通过 TB6612 电机驱动控制小车电机，同时支持编码器反馈。
-- `server`：Python 远程控制网关。提供轻量级 TCP 控制转发和 WebRTC 信令转发，也支持可选的全量 manager-api / 内置 manager-web，用于账号化设备管理。
+- `server`：Python 远程控制网关。提供轻量级 TCP 控制转发和 WebRTC 信令转发，也支持可选的全量 `manager_api` + 独立 `manager_web`，用于账号化设备管理。
 
 ## 硬件清单
 
@@ -69,7 +69,7 @@ ESP32 当前可同时支持两种输入路径：接收端 Android 应用通过 C
 
 - **局域网发送端 / 接收端**：保留原有局域网流程。发送端通过 UDP 广播发现接收端，再直连接收端手机的 TCP `42101` 控制端口；WebRTC 信令也直连接收端手机的 TCP `42102` 端口。
 - **服务器 Light 发送端 / 接收端**：两台手机分别手动输入同一个服务器 IP/域名和接收端 `device_id`。接收端与发送端都会主动连接 `server:42110`；不需要账号、manager-api、数据库 UI 或 manager-web 登录。适合 Tailscale/ZeroTier/ngrok 或最小化公网 VPS。
-- **服务器 Full 发送端 / 接收端**：两台手机使用同一个账号登录 manager-api。接收端加入该账号成为受管理设备；发送端查询设备列表、选择接收端后通过 `control_server` 控制它。该模式同时在 manager-api 根路径提供一个轻量内置 manager-web 页面。
+- **服务器 Full 发送端 / 接收端**：两台手机使用同一个账号登录 manager-api。接收端加入该账号成为受管理设备；发送端查询设备列表、选择接收端后通过 `control_server` 控制它。该模式会单独启动 `manager_web` 服务，和 xiaozhi 的 `manager-api` / `manager-web` 拆分方式保持一致。
 
 服务器模式下，WebRTC **媒体流**仍尽量走两台 Android 设备之间的 ICE/P2P 链路；Python server 只在 TCP `42112` 上转发信令（`offer`、`answer` 和 ICE candidates）。如果遇到严格 NAT 或防火墙环境，建议后续给 WebRTC 增加 TURN 服务器，让媒体流可回退到 TURN 中继。
 
@@ -78,11 +78,13 @@ ESP32 当前可同时支持两种输入路径：接收端 Android 应用通过 C
 Python server 支持类似 `xiaozhi-esp32-server` 的轻量部署和全量部署：
 
 ```bash
-# 轻量部署：仅启动控制转发 + WebRTC 信令转发。
-CRUISECAR_DEPLOYMENT=light python3 -m server.app
+cd server
 
-# 全量部署：轻量能力 + manager-api + 内置 manager-web。
-CRUISECAR_DEPLOYMENT=full python3 -m server.app
+# 轻量部署：仅启动控制转发 + WebRTC 信令转发。
+CRUISECAR_DEPLOYMENT=light python3 -m control_server.server
+
+# 全量部署：轻量能力 + manager-api + manager-web。
+CRUISECAR_DEPLOYMENT=full python3 -m control_server.server
 ```
 
 环境变量：
@@ -92,15 +94,16 @@ CRUISECAR_DEPLOYMENT=light|full   # 默认 light
 CRUISECAR_HOST=0.0.0.0
 CRUISECAR_CONTROL_PORT=42110      # 发送端/接收端 TCP 控制转发
 CRUISECAR_WEBRTC_PORT=42112       # WebRTC 信令转发
-CRUISECAR_MANAGER_PORT=8088       # full 模式下 manager-api / manager-web
+CRUISECAR_MANAGER_PORT=8088       # full 模式下 manager-api
+CRUISECAR_MANAGER_WEB_PORT=8089   # full 模式下 manager-web
 CRUISECAR_DB=server/cruisecar.db  # SQLite 数据库路径
 CRUISECAR_AUTH_TOKEN=             # 可选全局 token，适合轻量部署
 ```
 
-Full 模式 manager API / Web UI：
+Full 模式 manager API：
 
 ```text
-GET  /                         内置 manager-web
+GET  /                         manager-api 服务信息
 POST /api/auth/login           登录或自动注册账号
 POST /api/receivers            在当前账号下加入/更新接收端
 GET  /api/receivers            查询当前账号可见接收端
@@ -109,7 +112,7 @@ GET  /api/senders
 GET  /api/events?limit=100
 ```
 
-浏览器打开 `http://server-ip:8088/` 可使用内置 manager-web 进行登录、加入接收端、查看设备列表和事件。
+浏览器打开 `http://server-ip:8089/` 可使用 `manager_web` 进行登录、加入接收端、查看设备列表和事件；页面会调用 `http://server-ip:8088` 上的 `manager_api`。
 
 ## 目录结构
 
@@ -131,10 +134,12 @@ GET  /api/events?limit=100
 │   ├── main/
 │   └── scripts/
 ├── server/
-│   ├── app.py                  # 启动 light/full 部署
-│   ├── common/                 # 配置、控制包协议、SQLite 存储
-│   ├── control_server/         # TCP 控制转发 + WebRTC 信令转发
-│   └── manager_api/            # manager API 和内置 manager-web
+│   ├── control_server/         # TCP 控制转发 + WebRTC 信令转发；服务入口
+│   ├── manager_api/            # full 模式 HTTP API + config/protocol/storage
+│   │   ├── config/             # 服务配置
+│   │   ├── protocol/           # 10 字节控制包协议工具
+│   │   └── storage/            # SQLite 存储
+│   └── manager_web/            # full 模式 Web UI，和 manager_api 独立启动
 └── ml/
     ├── train_server.py          # Web 训练平台（Flask + 多模态 LLM + YOLO）
     ├── auto_label_orange.py     # 用于从橙色罐区域快速生成初始标签的辅助脚本
@@ -162,7 +167,8 @@ TCP 端口：
 服务器模式：
   42110 TCP 控制转发
   42112 TCP WebRTC 信令转发
-  8088  HTTP manager-api / 内置 manager-web（仅 full 模式）
+  8088  HTTP manager-api（仅 full 模式）
+  8089  HTTP manager-web（仅 full 模式）
 ```
 
 ## 控制包
@@ -254,7 +260,8 @@ JAVA_HOME=/path/to/jdk17 ./gradlew :app:assembleDebug
 Python server：
 
 ```bash
-python3 -m server.app
+cd server
+python3 -m control_server.server
 ```
 
 ESP32：
