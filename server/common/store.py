@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import secrets
 import sqlite3
 import time
 from pathlib import Path
@@ -26,6 +28,7 @@ class Store:
                 """
                 CREATE TABLE IF NOT EXISTS receivers (
                     device_id TEXT PRIMARY KEY,
+                    owner_username TEXT NOT NULL DEFAULT '',
                     name TEXT NOT NULL DEFAULT '',
                     token TEXT NOT NULL DEFAULT '',
                     online INTEGER NOT NULL DEFAULT 0,
@@ -39,6 +42,7 @@ class Store:
 
                 CREATE TABLE IF NOT EXISTS senders (
                     sender_id TEXT PRIMARY KEY,
+                    owner_username TEXT NOT NULL DEFAULT '',
                     name TEXT NOT NULL DEFAULT '',
                     token TEXT NOT NULL DEFAULT '',
                     target_device_id TEXT NOT NULL DEFAULT '',
@@ -69,39 +73,85 @@ class Store:
                     created_at REAL NOT NULL,
                     sent_at REAL
                 );
+
+                CREATE TABLE IF NOT EXISTS users (
+                    username TEXT PRIMARY KEY,
+                    password_hash TEXT NOT NULL,
+                    token TEXT NOT NULL UNIQUE,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
                 """
             )
+            self._ensure_column(conn, "receivers", "owner_username", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "senders", "owner_username", "TEXT NOT NULL DEFAULT ''")
 
-    def upsert_receiver(self, device_id: str, name: str = "", token: str = "") -> dict[str, Any]:
+    def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        if column not in {row["name"] for row in rows}:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+    def create_or_login_user(self, username: str, password: str) -> dict[str, Any]:
+        username = username.strip()
+        if not username:
+            raise ValueError("username is required")
+        if not password:
+            raise ValueError("password is required")
+        password_hash = self._password_hash(password)
+        now = time.time()
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+            if row:
+                if row["password_hash"] != password_hash:
+                    raise PermissionError("invalid username or password")
+                token = row["token"]
+                conn.execute("UPDATE users SET updated_at=? WHERE username=?", (now, username))
+            else:
+                token = secrets.token_urlsafe(32)
+                conn.execute(
+                    "INSERT INTO users(username, password_hash, token, created_at, updated_at) VALUES(?, ?, ?, ?, ?)",
+                    (username, password_hash, token, now, now),
+                )
+        return {"username": username, "token": token}
+
+    def user_by_token(self, token: str) -> dict[str, Any] | None:
+        if not token:
+            return None
+        row = self._get_one("SELECT username, token, created_at, updated_at FROM users WHERE token=?", (token,))
+        return row
+
+    def upsert_receiver(self, device_id: str, name: str = "", token: str = "", owner_username: str = "") -> dict[str, Any]:
         now = time.time()
         with self.connect() as conn:
             conn.execute(
                 """
-                INSERT INTO receivers(device_id, name, token, created_at, updated_at)
-                VALUES(?, ?, ?, ?, ?)
+                INSERT INTO receivers(device_id, owner_username, name, token, created_at, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?)
                 ON CONFLICT(device_id) DO UPDATE SET
+                    owner_username=COALESCE(NULLIF(excluded.owner_username, ''), receivers.owner_username),
                     name=COALESCE(NULLIF(excluded.name, ''), receivers.name),
                     token=COALESCE(NULLIF(excluded.token, ''), receivers.token),
                     updated_at=excluded.updated_at
                 """,
-                (device_id, name, token, now, now),
+                (device_id, owner_username, name, token, now, now),
             )
         return self.get_receiver(device_id) or {}
 
-    def upsert_sender(self, sender_id: str, name: str = "", token: str = "", target_device_id: str = "") -> dict[str, Any]:
+    def upsert_sender(self, sender_id: str, name: str = "", token: str = "", target_device_id: str = "", owner_username: str = "") -> dict[str, Any]:
         now = time.time()
         with self.connect() as conn:
             conn.execute(
                 """
-                INSERT INTO senders(sender_id, name, token, target_device_id, created_at, updated_at)
-                VALUES(?, ?, ?, ?, ?, ?)
+                INSERT INTO senders(sender_id, owner_username, name, token, target_device_id, created_at, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(sender_id) DO UPDATE SET
+                    owner_username=COALESCE(NULLIF(excluded.owner_username, ''), senders.owner_username),
                     name=COALESCE(NULLIF(excluded.name, ''), senders.name),
                     token=COALESCE(NULLIF(excluded.token, ''), senders.token),
                     target_device_id=COALESCE(NULLIF(excluded.target_device_id, ''), senders.target_device_id),
                     updated_at=excluded.updated_at
                 """,
-                (sender_id, name, token, target_device_id, now, now),
+                (sender_id, owner_username, name, token, target_device_id, now, now),
             )
         return self.get_sender(sender_id) or {}
 
@@ -150,8 +200,18 @@ class Store:
     def list_receivers(self) -> list[dict[str, Any]]:
         return self._get_all("SELECT * FROM receivers ORDER BY updated_at DESC")
 
+    def list_receivers_for_user(self, username: str) -> list[dict[str, Any]]:
+        return self._get_all(
+            "SELECT * FROM receivers WHERE owner_username=? ORDER BY updated_at DESC", (username,)
+        )
+
     def list_senders(self) -> list[dict[str, Any]]:
         return self._get_all("SELECT * FROM senders ORDER BY updated_at DESC")
+
+    def list_senders_for_user(self, username: str) -> list[dict[str, Any]]:
+        return self._get_all(
+            "SELECT * FROM senders WHERE owner_username=? ORDER BY updated_at DESC", (username,)
+        )
 
     def add_event(
         self,
@@ -232,3 +292,6 @@ class Store:
                 data[key] = bool(data[key])
         return data
 
+    @staticmethod
+    def _password_hash(password: str) -> str:
+        return hashlib.sha256(password.encode("utf-8")).hexdigest()

@@ -218,6 +218,8 @@ class ConnectionHub:
                 logger.info("sender offline sender_id=%s", identity)
 
     def _check_token(self, row: dict[str, Any] | None, token: Any) -> None:
+        if self.store.user_by_token(str(token or "")):
+            return
         expected = (row or {}).get("token") or self.config.auth_token
         if expected and str(token or "") != str(expected):
             raise PermissionError("invalid token")
@@ -256,4 +258,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-

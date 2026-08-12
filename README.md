@@ -2,10 +2,11 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-Smart cruise car project with two subprojects:
+Smart cruise car project with three runtime subprojects:
 
 - `android-app`: Android 6.0+ Kotlin app. It can run as a sender controller or a receiver mounted on the car.
 - `esp32-firmware`: ESP-IDF firmware. ESP32 exposes a Classic Bluetooth SPP service, parses controller packets, and drives the TB6612 motor controller with encoder feedback.
+- `server`: Python remote-control gateway. It provides lightweight TCP control + WebRTC signaling relay, and an optional full manager API / embedded manager web UI for account-based device management.
 
 ## Hardware Requirements
 
@@ -35,9 +36,11 @@ Current physical build: the receiver Android phone is mounted at the front as th
 
 ```text
 Sender Android
-  UDP broadcast discovery
-  TCP control channel
+  LAN mode: UDP discovery + direct TCP control + direct WebRTC signaling
+  Server mode: TCP control via Python control_server + WebRTC signaling relay
 Receiver Android
+  LAN mode: local TCP control server + local WebRTC signaling server
+  Server mode: outbound TCP connection to Python control_server + signaling relay
   Classic Bluetooth SPP
 Bluetooth HID Gamepad
   Classic Bluetooth / BLE HID
@@ -62,6 +65,52 @@ The sender and receiver apps now share a 10-byte TCP control frame model:
 - Smart patrol: reserved mode frame and UI entry. The receiver stops motion and logs the selected mode until route planning is added.
 - OpenCV object demo: app camera preview feeds frames into a YOLO TFLite detector, detection results are rendered as rectangle overlays on top of the camera view. The detector consumes a `frameProvider` abstraction so the same camera frame path can later be shared with WebRTC sending.
 
+The app can be started in three network modes from the home screen:
+
+- **LAN sender / LAN receiver**: the original local-network flow. The sender discovers receivers with UDP broadcast, then connects directly to the receiver phone on TCP `42101`; WebRTC signaling is also direct to the receiver phone on TCP `42102`.
+- **Server Light sender / receiver**: both phones manually enter the same server IP/domain and the receiver `device_id`. The receiver and sender each open an outbound TCP connection to `server:42110`; no account, manager API, database UI, or manager-web login is required. This is useful for Tailscale/ZeroTier/ngrok or a minimal public VPS.
+- **Server Full sender / receiver**: both phones log in with the same account through the manager API. The receiver joins the account as a managed device, and the sender queries the device list, selects a receiver, then controls it through `control_server`. This mode also exposes a small embedded manager-web page at the manager API root.
+
+In server modes, WebRTC **media** still uses WebRTC's ICE path between the two Android devices whenever possible; the Python server only relays signaling (`offer`, `answer`, and ICE candidates) on TCP `42112`. For restrictive NAT/firewall environments, add a TURN server to the WebRTC ICE server list so media can fall back to TURN relay.
+
+## Python Server
+
+The Python server has two deployment modes, similar to `xiaozhi-esp32-server`:
+
+```bash
+# Lightweight deployment: control relay + WebRTC signaling relay only.
+CRUISECAR_DEPLOYMENT=light python3 -m server.app
+
+# Full deployment: lightweight services + manager-api + embedded manager-web.
+CRUISECAR_DEPLOYMENT=full python3 -m server.app
+```
+
+Environment variables:
+
+```text
+CRUISECAR_DEPLOYMENT=light|full   # default: light
+CRUISECAR_HOST=0.0.0.0
+CRUISECAR_CONTROL_PORT=42110      # sender/receiver TCP control relay
+CRUISECAR_WEBRTC_PORT=42112       # WebRTC signaling relay
+CRUISECAR_MANAGER_PORT=8088       # manager-api / manager-web in full mode
+CRUISECAR_DB=server/cruisecar.db  # SQLite database path
+CRUISECAR_AUTH_TOKEN=             # optional global token for lightweight deployments
+```
+
+Full-mode manager API / web UI:
+
+```text
+GET  /                         embedded manager-web
+POST /api/auth/login           login or auto-register account
+POST /api/receivers            add/update receiver under the logged-in account
+GET  /api/receivers            list receivers visible to the account
+POST /api/receivers/{id}/commands
+GET  /api/senders
+GET  /api/events?limit=100
+```
+
+Open `http://server-ip:8088/` to use the embedded manager-web for login, receiver registration, device list, and event inspection.
+
 ## Directory Layout
 
 ```text
@@ -81,6 +130,11 @@ The sender and receiver apps now share a 10-byte TCP control frame model:
 ├── esp32-gamepad-hid-demo/
 │   ├── main/
 │   └── scripts/
+├── server/
+│   ├── app.py                  # starts light/full deployment
+│   ├── common/                 # config, packet protocol, SQLite store
+│   ├── control_server/         # TCP control relay + WebRTC signaling relay
+│   └── manager_api/            # manager API and embedded manager-web
 └── ml/
     ├── train_server.py          # web-based training platform (Flask + multimodal LLM + YOLO)
     ├── auto_label_orange.py     # helper used to bootstrap labels from the orange can region
@@ -133,9 +187,15 @@ yolov8s-worldv2.pt
 TCP ports:
 
 ```text
-42100 UDP discovery
-42101 TCP control frames
-42102 TCP WebRTC signaling
+LAN mode:
+  42100 UDP discovery
+  42101 TCP control frames
+  42102 TCP WebRTC signaling
+
+Server mode:
+  42110 TCP control relay
+  42112 TCP WebRTC signaling relay
+  8088  HTTP manager-api / embedded manager-web (full mode only)
 ```
 
 ## Control Packet
@@ -216,6 +276,18 @@ Android:
 ```powershell
 cd android-app
 .\gradlew.bat assembleDebug
+```
+
+On macOS/Linux, ensure Java 17 is selected for the Android Gradle plugin, for example:
+
+```bash
+JAVA_HOME=/path/to/jdk17 ./gradlew :app:assembleDebug
+```
+
+Python server:
+
+```bash
+python3 -m server.app
 ```
 
 ESP32:

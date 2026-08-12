@@ -15,6 +15,7 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -31,6 +32,9 @@ class MainActivity : Activity() {
     private val appVersionLabel = "v0.1.3-camera-switch"
     private val controlPort = 42101
     private val videoPort = 42102
+    private val remoteControlPort = 42110
+    private val remoteWebRtcPort = 42112
+    private val remoteManagerPort = 8088
     private val controlClient = ControlClient()
     private val bluetooth = BluetoothSppClient()
     private val senderExecutor = Executors.newSingleThreadExecutor()
@@ -56,6 +60,12 @@ class MainActivity : Activity() {
     private var webRtcCall: WebRtcCall? = null
     private lateinit var logView: TextView
     private var connectedReceiverHost: String? = null
+    private var connectionMode = ConnectionMode.LAN
+    private var remoteHost = ""
+    private var remoteToken = ""
+    private var remoteDeviceId = ""
+    private var remoteSenderId = ""
+    private var remoteManagerBaseUrl = ""
     private var senderMode = ControlMode.MANUAL
     private var receiverMode = ControlMode.MANUAL
     private var senderVideoEnabled = false
@@ -73,6 +83,8 @@ class MainActivity : Activity() {
     private val senderServoLock = Any()
     private var backAction: (() -> Unit)? = null
 
+    private enum class ConnectionMode { LAN, SERVER_LIGHT, SERVER_FULL }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         log("CruiseCar APK debug $appVersionLabel started")
@@ -87,8 +99,91 @@ class MainActivity : Activity() {
         layout.addView(button("调试台 (识别 + 遥控)") {
             startActivity(Intent(this, DebugActivity::class.java))
         })
-        layout.addView(button("发送端") { showSenderScreen() })
-        layout.addView(button("接收端") { showReceiverScreen() })
+        layout.addView(button("发送端 - 局域网") { connectionMode = ConnectionMode.LAN; showSenderScreen() })
+        layout.addView(button("接收端 - 局域网") { connectionMode = ConnectionMode.LAN; showReceiverScreen() })
+        layout.addView(button("发送端 - 服务器 Light") { showServerLightSetup(isSender = true) })
+        layout.addView(button("接收端 - 服务器 Light") { showServerLightSetup(isSender = false) })
+        layout.addView(button("发送端 - 服务器 Full") { showServerFullSetup(isSender = true) })
+        layout.addView(button("接收端 - 服务器 Full") { showServerFullSetup(isSender = false) })
+        setContentView(withLog(layout))
+    }
+
+    private fun showServerLightSetup(isSender: Boolean) {
+        backAction = { showRoleScreen() }
+        val layout = rootLayout()
+        layout.addView(title("服务器 Light 配置"))
+        val hostInput = input("服务器 IP / 域名", remoteHost)
+        val deviceInput = input("接收端设备ID", if (remoteDeviceId.isNotBlank()) remoteDeviceId else "car-001")
+        val senderInput = input("发送端ID", if (remoteSenderId.isNotBlank()) remoteSenderId else "phone-${System.currentTimeMillis() % 100000}")
+        layout.addView(hostInput)
+        layout.addView(deviceInput)
+        if (isSender) layout.addView(senderInput)
+        layout.addView(button("进入${if (isSender) "发送端" else "接收端"}") {
+            remoteHost = hostInput.text.toString().trim()
+            remoteDeviceId = deviceInput.text.toString().trim()
+            remoteSenderId = senderInput.text.toString().trim()
+            remoteToken = ""
+            connectionMode = ConnectionMode.SERVER_LIGHT
+            if (isSender) showSenderScreen() else showReceiverScreen()
+        })
+        layout.addView(button("返回") { showRoleScreen() })
+        setContentView(withLog(layout))
+    }
+
+    private fun showServerFullSetup(isSender: Boolean) {
+        backAction = { showRoleScreen() }
+        val layout = rootLayout()
+        layout.addView(title("服务器 Full 登录"))
+        val hostInput = input("服务器 IP / 域名", remoteHost)
+        val userInput = input("账号", "demo")
+        val passInput = input("密码", "demo")
+        val deviceInput = input("接收端设备ID", if (remoteDeviceId.isNotBlank()) remoteDeviceId else "car-001")
+        layout.addView(hostInput)
+        layout.addView(userInput)
+        layout.addView(passInput)
+        if (!isSender) layout.addView(deviceInput)
+        layout.addView(button(if (isSender) "登录并选择设备" else "登录并加入接收端") {
+            Thread {
+                try {
+                    remoteHost = hostInput.text.toString().trim()
+                    remoteManagerBaseUrl = "http://$remoteHost:$remoteManagerPort"
+                    remoteToken = RemoteApi.login(remoteManagerBaseUrl, userInput.text.toString(), passInput.text.toString())
+                    connectionMode = ConnectionMode.SERVER_FULL
+                    if (isSender) {
+                        val devices = RemoteApi.listReceivers(remoteManagerBaseUrl, remoteToken)
+                        if (devices.isEmpty()) {
+                            log("账号下暂无接收端，请先用接收端加入")
+                        } else {
+                            remoteSenderId = "phone-${System.currentTimeMillis() % 100000}"
+                            runOnUiThread { showDevicePicker(devices) }
+                        }
+                    } else {
+                        remoteDeviceId = deviceInput.text.toString().trim()
+                        RemoteApi.addReceiver(remoteManagerBaseUrl, remoteToken, remoteDeviceId, remoteDeviceId)
+                        log("接收端已加入账号: $remoteDeviceId")
+                        runOnUiThread { showReceiverScreen() }
+                    }
+                } catch (e: Exception) {
+                    log("Full 模式登录/配置失败: ${e.message}")
+                }
+            }.start()
+        })
+        layout.addView(button("返回") { showRoleScreen() })
+        setContentView(withLog(layout))
+    }
+
+    private fun showDevicePicker(devices: List<RemoteReceiver>) {
+        backAction = { showServerFullSetup(isSender = true) }
+        val layout = rootLayout()
+        layout.addView(title("选择接收端"))
+        devices.forEach { device ->
+            layout.addView(button("${device.name.ifBlank { device.deviceId }} | ${if (device.online) "在线" else "离线"} | ESP32=${device.espConnected}") {
+                remoteDeviceId = device.deviceId
+                log("已选择接收端: ${device.deviceId}")
+                showSenderScreen()
+            })
+        }
+        layout.addView(button("返回") { showServerFullSetup(isSender = true) })
         setContentView(withLog(layout))
     }
 
@@ -106,11 +201,11 @@ class MainActivity : Activity() {
         val videoArea = VideoGamepadView(this)
         senderVideoArea = videoArea
         val remoteVideo = createSenderVideoRenderer(videoArea)
-        videoArea.onStateChanged = { state ->
+        videoArea.onStateChanged = stateChanged@{ state ->
             if (senderMode != ControlMode.MANUAL) {
                 /* 用户在非手动模式下操作了摇杆(lx/ly 有实际输入), 自动退出智能模式回到手动遥控 */
                 val controlling = state.lx != 128 || state.ly != 128 || state.buttons != 0
-                if (!controlling) return@onStateChanged
+                if (!controlling) return@stateChanged
                 val exited = senderMode
                 senderMode = ControlMode.MANUAL
                 sendMode(ControlMode.MANUAL)
@@ -150,28 +245,11 @@ class MainActivity : Activity() {
             }
         }
 
-        layout.addView(button("扫描接收端并连接") {
-            Thread {
-                try {
-                    val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-                    val receivers = DiscoveryScanner(wifi).scan { log(it) }
-                    if (receivers.isNotEmpty()) {
-                        val receiver = receivers.first()
-                        connectedReceiverHost = receiver.host
-                        controlClient.connect(receiver.host, receiver.port) { log(it) }
-                        sendFromGamepad(GamepadState(), force = true)
-                    } else {
-                        log("No receiver found")
-                    }
-                } catch (e: Exception) {
-                    log("Scan/connect failed: ${e.message}")
-                }
-            }.start()
-        })
+        layout.addView(button(senderConnectButtonText()) { connectSenderByMode() })
 
         layout.addView(button("远程连接 ESP32") {
             if (controlClient.isConnected()) {
-                controlClient.sendCommand(ControlCommand.CMD_CONNECT_ESP32)
+                controlClient.sendCommand(ControlProtocol.CMD_CONNECT_ESP32)
                 log("已向接收端下发指令：自动扫描并连接 ESP32")
             } else {
                 log("未连接接收端，无法远程触发 ESP32 连接")
@@ -254,46 +332,13 @@ class MainActivity : Activity() {
     }
 
     private fun startReceiverServices() {
+        if (connectionMode != ConnectionMode.LAN) {
+            startRemoteReceiverServices()
+            return
+        }
         discoveryResponder = DiscoveryResponder(controlPort).also { it.start { msg -> log(msg) } }
         controlServer = ControlServer(controlPort) { packet, frame ->
-            when (frame) {
-                is ControlFrame.Gamepad -> {
-                    if (receiverMode == ControlMode.MANUAL) {
-                        if (bluetooth.isConnected()) {
-                            forwardExecutor.execute {
-                                bluetooth.send(packet)
-                                log("Forwarded: ${packet.toHexLine()}")
-                            }
-                        } else {
-                            runOnUiThread { updateReceiverEspStatus(false) }
-                        }
-                    }
-                }
-                is ControlFrame.Servo -> {
-                    if (bluetooth.isConnected()) {
-                        forwardExecutor.execute {
-                            bluetooth.send(packet)
-                            log("Forwarded servo: idx=${frame.index} angle=${frame.angle}")
-                        }
-                    } else {
-                        runOnUiThread { updateReceiverEspStatus(false) }
-                    }
-                }
-                is ControlFrame.Mode -> runOnUiThread {
-                    when (frame.mode) {
-                        ControlMode.VIDEO_CALL -> setReceiverVideoEnabled(true)
-                        ControlMode.VIDEO_OFF -> setReceiverVideoEnabled(false)
-                        else -> applyReceiverDriveMode(frame.mode)
-                    }
-                }
-                is ControlFrame.Command -> {
-                    /* 发送端远程触发: 自动扫描并连接 ESP32 */
-                    if (frame.code == ControlCommand.CMD_CONNECT_ESP32) {
-                        log("收到发送端指令：远程连接 ESP32")
-                        connectEsp32ByScan()
-                    }
-                }
-            }
+            handleReceiverControlFrame(packet, frame)
         }.also { it.start { msg -> log(msg) } }
 
         /* 1Hz 向所有已连接发送端回传状态(ESP32 连接态 + 接收端当前模式),
@@ -309,6 +354,61 @@ class MainActivity : Activity() {
         log("Receiver services ready: control=$controlPort webrtc-signal=$videoPort")
     }
 
+    private fun startRemoteReceiverServices() {
+        controlClient.onFrame = { packet, frame -> handleReceiverControlFrame(packet, frame) }
+        Thread {
+            try {
+                controlClient.connectRemoteReceiver(remoteHost, remoteControlPort, remoteDeviceId, remoteToken) { log(it) }
+                log("Remote receiver ready: device=$remoteDeviceId server=$remoteHost")
+            } catch (e: Exception) {
+                log("Remote receiver connect failed: ${e.message}")
+            }
+        }.start()
+        receiverReporterTask = receiverReporter.scheduleAtFixedRate({
+            try {
+                if (controlClient.isConnected()) {
+                    controlClient.sendRaw(StatusCommand.packet(bluetooth.isConnected(), receiverMode))
+                }
+            } catch (e: Exception) {
+                log("Remote status report failed: ${e.message}")
+            }
+        }, 1, 1, TimeUnit.SECONDS)
+    }
+
+    private fun handleReceiverControlFrame(packet: ByteArray, frame: ControlFrame) {
+        when (frame) {
+            is ControlFrame.Gamepad -> {
+                if (receiverMode == ControlMode.MANUAL) forwardToEsp32(packet, "Forwarded: ${packet.toHexLine()}")
+            }
+            is ControlFrame.Servo -> forwardToEsp32(packet, "Forwarded servo: idx=${frame.index} angle=${frame.angle}")
+            is ControlFrame.Mode -> runOnUiThread {
+                when (frame.mode) {
+                    ControlMode.VIDEO_CALL -> setReceiverVideoEnabled(true)
+                    ControlMode.VIDEO_OFF -> setReceiverVideoEnabled(false)
+                    else -> applyReceiverDriveMode(frame.mode)
+                }
+            }
+            is ControlFrame.Command -> {
+                if (frame.code == ControlProtocol.CMD_CONNECT_ESP32) {
+                    log("收到发送端指令：远程连接 ESP32")
+                    connectEsp32ByScan()
+                }
+            }
+            is ControlFrame.Status -> Unit
+        }
+    }
+
+    private fun forwardToEsp32(packet: ByteArray, message: String) {
+        if (bluetooth.isConnected()) {
+            forwardExecutor.execute {
+                bluetooth.send(packet)
+                log(message)
+            }
+        } else {
+            runOnUiThread { updateReceiverEspStatus(false) }
+        }
+    }
+
     private fun stopReceiverServices() {
         smartFollow?.stop()
         smartFollow = null
@@ -316,6 +416,7 @@ class MainActivity : Activity() {
         receiverReporterTask = null
         discoveryResponder?.stop()
         controlServer?.stop()
+        controlClient.onFrame = null
         discoveryResponder = null
         controlServer = null
         cameraPreview?.stop()
@@ -378,8 +479,45 @@ class MainActivity : Activity() {
             renderer,
             cameraFacing = WebRtcCall.CameraFacing.FRONT
         ) { msg -> log(msg) }
-        log("Receiver video signaling starting on $videoPort")
-        webRtcCall?.startServer(videoPort)
+        if (connectionMode == ConnectionMode.LAN) {
+            log("Receiver video signaling starting on $videoPort")
+            webRtcCall?.startServer(videoPort)
+        } else {
+            log("Receiver video relay target $remoteHost:$remoteWebRtcPort room=$remoteDeviceId")
+            webRtcCall?.connectRelay(remoteHost, remoteWebRtcPort, remoteDeviceId, WebRtcCall.Role.CALLER, remoteToken)
+        }
+    }
+
+    private fun senderConnectButtonText(): String = when (connectionMode) {
+        ConnectionMode.LAN -> "扫描接收端并连接"
+        ConnectionMode.SERVER_LIGHT -> "连接服务器接收端"
+        ConnectionMode.SERVER_FULL -> "连接已选设备"
+    }
+
+    private fun connectSenderByMode() {
+        Thread {
+            try {
+                if (connectionMode == ConnectionMode.LAN) {
+                    val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                    val receivers = DiscoveryScanner(wifi).scan { log(it) }
+                    if (receivers.isNotEmpty()) {
+                        val receiver = receivers.first()
+                        connectedReceiverHost = receiver.host
+                        controlClient.connect(receiver.host, receiver.port) { log(it) }
+                        sendFromGamepad(GamepadState(), force = true)
+                    } else {
+                        log("No receiver found")
+                    }
+                } else {
+                    connectedReceiverHost = remoteHost
+                    val senderId = if (remoteSenderId.isNotBlank()) remoteSenderId else "phone-${System.currentTimeMillis() % 100000}"
+                    controlClient.connectRemoteSender(remoteHost, remoteControlPort, senderId, remoteDeviceId, remoteToken) { log(it) }
+                    sendFromGamepad(GamepadState(), force = true)
+                }
+            } catch (e: Exception) {
+                log("Connect failed: ${e.message}")
+            }
+        }.start()
     }
 
     private fun releaseReceiverCall() {
@@ -433,8 +571,8 @@ class MainActivity : Activity() {
                 return
             }
 
-            val host = connectedReceiverHost
-            if (!controlClient.isConnected() || host == null) {
+            val host = if (connectionMode == ConnectionMode.LAN) connectedReceiverHost else remoteHost
+            if (!controlClient.isConnected() || host.isNullOrBlank()) {
                 log("Not connected: scan and connect receiver first")
                 return
             }
@@ -451,7 +589,7 @@ class MainActivity : Activity() {
 
             senderVideoEnabled = true
             senderVideoButton?.text = senderVideoButtonText()
-            log("Sender video signaling target $host:$videoPort")
+            log("Sender video signaling target $host:${if (connectionMode == ConnectionMode.LAN) videoPort else remoteWebRtcPort}")
             log("releaseSenderCall before video on ${threadName()}")
             releaseSenderCall()
             log("createSenderVideoRenderer before video on ${threadName()}")
@@ -464,7 +602,11 @@ class MainActivity : Activity() {
                 cameraFacing = senderCameraFacing
             ) { msg -> log(msg) }
             log("WebRtcCall connect call on ${threadName()}")
-            webRtcCall?.connect(host, videoPort)
+            if (connectionMode == ConnectionMode.LAN) {
+                webRtcCall?.connect(host, videoPort)
+            } else {
+                webRtcCall?.connectRelay(host, remoteWebRtcPort, remoteDeviceId, WebRtcCall.Role.ANSWERER, remoteToken)
+            }
         } catch (e: Throwable) {
             logError("startSenderVideoMode failed", e)
         }
@@ -619,6 +761,12 @@ class MainActivity : Activity() {
     private fun button(text: String, onClick: () -> Unit): Button = Button(this).apply {
         this.text = text
         setOnClickListener { onClick() }
+    }
+
+    private fun input(hint: String, value: String = ""): EditText = EditText(this).apply {
+        this.hint = hint
+        setText(value)
+        setSingleLine(true)
     }
 
     private fun weightParams(): LinearLayout.LayoutParams =

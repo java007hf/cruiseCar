@@ -95,17 +95,50 @@ class ControlClient {
     private var socket: Socket? = null
     private var output: OutputStream? = null
     private var readThread: Thread? = null
+    private var skipHandshakeAck = false
 
     var onStatus: ((Boolean, ControlMode) -> Unit)? = null
     var onReceiverGone: (() -> Unit)? = null
+    var onFrame: ((ByteArray, ControlFrame) -> Unit)? = null
 
     fun connect(host: String, port: Int, onLog: (String) -> Unit) {
         close()
         socket = Socket(host, port)
         output = socket?.getOutputStream()
+        skipHandshakeAck = false
         running.set(true)
         startReadLoop()
         onLog("Connected to receiver $host:$port")
+    }
+
+    fun connectRemoteSender(host: String, port: Int, senderId: String, targetDeviceId: String, token: String, onLog: (String) -> Unit) {
+        connectWithHandshake(
+            host,
+            port,
+            "{\"role\":\"sender\",\"sender_id\":\"${senderId.jsonEscape()}\",\"target_device_id\":\"${targetDeviceId.jsonEscape()}\",\"token\":\"${token.jsonEscape()}\"}\n",
+            onLog
+        )
+    }
+
+    fun connectRemoteReceiver(host: String, port: Int, deviceId: String, token: String, onLog: (String) -> Unit) {
+        connectWithHandshake(
+            host,
+            port,
+            "{\"role\":\"receiver\",\"device_id\":\"${deviceId.jsonEscape()}\",\"token\":\"${token.jsonEscape()}\"}\n",
+            onLog
+        )
+    }
+
+    private fun connectWithHandshake(host: String, port: Int, hello: String, onLog: (String) -> Unit) {
+        close()
+        socket = Socket(host, port)
+        output = socket?.getOutputStream()
+        output?.write(hello.toByteArray(Charsets.UTF_8))
+        output?.flush()
+        skipHandshakeAck = true
+        running.set(true)
+        startReadLoop()
+        onLog("Connected to remote server $host:$port")
     }
 
     private fun startReadLoop() {
@@ -113,6 +146,12 @@ class ControlClient {
         readThread = Thread {
             val frame = ByteArray(ControlProtocol.PACKET_SIZE)
             try {
+                if (skipHandshakeAck) {
+                    while (true) {
+                        val b = input.read()
+                        if (b < 0 || b == '\n'.code) break
+                    }
+                }
                 while (running.get() && socket?.isConnected == true) {
                     var offset = 0
                     var eof = false
@@ -125,6 +164,9 @@ class ControlClient {
                     val parsed = ControlProtocol.parse(frame.copyOf())
                     if (parsed is ControlFrame.Status) {
                         onStatus?.invoke(parsed.espConnected, parsed.mode)
+                    } else if (parsed != null) {
+                        val packet = frame.copyOf()
+                        onFrame?.invoke(packet, parsed)
                     }
                 }
             } catch (ignored: Exception) {
@@ -158,13 +200,23 @@ class ControlClient {
         output?.flush()
     }
 
+    @Synchronized
+    fun sendRaw(packet: ByteArray) {
+        output?.write(packet)
+        output?.flush()
+    }
+
     fun isConnected(): Boolean = socket?.isConnected == true && output != null && running.get()
 
     fun close() {
         running.set(false)
         output = null
+        skipHandshakeAck = false
         socket?.close()
         socket = null
         readThread = null
     }
 }
+
+private fun String.jsonEscape(): String =
+    replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")

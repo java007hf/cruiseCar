@@ -110,6 +110,38 @@ class WebRtcCall(
         }.start()
     }
 
+    fun connectRelay(host: String, port: Int, roomId: String, signalRole: Role, token: String = "") {
+        onLog("WebRTC relay connect requested room=$roomId role=$signalRole")
+        close()
+        running.set(true)
+        initRenderer()
+        Thread {
+            var lastError: Exception? = null
+            try {
+                repeat(30) { attempt ->
+                    try {
+                        onLog("WebRTC relay connect attempt ${attempt + 1}: $host:$port")
+                        val socket = Socket(host, port)
+                        val helloRole = if (signalRole == Role.CALLER) "caller" else "answerer"
+                        val hello = "{\"role\":\"$helloRole\",\"room_id\":\"${roomId.jsonEscape()}\",\"token\":\"${token.jsonEscape()}\"}\n"
+                        socket.getOutputStream().write(hello.toByteArray(Charsets.UTF_8))
+                        socket.getOutputStream().flush()
+                        onLog("WebRTC relay connected: $host:$port room=$roomId")
+                        startPeer(SignalChannel(socket, skipHandshakeAck = true), createOffer = signalRole == Role.CALLER)
+                        return@Thread
+                    } catch (e: Exception) {
+                        lastError = e
+                        onLog("WebRTC relay retry: ${e.message}")
+                        Thread.sleep(300L)
+                    }
+                }
+            } catch (e: Exception) {
+                lastError = e
+            }
+            if (running.get()) onLog("WebRTC relay connect failed: ${lastError?.message}")
+        }.start()
+    }
+
     fun close() {
         onLog("WebRTC close on ${threadName()}")
         running.set(false)
@@ -366,13 +398,25 @@ class WebRtcCall(
         listOf(PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer())
 }
 
-private class SignalChannel(private val socket: Socket) {
+private class SignalChannel(private val socket: Socket, private val skipHandshakeAck: Boolean = false) {
     private val input = DataInputStream(socket.getInputStream())
     private val output = DataOutputStream(socket.getOutputStream())
     private val running = AtomicBoolean(true)
 
     fun listen(onMessage: (JSONObject) -> Unit) {
         Thread {
+            if (skipHandshakeAck) {
+                try {
+                    val ack = StringBuilder()
+                    while (true) {
+                        val b = input.readByte().toInt()
+                        if (b == '\n'.code) break
+                        ack.append(b.toChar())
+                    }
+                } catch (_: Exception) {
+                    running.set(false)
+                }
+            }
             while (running.get()) {
                 try {
                     val length = input.readInt()
@@ -417,6 +461,9 @@ private class SignalChannel(private val socket: Socket) {
         socket.close()
     }
 }
+
+private fun String.jsonEscape(): String =
+    replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
 
 private open class SimpleSdpObserver : SdpObserver {
     override fun onCreateSuccess(desc: SessionDescription) = Unit

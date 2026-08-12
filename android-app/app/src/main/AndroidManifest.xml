@@ -17,6 +17,7 @@
     <application
         android:allowBackup="true"
         android:label="CruiseCar"
+        android:usesCleartextTraffic="true"
         android:theme="@style/AppTheme">
         <activity
             android:name=".MainActivity"
@@ -34,4 +35,3 @@
             android:screenOrientation="portrait" />
     </application>
 </manifest>
-
