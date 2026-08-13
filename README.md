@@ -69,13 +69,13 @@ The app can be started in three network modes from the home screen:
 
 - **LAN sender / LAN receiver**: the original local-network flow. The sender discovers receivers with UDP broadcast, then connects directly to the receiver phone on TCP `42101`; WebRTC signaling is also direct to the receiver phone on TCP `42102`.
 - **Server Light sender / receiver**: both phones manually enter the same server IP/domain and the receiver `device_id`. The receiver and sender each open an outbound TCP connection to `server:42110`; no account, manager API, database UI, or manager-web login is required. This is useful for Tailscale/ZeroTier/ngrok or a minimal public VPS.
-- **Server Full sender / receiver**: both phones log in with the same account through the manager API. The receiver joins the account as a managed device, and the sender queries the device list, selects a receiver, then controls it through `control_server`. This mode also starts a small `manager_web` service separately from `manager_api`, similar to xiaozhi's split `manager-api` / `manager-web` layout.
+- **Server Full sender / receiver**: both phones log in with the same account through the manager API. The receiver joins the account as a managed device, and the sender queries the device list, selects a receiver, then controls it through `control_server`. This mode also starts a small `manager_web` service separately from `manager_api`.
 
 In server modes, WebRTC **media** still uses WebRTC's ICE path between the two Android devices whenever possible; the Python server only relays signaling (`offer`, `answer`, and ICE candidates) on TCP `42112`. For restrictive NAT/firewall environments, add a TURN server to the WebRTC ICE server list so media can fall back to TURN relay.
 
 ## Python Server
 
-The Python server has two deployment modes, similar to `xiaozhi-esp32-server`:
+The Python server has two deployment modes:
 
 ```bash
 cd server

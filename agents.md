@@ -77,7 +77,7 @@ CruiseCar 是一个智能巡航小车项目，当前由 Android App、ESP32 固�
 
 ### Python Server
 
-server 参考 xiaozhi 的拆分思路，不保留顶层 `app.py`，从 `server/` 目录内启动：
+server 按控制层、管理 API 和管理 Web 分层拆分，不保留顶层 `app.py`，从 `server/` 目录内启动：
 
 ```bash
 cd server
