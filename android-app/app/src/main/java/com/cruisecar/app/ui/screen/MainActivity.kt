@@ -16,6 +16,7 @@ import com.cruisecar.app.protocol.ControlProtocol
 import com.cruisecar.app.protocol.GamepadState
 import com.cruisecar.app.protocol.StatusCommand
 import com.cruisecar.app.protocol.toHexLine
+import com.cruisecar.app.ui.screen.main.MainViewFactory
 import com.cruisecar.app.ui.widget.CameraPreviewView
 import com.cruisecar.app.ui.widget.VideoGamepadView
 import android.Manifest
@@ -37,7 +38,6 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
-import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import com.cruisecar.app.data.local.ReceiverIdentityStore
@@ -102,9 +102,11 @@ class MainActivity : Activity() {
     private var senderServoSendScheduled = false
     private val senderServoLock = Any()
     private var backAction: (() -> Unit)? = null
+    private lateinit var viewFactory: MainViewFactory
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        viewFactory = MainViewFactory(this)
         viewModel = MainViewModel(ReceiverIdentityStore(this))
         log("CruiseCar APK debug $appVersionLabel started")
         requestBasePermissions()
@@ -771,40 +773,22 @@ class MainActivity : Activity() {
         if (missing.isNotEmpty()) requestPermissions(missing.toTypedArray(), 100)
     }
 
-    private fun rootLayout(): LinearLayout = LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL
-        setPadding(32, 32, 32, 32)
-    }
+    private fun rootLayout(): LinearLayout = viewFactory.rootLayout()
 
-    private fun row(): LinearLayout = LinearLayout(this).apply {
-        orientation = LinearLayout.HORIZONTAL
-    }
+    private fun row(): LinearLayout = viewFactory.row()
 
-    private fun title(text: String): TextView = TextView(this).apply {
-        this.text = text
-        textSize = 28f
-        gravity = Gravity.CENTER_HORIZONTAL
-    }
+    private fun title(text: String): TextView = viewFactory.title(text)
 
-    private fun button(text: String, onClick: () -> Unit): Button = Button(this).apply {
-        this.text = text
-        setOnClickListener { onClick() }
-    }
+    private fun button(text: String, onClick: () -> Unit): Button = viewFactory.button(text, onClick)
 
-    private fun input(hint: String, value: String = ""): EditText = EditText(this).apply {
-        this.hint = hint
-        setText(value)
-        setSingleLine(true)
-    }
+    private fun input(hint: String, value: String = ""): EditText = viewFactory.input(hint, value)
 
-    private fun weightParams(): LinearLayout.LayoutParams =
-        LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+    private fun weightParams(): LinearLayout.LayoutParams = viewFactory.weightParams()
 
     private fun withLog(content: LinearLayout): LinearLayout {
-        logView = TextView(this).apply { textSize = 13f }
-        val scroll = ScrollView(this).apply { addView(logView) }
-        content.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
-        return content
+        val screen = viewFactory.withLog(content)
+        logView = screen.logView
+        return screen.root
     }
 
     private fun log(message: String) {
