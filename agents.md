@@ -47,13 +47,14 @@ CruiseCar 是一个智能巡航小车项目，当前由 Android App、ESP32 固�
    - WebRTC 信令直连接收端 TCP `42102`。
 
 2. **服务器 Light 模式**
-   - 发送端和接收端都手动填写 server IP/域名和 `device_id`。
-   - 双方主动连接 `server:42110`。
+   - 发送端和接收端都手动填写 server IP/域名。
+   - 接收端根据 Android 设备信息自动生成稳定 `device_id` 和可读设备名，并提供复制按钮。
+   - 发送端填写接收端展示的 `device_id` 后连接 `server:42110`。
    - 不依赖账号、manager-api 或 manager-web。
 
 3. **服务器 Full 模式**
    - 发送端和接收端使用同一账号登录 manager-api。
-   - 接收端加入账号成为设备。
+   - 接收端用自动生成的 `device_id` 和可读设备名加入账号成为设备。
    - 发送端查询设备列表并选择设备控制。
    - manager-web 只负责管理 UI，实际数据通过 manager-api。
 
@@ -194,6 +195,7 @@ AA 55 02 MODE 00 00 00 00 00 SUM
 - 控制通道相关修改优先看 `TcpControl.kt`。
 - WebRTC 相关修改优先看 `WebRtcCall.kt`。
 - Full 模式 HTTP API 客户端在 `RemoteApi.kt`。
+- 接收端服务器模式的 `device_id` 由 `MainActivity.kt` 自动生成并持久化，不要恢复成默认 `car-001` 手填流程。
 - 构建 Android 时需要 JDK 17。
 
 ### ESP32 规范

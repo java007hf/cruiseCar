@@ -68,8 +68,8 @@ ESP32 当前可同时支持两种输入路径：接收端 Android 应用通过 C
 应用首页现在提供三类网络模式：
 
 - **局域网发送端 / 接收端**：保留原有局域网流程。发送端通过 UDP 广播发现接收端，再直连接收端手机的 TCP `42101` 控制端口；WebRTC 信令也直连接收端手机的 TCP `42102` 端口。
-- **服务器 Light 发送端 / 接收端**：两台手机分别手动输入同一个服务器 IP/域名和接收端 `device_id`。接收端与发送端都会主动连接 `server:42110`；不需要账号、manager-api、数据库 UI 或 manager-web 登录。适合 Tailscale/ZeroTier/ngrok 或最小化公网 VPS。
-- **服务器 Full 发送端 / 接收端**：两台手机使用同一个账号登录 manager-api。接收端加入该账号成为受管理设备；发送端查询设备列表、选择接收端后通过 `control_server` 控制它。该模式会单独启动 `manager_web` 服务。
+- **服务器 Light 发送端 / 接收端**：两台手机分别手动输入同一个服务器 IP/域名。接收端会根据本机 Android 设备信息自动生成稳定设备 ID，并提供复制按钮；发送端填入该 ID 后通过 `server:42110` 连接控制。不需要账号、manager-api、数据库 UI 或 manager-web 登录。适合 Tailscale/ZeroTier/ngrok 或最小化公网 VPS。
+- **服务器 Full 发送端 / 接收端**：两台手机使用同一个账号登录 manager-api。接收端会用自动生成的设备 ID 和可读设备名加入该账号；发送端查询设备列表、选择接收端后通过 `control_server` 控制它。该模式会单独启动 `manager_web` 服务。
 
 服务器模式下，WebRTC **媒体流**仍尽量走两台 Android 设备之间的 ICE/P2P 链路；Python server 只在 TCP `42112` 上转发信令（`offer`、`answer` 和 ICE candidates）。如果遇到严格 NAT 或防火墙环境，建议后续给 WebRTC 增加 TURN 服务器，让媒体流可回退到 TURN 中继。
 

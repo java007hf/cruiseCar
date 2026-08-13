@@ -2,14 +2,18 @@ package com.cruisecar.app
 
 import android.Manifest
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
 import android.view.View
@@ -22,6 +26,9 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import org.webrtc.SurfaceViewRenderer
+import java.security.MessageDigest
+import java.util.Locale
+import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
@@ -85,6 +92,8 @@ class MainActivity : Activity() {
 
     private enum class ConnectionMode { LAN, SERVER_LIGHT, SERVER_FULL }
 
+    private data class LocalDeviceIdentity(val deviceId: String, val displayName: String)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         log("CruiseCar APK debug $appVersionLabel started")
@@ -113,14 +122,28 @@ class MainActivity : Activity() {
         val layout = rootLayout()
         layout.addView(title("服务器 Light 配置"))
         val hostInput = input("服务器 IP / 域名", remoteHost)
-        val deviceInput = input("接收端设备ID", if (remoteDeviceId.isNotBlank()) remoteDeviceId else "car-001")
+        val receiverIdentity = localReceiverIdentity()
+        val deviceInput = input(
+            "接收端设备ID（从接收端页面复制）",
+            remoteDeviceId
+        )
         val senderInput = input("发送端ID", if (remoteSenderId.isNotBlank()) remoteSenderId else "phone-${System.currentTimeMillis() % 100000}")
         layout.addView(hostInput)
-        layout.addView(deviceInput)
-        if (isSender) layout.addView(senderInput)
-        layout.addView(button("进入${if (isSender) "发送端" else "接收端"}") {
+        if (isSender) {
+            layout.addView(deviceInput)
+            layout.addView(senderInput)
+        } else {
+            layout.addView(deviceIdentityView(receiverIdentity))
+            layout.addView(button("复制接收端设备ID") { copyToClipboard("接收端设备ID", receiverIdentity.deviceId) })
+        }
+        layout.addView(button(if (isSender) "进入发送端" else "确认并进入接收端") action@{
             remoteHost = hostInput.text.toString().trim()
-            remoteDeviceId = deviceInput.text.toString().trim()
+            val selectedDeviceId = if (isSender) deviceInput.text.toString().trim() else receiverIdentity.deviceId
+            if (isSender && selectedDeviceId.isBlank()) {
+                toast("请从接收端页面复制设备ID并填入")
+                return@action
+            }
+            remoteDeviceId = selectedDeviceId
             remoteSenderId = senderInput.text.toString().trim()
             remoteToken = ""
             connectionMode = ConnectionMode.SERVER_LIGHT
@@ -137,12 +160,15 @@ class MainActivity : Activity() {
         val hostInput = input("服务器 IP / 域名", remoteHost)
         val userInput = input("账号", "demo")
         val passInput = input("密码", "demo")
-        val deviceInput = input("接收端设备ID", if (remoteDeviceId.isNotBlank()) remoteDeviceId else "car-001")
+        val receiverIdentity = localReceiverIdentity()
         layout.addView(hostInput)
         layout.addView(userInput)
         layout.addView(passInput)
-        if (!isSender) layout.addView(deviceInput)
-        layout.addView(button(if (isSender) "登录并选择设备" else "登录并加入接收端") {
+        if (!isSender) {
+            layout.addView(deviceIdentityView(receiverIdentity))
+            layout.addView(button("复制接收端设备ID") { copyToClipboard("接收端设备ID", receiverIdentity.deviceId) })
+        }
+        layout.addView(button(if (isSender) "登录并选择设备" else "登录并确认加入接收端") {
             Thread {
                 try {
                     remoteHost = hostInput.text.toString().trim()
@@ -158,9 +184,9 @@ class MainActivity : Activity() {
                             runOnUiThread { showDevicePicker(devices) }
                         }
                     } else {
-                        remoteDeviceId = deviceInput.text.toString().trim()
-                        RemoteApi.addReceiver(remoteManagerBaseUrl, remoteToken, remoteDeviceId, remoteDeviceId)
-                        log("接收端已加入账号: $remoteDeviceId")
+                        remoteDeviceId = receiverIdentity.deviceId
+                        RemoteApi.addReceiver(remoteManagerBaseUrl, remoteToken, receiverIdentity.deviceId, receiverIdentity.displayName)
+                        log("接收端已加入账号: ${receiverIdentity.displayName} (${receiverIdentity.deviceId})")
                         runOnUiThread { showReceiverScreen() }
                     }
                 } catch (e: Exception) {
@@ -185,6 +211,49 @@ class MainActivity : Activity() {
         }
         layout.addView(button("返回") { showServerFullSetup(isSender = true) })
         setContentView(withLog(layout))
+    }
+
+    private fun localReceiverIdentity(): LocalDeviceIdentity {
+        val prefs = getSharedPreferences("receiver_identity", Context.MODE_PRIVATE)
+        val savedId = prefs.getString("device_id", "").orEmpty()
+        val savedName = prefs.getString("display_name", "").orEmpty()
+        if (savedId.isNotBlank() && savedName.isNotBlank()) {
+            return LocalDeviceIdentity(savedId, savedName)
+        }
+
+        val manufacturer = Build.MANUFACTURER.safeDevicePart().ifBlank { "Android" }
+        val model = Build.MODEL.safeDevicePart().ifBlank { "Phone" }
+        val androidId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID).orEmpty()
+        val installId = prefs.getString("install_id", "").orEmpty().ifBlank { UUID.randomUUID().toString() }
+        val seed = listOf(packageName, androidId, installId, Build.BRAND, Build.DEVICE, Build.MODEL, Build.MANUFACTURER)
+            .joinToString("|")
+        val suffix = sha256(seed).take(8).uppercase(Locale.US)
+        val displayName = "${Build.MANUFACTURER.readableDevicePart()} ${Build.MODEL.readableDevicePart()}".trim()
+            .ifBlank { "Android 接收端" }
+        val deviceId = "car-${manufacturer}-${model}-$suffix"
+            .lowercase(Locale.US)
+            .replace(Regex("-+"), "-")
+            .trim('-')
+
+        prefs.edit()
+            .putString("install_id", installId)
+            .putString("device_id", deviceId)
+            .putString("display_name", displayName)
+            .apply()
+        return LocalDeviceIdentity(deviceId, displayName)
+    }
+
+    private fun deviceIdentityView(identity: LocalDeviceIdentity): TextView = TextView(this).apply {
+        text = "接收端名称：${identity.displayName}\n接收端设备ID：${identity.deviceId}\n\n接收端会自动使用该 ID 加入服务器；发送端 Full 模式登录同一账号后可直接选择设备。Light 模式下请把该 ID 填到发送端。"
+        textSize = 14f
+        setTextColor(Color.rgb(70, 70, 70))
+        setPadding(0, 12, 0, 12)
+    }
+
+    private fun copyToClipboard(label: String, value: String) {
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard.setPrimaryClip(ClipData.newPlainText(label, value))
+        toast("已复制：$value")
     }
 
     private fun showSenderScreen() {
@@ -800,6 +869,21 @@ class MainActivity : Activity() {
         Log.e(tag, "$message on ${threadName()}: ${error.message}", error)
         log("$message: ${error.message}")
     }
+
+    private fun sha256(value: String): String {
+        val bytes = MessageDigest.getInstance("SHA-256").digest(value.toByteArray(Charsets.UTF_8))
+        return bytes.joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+    }
+
+    private fun String.safeDevicePart(): String = trim()
+        .lowercase(Locale.US)
+        .replace(Regex("[^a-z0-9]+"), "-")
+        .trim('-')
+        .take(24)
+
+    private fun String.readableDevicePart(): String = trim()
+        .replace(Regex("\\s+"), " ")
+        .take(32)
 
     private fun threadName(): String =
         "${Thread.currentThread().name}/${Thread.currentThread().id}"
