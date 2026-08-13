@@ -1,6 +1,8 @@
 # CruiseCar Agent Guide
 
-本文档面向后续参与本仓库维护的 AI Agent / 开发者，说明项目结构、核心功能、开发规范、注意事项和关键组件。
+本文档面向后续参与本仓库维护的 AI Agent / 开发者，说明项目侧的功能逻辑、架构分层、关键组件、开发规范和注意事项。
+
+README 只保留项目粗略介绍、硬件材料、项目结构、构建/启动方式等面向使用者的内容；更细的协议、链路、架构约束和维护规则统一写在本文档中。
 
 ## 项目定位
 
@@ -37,7 +39,50 @@ CruiseCar 是一个智能巡航小车项目，当前由 Android App、ESP32 固�
 
 ### Android App
 
-入口与主要逻辑位于 `android-app/app/src/main/java/com/cruisecar/app/MainActivity.kt`。
+入口位于 `android-app/app/src/main/java/com/cruisecar/app/MainActivity.kt`。当前 UI 主要由 Kotlin 动态创建，`MainActivity` 负责页面渲染、按钮事件绑定和设备能力调用；跨页面状态、连接配置和接收端身份由 MVI 相关类承载。
+
+#### Android 分层
+
+```text
+android-app/app/src/main/java/com/cruisecar/app/
+├── MainActivity.kt                  # Activity/UI 编排，渲染页面并转发用户事件
+├── ControlPacket.kt                 # 10 字节控制协议的 Android 侧模型和编解码
+├── TcpControl.kt                    # LAN TCP 控制、server relay 控制连接
+├── WebRtcCall.kt                    # WebRTC 呼叫、直连/relay 信令连接
+├── BluetoothSppClient.kt            # Android 接收端到 ESP32 的 Classic Bluetooth SPP 链路
+├── CameraPreviewView.kt             # 接收端相机预览 / snapshot
+├── SmartFollowController.kt         # 接收端本地智能跟随控制器
+├── ObjectRecognitionDemo.kt         # YOLO/TFLite 目标识别 Demo
+├── RemoteApi.kt                     # Full 模式 manager-api HTTP 客户端
+├── data/local/ReceiverIdentityStore.kt
+├── domain/model/ConnectionMode.kt
+├── domain/model/ReceiverIdentity.kt
+├── mvi/AppState.kt
+├── mvi/AppIntent.kt
+├── mvi/AppEffect.kt
+├── mvi/MainViewModel.kt
+└── utils/DeviceIdUtils.kt
+```
+
+#### MVI 状态模型
+
+Android 侧按轻量 MVI 方式组织：
+
+- `AppState` 是单一状态树，保存当前连接模式、服务器地址、token、接收端 device id、发送端 id、manager-api 地址、接收端身份等。
+- `AppIntent` 表示 UI 或业务触发的状态变更，例如切换连接模式、设置远程地址、加载接收端身份。
+- `MainViewModel` 是状态规约器，所有跨页面配置变更必须通过 `dispatch(AppIntent)` 更新 `state`。
+- `MainActivity` 只读取 `viewModel.state` 渲染页面或启动连接，不应重新引入散落的 `remoteHost`、`remoteToken`、`connectionMode` 等 Activity 字段。
+- `AppEffect` 预留给一次性副作用（Toast、Log 等），后续如果继续拆 UI，可以把更多一次性事件从 Activity 中迁出。
+
+#### 接收端身份生成
+
+接收端服务器模式不要求用户手动填写 `device_id`：
+
+- `ReceiverIdentityStore` 使用 `SharedPreferences("receiver_identity")` 持久化安装级身份。
+- 首次启动时生成安装级 UUID，并调用 `DeviceIdUtils.buildReceiverIdentity()`。
+- `DeviceIdUtils` 基于 `packageName`、`ANDROID_ID`、安装 UUID、`Build.BRAND`、`Build.DEVICE`、`Build.MODEL`、`Build.MANUFACTURER` 生成 SHA-256 后缀。
+- 生成的 `deviceId` 形如 `car-{manufacturer}-{model}-{suffix}`，同时保留可读 `displayName`，便于 Full 模式设备列表区分。
+- 接收端配置页只展示身份并确认进入接收端，不提供“复制设备 ID”按钮；Full 模式发送端通过设备列表选择，Light 模式发送端按展示的 ID 输入。
 
 支持三类网络模式：
 
@@ -65,6 +110,42 @@ CruiseCar 是一个智能巡航小车项目，当前由 Android App、ESP32 固�
 - 智能跟随
 - 智能巡航（预留）
 - OpenCV / YOLO 目标识别 Demo
+
+#### Android 控制链路
+
+手动控制链路：
+
+```text
+发送端屏幕摇杆
+  → GamepadState.toPacket()
+  → TcpControl 发送 10 字节手柄帧
+  → 接收端 TcpControl / ControlServer 收帧
+  → BluetoothSppClient.send()
+  → ESP32 SPP parser
+  → car_control 电机输出
+```
+
+实时视频链路：
+
+```text
+发送端发送 VIDEO_CALL 模式帧
+  → 接收端启用 WebRtcCall(CALLER)
+  → LAN：接收端本机 WebRTC signaling server
+  → Server：Python webrtc_signal relay 按 room_id 配对 caller/answerer
+  → 媒体流走 WebRTC ICE/P2P；server 不转发媒体
+```
+
+智能跟随链路：
+
+```text
+发送端发送 SMART_FOLLOW 模式帧
+  → 接收端启动 CameraPreviewView
+  → SmartFollowController 获取 snapshot
+  → 本地视觉逻辑生成 GamepadState
+  → 接收端直接发送给 ESP32
+```
+
+接收端会周期性上报状态帧，包含 ESP32 连接态和当前控制模式，发送端据此更新 UI，无需轮询。
 
 ### ESP32 固件
 
@@ -132,6 +213,48 @@ server 内部职责：
 - `manager_api/storage/store.py`
   - SQLite 表结构和设备/用户/事件/命令队列操作。
 
+#### Server 部署边界
+
+- Light 模式只启动 `control_server` 和 `webrtc_signal`，不启动 HTTP API / Web UI。
+- Full 模式在 Light 能力基础上额外启动 `manager_api` 和 `manager_web`。
+- `manager_api` 和 `manager_web` 是两个独立服务，不能把 Web HTML 重新内嵌回 API 根路径。
+- `control_server` 可以复用 `manager_api/config`、`manager_api/protocol`、`manager_api/storage` 下的代码，但 Light 模式不能依赖 manager-api HTTP 服务已启动。
+- WebRTC server 只处理信令消息和 room 配对，不参与音视频媒体转发。
+
+#### Server 连接逻辑
+
+Light 模式：
+
+```text
+接收端 Android
+  → connectRemoteReceiver(server, 42110, device_id, token)
+
+发送端 Android
+  → connectRemoteSender(server, 42110, sender_id, target_device_id, token)
+
+control_server
+  → 按 device_id 维护接收端连接
+  → 将发送端控制帧转发给目标接收端
+  → 将接收端状态帧回传给发送端
+```
+
+Full 模式：
+
+```text
+接收端登录 manager-api
+  → POST /api/auth/login
+  → POST /api/receivers 注册/更新自动生成的 device_id
+  → 再连接 control_server
+
+发送端登录 manager-api
+  → POST /api/auth/login
+  → GET /api/receivers 查询同账号接收端
+  → 选择 device_id
+  → 再连接 control_server
+```
+
+SQLite 负责保存用户、设备、事件和离线命令队列；在线控制路径仍优先走 `control_server` 的实时 TCP 连接。
+
 ### ML 训练
 
 ML 相关内容统一放在 `ml/`：
@@ -146,6 +269,22 @@ ML 相关内容统一放在 `ml/`：
 - `weights/`：预训练权重。
 
 根目录历史 `runs/`、`weights/`、`yolo*.pt` 属于旧训练残留，不应作为规范目录使用。
+
+#### ML 流程逻辑
+
+训练平台目标是把“上传视频 → 抽帧 → 多模态 LLM 自动标注 → 人工复核/补标 → YOLO 训练 → TFLite/LiteRT 导出”串成一条流程：
+
+```text
+ml/train_server.py
+  → 上传原始视频到 uploads/
+  → OpenCV 抽帧到 extractions/{run_id}/
+  → 多模态 LLM 返回归一化检测框
+  → 写入 YOLO label 到 datasets/{run_id}/
+  → Ultralytics 训练输出到 outputs/{run_id}/
+  → 导出模型供 Android assets 使用
+```
+
+运行产物默认不提交；如果确实需要提交模型或样例数据，必须先确认体积和用途。
 
 ## 控制协议
 
