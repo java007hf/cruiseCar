@@ -2,18 +2,14 @@ package com.cruisecar.app
 
 import android.Manifest
 import android.app.Activity
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.net.wifi.WifiManager
-import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
 import android.view.View
@@ -25,10 +21,12 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import com.cruisecar.app.data.local.ReceiverIdentityStore
+import com.cruisecar.app.domain.model.ConnectionMode
+import com.cruisecar.app.domain.model.ReceiverIdentity
+import com.cruisecar.app.mvi.AppIntent
+import com.cruisecar.app.mvi.MainViewModel
 import org.webrtc.SurfaceViewRenderer
-import java.security.MessageDigest
-import java.util.Locale
-import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
@@ -67,12 +65,7 @@ class MainActivity : Activity() {
     private var webRtcCall: WebRtcCall? = null
     private lateinit var logView: TextView
     private var connectedReceiverHost: String? = null
-    private var connectionMode = ConnectionMode.LAN
-    private var remoteHost = ""
-    private var remoteToken = ""
-    private var remoteDeviceId = ""
-    private var remoteSenderId = ""
-    private var remoteManagerBaseUrl = ""
+    private lateinit var viewModel: MainViewModel
     private var senderMode = ControlMode.MANUAL
     private var receiverMode = ControlMode.MANUAL
     private var senderVideoEnabled = false
@@ -90,12 +83,9 @@ class MainActivity : Activity() {
     private val senderServoLock = Any()
     private var backAction: (() -> Unit)? = null
 
-    private enum class ConnectionMode { LAN, SERVER_LIGHT, SERVER_FULL }
-
-    private data class LocalDeviceIdentity(val deviceId: String, val displayName: String)
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        viewModel = MainViewModel(ReceiverIdentityStore(this))
         log("CruiseCar APK debug $appVersionLabel started")
         requestBasePermissions()
         showRoleScreen()
@@ -108,8 +98,8 @@ class MainActivity : Activity() {
         layout.addView(button("调试台 (识别 + 遥控)") {
             startActivity(Intent(this, DebugActivity::class.java))
         })
-        layout.addView(button("发送端 - 局域网") { connectionMode = ConnectionMode.LAN; showSenderScreen() })
-        layout.addView(button("接收端 - 局域网") { connectionMode = ConnectionMode.LAN; showReceiverScreen() })
+        layout.addView(button("发送端 - 局域网") { setConnectionMode(ConnectionMode.LAN); showSenderScreen() })
+        layout.addView(button("接收端 - 局域网") { setConnectionMode(ConnectionMode.LAN); showReceiverScreen() })
         layout.addView(button("发送端 - 服务器 Light") { showServerLightSetup(isSender = true) })
         layout.addView(button("接收端 - 服务器 Light") { showServerLightSetup(isSender = false) })
         layout.addView(button("发送端 - 服务器 Full") { showServerFullSetup(isSender = true) })
@@ -121,32 +111,33 @@ class MainActivity : Activity() {
         backAction = { showRoleScreen() }
         val layout = rootLayout()
         layout.addView(title("服务器 Light 配置"))
-        val hostInput = input("服务器 IP / 域名", remoteHost)
-        val receiverIdentity = localReceiverIdentity()
+        val state = viewModel.state
+        val hostInput = input("服务器 IP / 域名", state.remoteHost)
+        val receiverIdentity = viewModel.receiverIdentity()
         val deviceInput = input(
-            "接收端设备ID（从接收端页面复制）",
-            remoteDeviceId
+            "接收端设备ID",
+            state.remoteDeviceId
         )
-        val senderInput = input("发送端ID", if (remoteSenderId.isNotBlank()) remoteSenderId else "phone-${System.currentTimeMillis() % 100000}")
+        val senderInput = input("发送端ID", if (state.remoteSenderId.isNotBlank()) state.remoteSenderId else "phone-${System.currentTimeMillis() % 100000}")
         layout.addView(hostInput)
         if (isSender) {
             layout.addView(deviceInput)
             layout.addView(senderInput)
         } else {
             layout.addView(deviceIdentityView(receiverIdentity))
-            layout.addView(button("复制接收端设备ID") { copyToClipboard("接收端设备ID", receiverIdentity.deviceId) })
         }
         layout.addView(button(if (isSender) "进入发送端" else "确认并进入接收端") action@{
-            remoteHost = hostInput.text.toString().trim()
+            val host = hostInput.text.toString().trim()
             val selectedDeviceId = if (isSender) deviceInput.text.toString().trim() else receiverIdentity.deviceId
             if (isSender && selectedDeviceId.isBlank()) {
-                toast("请从接收端页面复制设备ID并填入")
+                toast("请填入接收端设备ID")
                 return@action
             }
-            remoteDeviceId = selectedDeviceId
-            remoteSenderId = senderInput.text.toString().trim()
-            remoteToken = ""
-            connectionMode = ConnectionMode.SERVER_LIGHT
+            viewModel.dispatch(AppIntent.SetRemoteHost(host))
+            viewModel.dispatch(AppIntent.SetRemoteDeviceId(selectedDeviceId))
+            viewModel.dispatch(AppIntent.SetRemoteSenderId(senderInput.text.toString().trim()))
+            viewModel.dispatch(AppIntent.SetRemoteToken(""))
+            setConnectionMode(ConnectionMode.SERVER_LIGHT)
             if (isSender) showSenderScreen() else showReceiverScreen()
         })
         layout.addView(button("返回") { showRoleScreen() })
@@ -157,35 +148,38 @@ class MainActivity : Activity() {
         backAction = { showRoleScreen() }
         val layout = rootLayout()
         layout.addView(title("服务器 Full 登录"))
-        val hostInput = input("服务器 IP / 域名", remoteHost)
+        val state = viewModel.state
+        val hostInput = input("服务器 IP / 域名", state.remoteHost)
         val userInput = input("账号", "demo")
         val passInput = input("密码", "demo")
-        val receiverIdentity = localReceiverIdentity()
+        val receiverIdentity = viewModel.receiverIdentity()
         layout.addView(hostInput)
         layout.addView(userInput)
         layout.addView(passInput)
         if (!isSender) {
             layout.addView(deviceIdentityView(receiverIdentity))
-            layout.addView(button("复制接收端设备ID") { copyToClipboard("接收端设备ID", receiverIdentity.deviceId) })
         }
         layout.addView(button(if (isSender) "登录并选择设备" else "登录并确认加入接收端") {
             Thread {
                 try {
-                    remoteHost = hostInput.text.toString().trim()
-                    remoteManagerBaseUrl = "http://$remoteHost:$remoteManagerPort"
-                    remoteToken = RemoteApi.login(remoteManagerBaseUrl, userInput.text.toString(), passInput.text.toString())
-                    connectionMode = ConnectionMode.SERVER_FULL
+                    val host = hostInput.text.toString().trim()
+                    val managerBaseUrl = "http://$host:$remoteManagerPort"
+                    val token = RemoteApi.login(managerBaseUrl, userInput.text.toString(), passInput.text.toString())
+                    viewModel.dispatch(AppIntent.SetRemoteHost(host))
+                    viewModel.dispatch(AppIntent.SetRemoteManagerBaseUrl(managerBaseUrl))
+                    viewModel.dispatch(AppIntent.SetRemoteToken(token))
+                    setConnectionMode(ConnectionMode.SERVER_FULL)
                     if (isSender) {
-                        val devices = RemoteApi.listReceivers(remoteManagerBaseUrl, remoteToken)
+                        val devices = RemoteApi.listReceivers(managerBaseUrl, token)
                         if (devices.isEmpty()) {
                             log("账号下暂无接收端，请先用接收端加入")
                         } else {
-                            remoteSenderId = "phone-${System.currentTimeMillis() % 100000}"
+                            viewModel.dispatch(AppIntent.SetRemoteSenderId("phone-${System.currentTimeMillis() % 100000}"))
                             runOnUiThread { showDevicePicker(devices) }
                         }
                     } else {
-                        remoteDeviceId = receiverIdentity.deviceId
-                        RemoteApi.addReceiver(remoteManagerBaseUrl, remoteToken, receiverIdentity.deviceId, receiverIdentity.displayName)
+                        viewModel.dispatch(AppIntent.SetRemoteDeviceId(receiverIdentity.deviceId))
+                        RemoteApi.addReceiver(managerBaseUrl, token, receiverIdentity.deviceId, receiverIdentity.displayName)
                         log("接收端已加入账号: ${receiverIdentity.displayName} (${receiverIdentity.deviceId})")
                         runOnUiThread { showReceiverScreen() }
                     }
@@ -204,7 +198,7 @@ class MainActivity : Activity() {
         layout.addView(title("选择接收端"))
         devices.forEach { device ->
             layout.addView(button("${device.name.ifBlank { device.deviceId }} | ${if (device.online) "在线" else "离线"} | ESP32=${device.espConnected}") {
-                remoteDeviceId = device.deviceId
+                viewModel.dispatch(AppIntent.SetRemoteDeviceId(device.deviceId))
                 log("已选择接收端: ${device.deviceId}")
                 showSenderScreen()
             })
@@ -213,47 +207,15 @@ class MainActivity : Activity() {
         setContentView(withLog(layout))
     }
 
-    private fun localReceiverIdentity(): LocalDeviceIdentity {
-        val prefs = getSharedPreferences("receiver_identity", Context.MODE_PRIVATE)
-        val savedId = prefs.getString("device_id", "").orEmpty()
-        val savedName = prefs.getString("display_name", "").orEmpty()
-        if (savedId.isNotBlank() && savedName.isNotBlank()) {
-            return LocalDeviceIdentity(savedId, savedName)
-        }
-
-        val manufacturer = Build.MANUFACTURER.safeDevicePart().ifBlank { "Android" }
-        val model = Build.MODEL.safeDevicePart().ifBlank { "Phone" }
-        val androidId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID).orEmpty()
-        val installId = prefs.getString("install_id", "").orEmpty().ifBlank { UUID.randomUUID().toString() }
-        val seed = listOf(packageName, androidId, installId, Build.BRAND, Build.DEVICE, Build.MODEL, Build.MANUFACTURER)
-            .joinToString("|")
-        val suffix = sha256(seed).take(8).uppercase(Locale.US)
-        val displayName = "${Build.MANUFACTURER.readableDevicePart()} ${Build.MODEL.readableDevicePart()}".trim()
-            .ifBlank { "Android 接收端" }
-        val deviceId = "car-${manufacturer}-${model}-$suffix"
-            .lowercase(Locale.US)
-            .replace(Regex("-+"), "-")
-            .trim('-')
-
-        prefs.edit()
-            .putString("install_id", installId)
-            .putString("device_id", deviceId)
-            .putString("display_name", displayName)
-            .apply()
-        return LocalDeviceIdentity(deviceId, displayName)
-    }
-
-    private fun deviceIdentityView(identity: LocalDeviceIdentity): TextView = TextView(this).apply {
-        text = "接收端名称：${identity.displayName}\n接收端设备ID：${identity.deviceId}\n\n接收端会自动使用该 ID 加入服务器；发送端 Full 模式登录同一账号后可直接选择设备。Light 模式下请把该 ID 填到发送端。"
+    private fun deviceIdentityView(identity: ReceiverIdentity): TextView = TextView(this).apply {
+        text = "接收端名称：${identity.displayName}\n接收端设备ID：${identity.deviceId}\n\n接收端会自动使用该 ID 加入服务器；发送端 Full 模式登录同一账号后可直接选择设备。"
         textSize = 14f
         setTextColor(Color.rgb(70, 70, 70))
         setPadding(0, 12, 0, 12)
     }
 
-    private fun copyToClipboard(label: String, value: String) {
-        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        clipboard.setPrimaryClip(ClipData.newPlainText(label, value))
-        toast("已复制：$value")
+    private fun setConnectionMode(mode: ConnectionMode) {
+        viewModel.dispatch(AppIntent.SetConnectionMode(mode))
     }
 
     private fun showSenderScreen() {
@@ -401,7 +363,8 @@ class MainActivity : Activity() {
     }
 
     private fun startReceiverServices() {
-        if (connectionMode != ConnectionMode.LAN) {
+        val state = viewModel.state
+        if (state.connectionMode != ConnectionMode.LAN) {
             startRemoteReceiverServices()
             return
         }
@@ -424,11 +387,12 @@ class MainActivity : Activity() {
     }
 
     private fun startRemoteReceiverServices() {
+        val state = viewModel.state
         controlClient.onFrame = { packet, frame -> handleReceiverControlFrame(packet, frame) }
         Thread {
             try {
-                controlClient.connectRemoteReceiver(remoteHost, remoteControlPort, remoteDeviceId, remoteToken) { log(it) }
-                log("Remote receiver ready: device=$remoteDeviceId server=$remoteHost")
+                controlClient.connectRemoteReceiver(state.remoteHost, remoteControlPort, state.remoteDeviceId, state.remoteToken) { log(it) }
+                log("Remote receiver ready: device=${state.remoteDeviceId} server=${state.remoteHost}")
             } catch (e: Exception) {
                 log("Remote receiver connect failed: ${e.message}")
             }
@@ -548,16 +512,17 @@ class MainActivity : Activity() {
             renderer,
             cameraFacing = WebRtcCall.CameraFacing.FRONT
         ) { msg -> log(msg) }
-        if (connectionMode == ConnectionMode.LAN) {
+        val state = viewModel.state
+        if (state.connectionMode == ConnectionMode.LAN) {
             log("Receiver video signaling starting on $videoPort")
             webRtcCall?.startServer(videoPort)
         } else {
-            log("Receiver video relay target $remoteHost:$remoteWebRtcPort room=$remoteDeviceId")
-            webRtcCall?.connectRelay(remoteHost, remoteWebRtcPort, remoteDeviceId, WebRtcCall.Role.CALLER, remoteToken)
+            log("Receiver video relay target ${state.remoteHost}:$remoteWebRtcPort room=${state.remoteDeviceId}")
+            webRtcCall?.connectRelay(state.remoteHost, remoteWebRtcPort, state.remoteDeviceId, WebRtcCall.Role.CALLER, state.remoteToken)
         }
     }
 
-    private fun senderConnectButtonText(): String = when (connectionMode) {
+    private fun senderConnectButtonText(): String = when (viewModel.state.connectionMode) {
         ConnectionMode.LAN -> "扫描接收端并连接"
         ConnectionMode.SERVER_LIGHT -> "连接服务器接收端"
         ConnectionMode.SERVER_FULL -> "连接已选设备"
@@ -566,7 +531,8 @@ class MainActivity : Activity() {
     private fun connectSenderByMode() {
         Thread {
             try {
-                if (connectionMode == ConnectionMode.LAN) {
+                val state = viewModel.state
+                if (state.connectionMode == ConnectionMode.LAN) {
                     val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
                     val receivers = DiscoveryScanner(wifi).scan { log(it) }
                     if (receivers.isNotEmpty()) {
@@ -578,9 +544,9 @@ class MainActivity : Activity() {
                         log("No receiver found")
                     }
                 } else {
-                    connectedReceiverHost = remoteHost
-                    val senderId = if (remoteSenderId.isNotBlank()) remoteSenderId else "phone-${System.currentTimeMillis() % 100000}"
-                    controlClient.connectRemoteSender(remoteHost, remoteControlPort, senderId, remoteDeviceId, remoteToken) { log(it) }
+                    connectedReceiverHost = state.remoteHost
+                    val senderId = if (state.remoteSenderId.isNotBlank()) state.remoteSenderId else "phone-${System.currentTimeMillis() % 100000}"
+                    controlClient.connectRemoteSender(state.remoteHost, remoteControlPort, senderId, state.remoteDeviceId, state.remoteToken) { log(it) }
                     sendFromGamepad(GamepadState(), force = true)
                 }
             } catch (e: Exception) {
@@ -640,7 +606,8 @@ class MainActivity : Activity() {
                 return
             }
 
-            val host = if (connectionMode == ConnectionMode.LAN) connectedReceiverHost else remoteHost
+            val state = viewModel.state
+            val host = if (state.connectionMode == ConnectionMode.LAN) connectedReceiverHost else state.remoteHost
             if (!controlClient.isConnected() || host.isNullOrBlank()) {
                 log("Not connected: scan and connect receiver first")
                 return
@@ -658,7 +625,7 @@ class MainActivity : Activity() {
 
             senderVideoEnabled = true
             senderVideoButton?.text = senderVideoButtonText()
-            log("Sender video signaling target $host:${if (connectionMode == ConnectionMode.LAN) videoPort else remoteWebRtcPort}")
+            log("Sender video signaling target $host:${if (state.connectionMode == ConnectionMode.LAN) videoPort else remoteWebRtcPort}")
             log("releaseSenderCall before video on ${threadName()}")
             releaseSenderCall()
             log("createSenderVideoRenderer before video on ${threadName()}")
@@ -671,10 +638,10 @@ class MainActivity : Activity() {
                 cameraFacing = senderCameraFacing
             ) { msg -> log(msg) }
             log("WebRtcCall connect call on ${threadName()}")
-            if (connectionMode == ConnectionMode.LAN) {
+            if (state.connectionMode == ConnectionMode.LAN) {
                 webRtcCall?.connect(host, videoPort)
             } else {
-                webRtcCall?.connectRelay(host, remoteWebRtcPort, remoteDeviceId, WebRtcCall.Role.ANSWERER, remoteToken)
+                webRtcCall?.connectRelay(host, remoteWebRtcPort, state.remoteDeviceId, WebRtcCall.Role.ANSWERER, state.remoteToken)
             }
         } catch (e: Throwable) {
             logError("startSenderVideoMode failed", e)
@@ -869,21 +836,6 @@ class MainActivity : Activity() {
         Log.e(tag, "$message on ${threadName()}: ${error.message}", error)
         log("$message: ${error.message}")
     }
-
-    private fun sha256(value: String): String {
-        val bytes = MessageDigest.getInstance("SHA-256").digest(value.toByteArray(Charsets.UTF_8))
-        return bytes.joinToString("") { "%02x".format(it.toInt() and 0xFF) }
-    }
-
-    private fun String.safeDevicePart(): String = trim()
-        .lowercase(Locale.US)
-        .replace(Regex("[^a-z0-9]+"), "-")
-        .trim('-')
-        .take(24)
-
-    private fun String.readableDevicePart(): String = trim()
-        .replace(Regex("\\s+"), " ")
-        .take(32)
 
     private fun threadName(): String =
         "${Thread.currentThread().name}/${Thread.currentThread().id}"
