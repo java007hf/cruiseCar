@@ -1,4 +1,4 @@
-package com.cruisecar.app
+package com.cruisecar.app.ui.widget
 
 import android.Manifest
 import android.annotation.SuppressLint

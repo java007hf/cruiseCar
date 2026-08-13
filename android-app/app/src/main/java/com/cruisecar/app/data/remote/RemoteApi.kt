@@ -1,4 +1,4 @@
-package com.cruisecar.app
+package com.cruisecar.app.data.remote
 
 import org.json.JSONArray
 import org.json.JSONObject

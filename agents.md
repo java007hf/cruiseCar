@@ -39,30 +39,32 @@ CruiseCar 是一个智能巡航小车项目，当前由 Android App、ESP32 固�
 
 ### Android App
 
-入口位于 `android-app/app/src/main/java/com/cruisecar/app/MainActivity.kt`。当前 UI 主要由 Kotlin 动态创建，`MainActivity` 负责页面渲染、按钮事件绑定和设备能力调用；跨页面状态、连接配置和接收端身份由 MVI 相关类承载。
+入口位于 `android-app/app/src/main/java/com/cruisecar/app/ui/screen/MainActivity.kt`。当前 UI 主要由 Kotlin 动态创建，`MainActivity` 负责页面渲染、按钮事件绑定和设备能力调用；跨页面状态、连接配置和接收端身份由 MVI 相关类承载。
 
 #### Android 分层
 
 ```text
 android-app/app/src/main/java/com/cruisecar/app/
-├── MainActivity.kt                  # Activity/UI 编排，渲染页面并转发用户事件
-├── ControlPacket.kt                 # 10 字节控制协议的 Android 侧模型和编解码
-├── TcpControl.kt                    # LAN TCP 控制、server relay 控制连接
-├── WebRtcCall.kt                    # WebRTC 呼叫、直连/relay 信令连接
-├── BluetoothSppClient.kt            # Android 接收端到 ESP32 的 Classic Bluetooth SPP 链路
-├── CameraPreviewView.kt             # 接收端相机预览 / snapshot
-├── SmartFollowController.kt         # 接收端本地智能跟随控制器
-├── ObjectRecognitionDemo.kt         # YOLO/TFLite 目标识别 Demo
-├── RemoteApi.kt                     # 账号模式 manager-api HTTP 客户端
-├── data/local/ReceiverIdentityStore.kt
-├── domain/model/ConnectionMode.kt
-├── domain/model/ReceiverIdentity.kt
-├── mvi/AppState.kt
-├── mvi/AppIntent.kt
-├── mvi/AppEffect.kt
-├── mvi/MainViewModel.kt
+├── ui/
+│   ├── screen/                      # Activity 页面入口：MainActivity / DebugActivity
+│   └── widget/                      # 复用 UI 控件：手柄、视频手柄、舵机、相机预览
+├── protocol/ControlPacket.kt        # 10 字节控制协议的 Android 侧模型和编解码
+├── connection/
+│   ├── control/                     # 发送端/接收端发现与 TCP 控制连接
+│   ├── esp32/                       # 接收端与 ESP32 的蓝牙扫描、配对、SPP 连接
+│   └── webrtc/                      # WebRTC 呼叫、直连/relay 信令连接
+├── data/
+│   ├── local/ReceiverIdentityStore.kt
+│   └── remote/RemoteApi.kt          # 账号模式 manager-api HTTP 客户端
+├── feature/
+│   ├── follow/                      # 接收端本地智能跟随控制器
+│   └── vision/                      # YOLO/TFLite 目标识别 Demo
+├── domain/model/                    # 领域模型：连接模式、接收端身份等
+├── mvi/                             # MVI 状态、意图、一次性副作用、ViewModel
 └── utils/DeviceIdUtils.kt
 ```
+
+根包 `com.cruisecar.app` 下不再继续平铺业务文件；新增 Android 代码应优先放入上述功能目录。只有确实跨层共享、且没有明确归属的轻量工具才放入 `utils/`。
 
 #### MVI 状态模型
 
@@ -287,7 +289,7 @@ AA 55 02 MODE 00 00 00 00 00 SUM
 
 协议实现位置：
 
-- Android：`ControlPacket.kt`、`TcpControl.kt`
+- Android：`protocol/ControlPacket.kt`、`connection/control/TcpControl.kt`
 - Python：`server/manager_api/protocol/control_protocol.py`
 - ESP32：`esp32-firmware/main/`
 
@@ -307,10 +309,12 @@ AA 55 02 MODE 00 00 00 00 00 SUM
 ### Android 规范
 
 - 主要 UI 当前是 Kotlin 代码动态创建，不是 XML 布局。
-- 网络模式入口、发送端/接收端流程优先在 `MainActivity.kt` 中维护。
-- 控制通道相关修改优先看 `TcpControl.kt`。
-- WebRTC 相关修改优先看 `WebRtcCall.kt`。
-- 账号模式 HTTP API 客户端在 `RemoteApi.kt`。
+- 网络模式入口、发送端/接收端流程优先在 `ui/screen/MainActivity.kt` 中维护。
+- 控制通道相关修改优先看 `connection/control/TcpControl.kt`。
+- 发送端/接收端局域网发现相关修改优先看 `connection/control/Discovery.kt`。
+- 接收端与 ESP32 蓝牙发现、配对、SPP 连接优先看 `connection/esp32/`。
+- WebRTC 相关修改优先看 `connection/webrtc/WebRtcCall.kt`。
+- 账号模式 HTTP API 客户端在 `data/remote/RemoteApi.kt`。
 - 接收端服务器模式的 `device_id` 由 `data/local/ReceiverIdentityStore.kt` 调用 `utils/DeviceIdUtils.kt` 自动生成并持久化，不要恢复成默认 `car-001` 手填流程。
 - 构建 Android 时需要 JDK 17。
 

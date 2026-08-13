@@ -20,7 +20,7 @@
         android:usesCleartextTraffic="true"
         android:theme="@style/AppTheme">
         <activity
-            android:name=".MainActivity"
+            android:name=".ui.screen.MainActivity"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -29,7 +29,7 @@
         </activity>
 
         <activity
-            android:name=".DebugActivity"
+            android:name=".ui.screen.DebugActivity"
             android:exported="false"
             android:label="CruiseCar-Debug"
             android:screenOrientation="portrait" />

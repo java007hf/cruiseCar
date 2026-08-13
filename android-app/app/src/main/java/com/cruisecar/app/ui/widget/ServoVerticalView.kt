@@ -1,4 +1,4 @@
-package com.cruisecar.app
+package com.cruisecar.app.ui.widget
 
 import android.content.Context
 import android.graphics.Canvas

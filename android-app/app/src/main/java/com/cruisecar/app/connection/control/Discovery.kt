@@ -1,4 +1,4 @@
-package com.cruisecar.app
+package com.cruisecar.app.connection.control
 
 import android.net.wifi.WifiManager
 import java.net.DatagramPacket

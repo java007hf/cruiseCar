@@ -1,4 +1,4 @@
-package com.cruisecar.app
+package com.cruisecar.app.feature.vision
 
 import android.content.Context
 import android.graphics.Bitmap

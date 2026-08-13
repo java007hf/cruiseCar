@@ -1,5 +1,6 @@
-package com.cruisecar.app
+package com.cruisecar.app.ui.widget
 
+import com.cruisecar.app.protocol.GamepadState
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color

@@ -1,5 +1,6 @@
-package com.cruisecar.app
+package com.cruisecar.app.ui.widget
 
+import com.cruisecar.app.protocol.GamepadState
 import android.content.Context
 import android.view.View
 import android.widget.FrameLayout

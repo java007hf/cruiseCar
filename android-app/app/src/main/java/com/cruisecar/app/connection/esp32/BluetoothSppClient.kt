@@ -1,4 +1,4 @@
-package com.cruisecar.app
+package com.cruisecar.app.connection.esp32
 
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter

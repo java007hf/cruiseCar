@@ -1,5 +1,23 @@
-package com.cruisecar.app
+package com.cruisecar.app.ui.screen
 
+import com.cruisecar.app.connection.control.ControlClient
+import com.cruisecar.app.connection.control.ControlServer
+import com.cruisecar.app.connection.control.DiscoveryResponder
+import com.cruisecar.app.connection.control.DiscoveryScanner
+import com.cruisecar.app.connection.esp32.BluetoothSppClient
+import com.cruisecar.app.connection.esp32.Esp32BlePairing
+import com.cruisecar.app.connection.webrtc.WebRtcCall
+import com.cruisecar.app.data.remote.RemoteApi
+import com.cruisecar.app.data.remote.RemoteReceiver
+import com.cruisecar.app.feature.follow.SmartFollowController
+import com.cruisecar.app.protocol.ControlFrame
+import com.cruisecar.app.protocol.ControlMode
+import com.cruisecar.app.protocol.ControlProtocol
+import com.cruisecar.app.protocol.GamepadState
+import com.cruisecar.app.protocol.StatusCommand
+import com.cruisecar.app.protocol.toHexLine
+import com.cruisecar.app.ui.widget.CameraPreviewView
+import com.cruisecar.app.ui.widget.VideoGamepadView
 import android.Manifest
 import android.app.Activity
 import android.content.Context

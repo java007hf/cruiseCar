@@ -1,5 +1,6 @@
-package com.cruisecar.app
+package com.cruisecar.app.feature.follow
 
+import com.cruisecar.app.protocol.GamepadState
 import android.graphics.Bitmap
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils

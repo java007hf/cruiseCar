@@ -1,5 +1,15 @@
-package com.cruisecar.app
+package com.cruisecar.app.ui.screen
 
+import com.cruisecar.app.connection.esp32.BluetoothSppClient
+import com.cruisecar.app.connection.esp32.Esp32BlePairing
+import com.cruisecar.app.feature.vision.ObjectRecognitionDemoController
+import com.cruisecar.app.feature.vision.ObjectRecognitionOverlayView
+import com.cruisecar.app.protocol.CarSettings
+import com.cruisecar.app.protocol.GamepadState
+import com.cruisecar.app.protocol.ServoCommand
+import com.cruisecar.app.protocol.toHexLine
+import com.cruisecar.app.ui.widget.CameraPreviewView
+import com.cruisecar.app.ui.widget.VideoGamepadView
 import android.Manifest
 import android.app.Activity
 import android.content.pm.PackageManager

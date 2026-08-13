@@ -1,4 +1,4 @@
-package com.cruisecar.app
+package com.cruisecar.app.protocol
 
 import kotlin.math.roundToInt
 
