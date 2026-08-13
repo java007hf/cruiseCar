@@ -10,6 +10,7 @@ import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.text.InputType
 import android.util.Log
 import android.view.Gravity
 import android.view.View
@@ -40,6 +41,7 @@ class MainActivity : Activity() {
     private val remoteControlPort = 42110
     private val remoteWebRtcPort = 42112
     private val remoteManagerPort = 8088
+    private val defaultRemoteHost = "116.62.32.90"
     private val controlClient = ControlClient()
     private val bluetooth = BluetoothSppClient()
     private val senderExecutor = Executors.newSingleThreadExecutor()
@@ -100,75 +102,41 @@ class MainActivity : Activity() {
         })
         layout.addView(button("发送端 - 局域网") { setConnectionMode(ConnectionMode.LAN); showSenderScreen() })
         layout.addView(button("接收端 - 局域网") { setConnectionMode(ConnectionMode.LAN); showReceiverScreen() })
-        layout.addView(button("发送端 - 服务器 Light") { showServerLightSetup(isSender = true) })
-        layout.addView(button("接收端 - 服务器 Light") { showServerLightSetup(isSender = false) })
-        layout.addView(button("发送端 - 服务器 Full") { showServerFullSetup(isSender = true) })
-        layout.addView(button("接收端 - 服务器 Full") { showServerFullSetup(isSender = false) })
+        layout.addView(button("发送端 - 服务器") { showServerSetup(isSender = true) })
+        layout.addView(button("接收端 - 服务器") { showServerSetup(isSender = false) })
         setContentView(withLog(layout))
     }
 
-    private fun showServerLightSetup(isSender: Boolean) {
+    private fun showServerSetup(isSender: Boolean) {
         backAction = { showRoleScreen() }
         val layout = rootLayout()
-        layout.addView(title("服务器 Light 配置"))
+        layout.addView(title("服务器账号登录"))
         val state = viewModel.state
-        val hostInput = input("服务器 IP / 域名", state.remoteHost)
-        val receiverIdentity = viewModel.receiverIdentity()
-        val deviceInput = input(
-            "接收端设备ID",
-            state.remoteDeviceId
-        )
-        val senderInput = input("发送端ID", if (state.remoteSenderId.isNotBlank()) state.remoteSenderId else "phone-${System.currentTimeMillis() % 100000}")
-        layout.addView(hostInput)
-        if (isSender) {
-            layout.addView(deviceInput)
-            layout.addView(senderInput)
-        } else {
-            layout.addView(deviceIdentityView(receiverIdentity))
+        val userInput = input("账号", state.remoteUsername)
+        val passInput = input("密码", state.remotePassword).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         }
-        layout.addView(button(if (isSender) "进入发送端" else "确认并进入接收端") action@{
-            val host = hostInput.text.toString().trim()
-            val selectedDeviceId = if (isSender) deviceInput.text.toString().trim() else receiverIdentity.deviceId
-            if (isSender && selectedDeviceId.isBlank()) {
-                toast("请填入接收端设备ID")
-                return@action
-            }
-            viewModel.dispatch(AppIntent.SetRemoteHost(host))
-            viewModel.dispatch(AppIntent.SetRemoteDeviceId(selectedDeviceId))
-            viewModel.dispatch(AppIntent.SetRemoteSenderId(senderInput.text.toString().trim()))
-            viewModel.dispatch(AppIntent.SetRemoteToken(""))
-            setConnectionMode(ConnectionMode.SERVER_LIGHT)
-            if (isSender) showSenderScreen() else showReceiverScreen()
-        })
-        layout.addView(button("返回") { showRoleScreen() })
-        setContentView(withLog(layout))
-    }
-
-    private fun showServerFullSetup(isSender: Boolean) {
-        backAction = { showRoleScreen() }
-        val layout = rootLayout()
-        layout.addView(title("服务器 Full 登录"))
-        val state = viewModel.state
-        val hostInput = input("服务器 IP / 域名", state.remoteHost)
-        val userInput = input("账号", "demo")
-        val passInput = input("密码", "demo")
         val receiverIdentity = viewModel.receiverIdentity()
-        layout.addView(hostInput)
+        layout.addView(serverHostView())
         layout.addView(userInput)
         layout.addView(passInput)
         if (!isSender) {
             layout.addView(deviceIdentityView(receiverIdentity))
         }
-        layout.addView(button(if (isSender) "登录并选择设备" else "登录并确认加入接收端") {
+        layout.addView(button(if (isSender) "登录并选择设备" else "登录并加入接收端") {
             Thread {
                 try {
-                    val host = hostInput.text.toString().trim()
+                    val host = defaultRemoteHost
+                    val username = userInput.text.toString().trim()
+                    val password = passInput.text.toString()
+                    if (host.isBlank() || username.isBlank() || password.isBlank()) {
+                        toast("请填写服务器、账号和密码")
+                        return@Thread
+                    }
                     val managerBaseUrl = "http://$host:$remoteManagerPort"
-                    val token = RemoteApi.login(managerBaseUrl, userInput.text.toString(), passInput.text.toString())
-                    viewModel.dispatch(AppIntent.SetRemoteHost(host))
-                    viewModel.dispatch(AppIntent.SetRemoteManagerBaseUrl(managerBaseUrl))
-                    viewModel.dispatch(AppIntent.SetRemoteToken(token))
-                    setConnectionMode(ConnectionMode.SERVER_FULL)
+                    val token = RemoteApi.login(managerBaseUrl, username, password)
+                    viewModel.saveRemoteAccount(host, username, password, token, managerBaseUrl)
+                    setConnectionMode(ConnectionMode.SERVER)
                     if (isSender) {
                         val devices = RemoteApi.listReceivers(managerBaseUrl, token)
                         if (devices.isEmpty()) {
@@ -184,7 +152,7 @@ class MainActivity : Activity() {
                         runOnUiThread { showReceiverScreen() }
                     }
                 } catch (e: Exception) {
-                    log("Full 模式登录/配置失败: ${e.message}")
+                    log("服务器登录/配置失败: ${e.message}")
                 }
             }.start()
         })
@@ -193,7 +161,7 @@ class MainActivity : Activity() {
     }
 
     private fun showDevicePicker(devices: List<RemoteReceiver>) {
-        backAction = { showServerFullSetup(isSender = true) }
+        backAction = { showServerSetup(isSender = true) }
         val layout = rootLayout()
         layout.addView(title("选择接收端"))
         devices.forEach { device ->
@@ -203,12 +171,19 @@ class MainActivity : Activity() {
                 showSenderScreen()
             })
         }
-        layout.addView(button("返回") { showServerFullSetup(isSender = true) })
+        layout.addView(button("返回") { showServerSetup(isSender = true) })
         setContentView(withLog(layout))
     }
 
     private fun deviceIdentityView(identity: ReceiverIdentity): TextView = TextView(this).apply {
-        text = "接收端名称：${identity.displayName}\n接收端设备ID：${identity.deviceId}\n\n接收端会自动使用该 ID 加入服务器；发送端 Full 模式登录同一账号后可直接选择设备。"
+        text = "接收端名称：${identity.displayName}\n接收端设备ID：${identity.deviceId}\n\n接收端会自动使用该 ID 加入服务器；发送端登录同一账号后可直接选择设备。"
+        textSize = 14f
+        setTextColor(Color.rgb(70, 70, 70))
+        setPadding(0, 12, 0, 12)
+    }
+
+    private fun serverHostView(): TextView = TextView(this).apply {
+        text = "服务器：http://$defaultRemoteHost/"
         textSize = 14f
         setTextColor(Color.rgb(70, 70, 70))
         setPadding(0, 12, 0, 12)
@@ -524,8 +499,7 @@ class MainActivity : Activity() {
 
     private fun senderConnectButtonText(): String = when (viewModel.state.connectionMode) {
         ConnectionMode.LAN -> "扫描接收端并连接"
-        ConnectionMode.SERVER_LIGHT -> "连接服务器接收端"
-        ConnectionMode.SERVER_FULL -> "连接已选设备"
+        ConnectionMode.SERVER -> "连接已选设备"
     }
 
     private fun connectSenderByMode() {

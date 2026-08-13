@@ -24,11 +24,11 @@ CruiseCar 是一个智能巡航小车项目，当前由 Android App、ESP32 固�
 ├── esp32-gamepad-hid-demo/      # ESP32 蓝牙 HID 手柄接入实验工程
 ├── server/                      # Python 远程控制服务，运行时从该目录启动
 │   ├── control_server/          # TCP 控制转发 + WebRTC 信令转发，统一启动入口
-│   ├── manager_api/             # Full 模式 HTTP API + 配置/协议/SQLite 存储
+│   ├── manager_api/             # 账号 HTTP API + 配置/协议/SQLite 存储
 │   │   ├── config/              # 环境变量配置
 │   │   ├── protocol/            # 10 字节控制协议解析/生成
 │   │   └── storage/             # SQLite 持久化
-│   └── manager_web/             # Full 模式 Web 管理页，独立于 manager_api
+│   └── manager_web/             # 账号 Web 管理页，独立于 manager_api
 ├── ml/                          # 训练、自动标注、模型导出、训练产物规范目录
 ├── docs/images/                 # 文档图片
 ├── README.md                    # 英文说明
@@ -53,7 +53,7 @@ android-app/app/src/main/java/com/cruisecar/app/
 ├── CameraPreviewView.kt             # 接收端相机预览 / snapshot
 ├── SmartFollowController.kt         # 接收端本地智能跟随控制器
 ├── ObjectRecognitionDemo.kt         # YOLO/TFLite 目标识别 Demo
-├── RemoteApi.kt                     # Full 模式 manager-api HTTP 客户端
+├── RemoteApi.kt                     # 账号模式 manager-api HTTP 客户端
 ├── data/local/ReceiverIdentityStore.kt
 ├── domain/model/ConnectionMode.kt
 ├── domain/model/ReceiverIdentity.kt
@@ -68,7 +68,7 @@ android-app/app/src/main/java/com/cruisecar/app/
 
 Android 侧按轻量 MVI 方式组织：
 
-- `AppState` 是单一状态树，保存当前连接模式、服务器地址、token、接收端 device id、发送端 id、manager-api 地址、接收端身份等。
+- `AppState` 是单一状态树，保存当前连接模式、服务器地址、账号、密码、token、接收端 device id、发送端 id、manager-api 地址、接收端身份等。
 - `AppIntent` 表示 UI 或业务触发的状态变更，例如切换连接模式、设置远程地址、加载接收端身份。
 - `MainViewModel` 是状态规约器，所有跨页面配置变更必须通过 `dispatch(AppIntent)` 更新 `state`。
 - `MainActivity` 只读取 `viewModel.state` 渲染页面或启动连接，不应重新引入散落的 `remoteHost`、`remoteToken`、`connectionMode` 等 Activity 字段。
@@ -81,23 +81,24 @@ Android 侧按轻量 MVI 方式组织：
 - `ReceiverIdentityStore` 使用 `SharedPreferences("receiver_identity")` 持久化安装级身份。
 - 首次启动时生成安装级 UUID，并调用 `DeviceIdUtils.buildReceiverIdentity()`。
 - `DeviceIdUtils` 基于 `packageName`、`ANDROID_ID`、安装 UUID、`Build.BRAND`、`Build.DEVICE`、`Build.MODEL`、`Build.MANUFACTURER` 生成 SHA-256 后缀。
-- 生成的 `deviceId` 形如 `car-{manufacturer}-{model}-{suffix}`，同时保留可读 `displayName`，便于 Full 模式设备列表区分。
-- 接收端配置页只展示身份并确认进入接收端，不提供“复制设备 ID”按钮；Full 模式发送端通过设备列表选择，Light 模式发送端按展示的 ID 输入。
+- 生成的 `deviceId` 形如 `car-{manufacturer}-{model}-{suffix}`，同时保留可读 `displayName`，便于服务器账号模式设备列表区分。
+- 接收端配置页只展示身份并确认进入接收端，不提供“复制设备 ID”按钮；服务器发送端通过同账号设备列表选择。
 
-支持三类网络模式：
+#### 服务器账号保存
+
+- `ReceiverIdentityStore` 同时使用 `SharedPreferences("remote_account")` 保存内置服务器地址、账号、密码、token、manager-api 地址和发送端 ID。
+- `MainViewModel` 初始化时加载本地账号信息；服务器地址为空时默认使用 `116.62.32.90`。
+- `MainActivity` 不再要求用户输入服务器地址，服务器账号登录页只展示内置服务器 `http://116.62.32.90/`。
+- 账号登录成功后立即回写本地配置，后续打开服务器发送端/接收端页面会自动回填，不需要每次重新输入。
+
+支持两类网络模式：
 
 1. **局域网模式**
    - 发送端通过 UDP 发现接收端。
    - 发送端直连接收端 TCP `42101` 控制端口。
    - WebRTC 信令直连接收端 TCP `42102`。
 
-2. **服务器 Light 模式**
-   - 发送端和接收端都手动填写 server IP/域名。
-   - 接收端根据 Android 设备信息自动生成稳定 `device_id` 和可读设备名。
-   - 发送端填写接收端展示的 `device_id` 后连接 `server:42110`。
-   - 不依赖账号、manager-api 或 manager-web。
-
-3. **服务器 Full 模式**
+2. **服务器账号模式**
    - 发送端和接收端使用同一账号登录 manager-api。
    - 接收端用自动生成的 `device_id` 和可读设备名加入账号成为设备。
    - 发送端查询设备列表并选择设备控制。
@@ -163,23 +164,18 @@ server 按控制层、管理 API 和管理 Web 分层拆分，不保留顶层 `a
 
 ```bash
 cd server
-
-# Light：仅控制转发 + WebRTC 信令转发
-CRUISECAR_DEPLOYMENT=light python3 -m control_server.server
-
-# Full：Light 能力 + manager-api + manager-web
-CRUISECAR_DEPLOYMENT=full python3 -m control_server.server
+python3 -m control_server.server
 ```
 
-Docker 部署：`server/` 下已提供 `Dockerfile` 与 `docker-compose.yml`（light/full 两种 profile）。镜像基于 `python:3.11-slim`，纯标准库无需 `pip install`；容器内工作目录为 `/app/server`，`CRUISECAR_DB` 默认 `/data/cruisecar.db`，需挂载卷才能持久化 SQLite。
+Docker 部署：`server/` 下已提供 `Dockerfile` 与 `docker-compose.yml`（`server` 服务）。镜像基于 `python:3.11-slim`，纯标准库无需 `pip install`；容器内工作目录为 `/app/server`，`CRUISECAR_DB` 默认 `/data/cruisecar.db`，需挂载卷才能持久化 SQLite。
 
 端口约定：
 
 ```text
 42110  TCP 控制转发，发送端/接收端连接
 42112  TCP WebRTC 信令转发，仅转发 offer/answer/ICE，不转发媒体
-8088   HTTP manager-api，仅 Full 模式
-8089   HTTP manager-web，仅 Full 模式
+8088   HTTP manager-api
+8089   HTTP manager-web
 ```
 
 server 内部职责：
@@ -187,8 +183,7 @@ server 内部职责：
 - `control_server/server.py`
   - 控制转发核心。
   - 统一启动入口。
-  - Light 模式启动 `control_server` + `webrtc_signal`。
-  - Full 模式额外启动 `manager_api` + `manager_web`。
+  - 启动 `control_server` + `webrtc_signal` + `manager_api` + `manager_web`。
 
 - `control_server/webrtc_signal.py`
   - WebRTC 信令 relay。
@@ -215,42 +210,24 @@ server 内部职责：
 
 #### Server 部署边界
 
-- Light 模式只启动 `control_server` 和 `webrtc_signal`，不启动 HTTP API / Web UI。
-- Full 模式在 Light 能力基础上额外启动 `manager_api` 和 `manager_web`。
+- 服务器统一使用账号模式，必须启动 `control_server`、`webrtc_signal`、`manager_api` 和 `manager_web`。
+- `control_server` 和 `webrtc_signal` 握手都必须携带 manager-api 登录获得的用户 token。
 - `manager_api` 和 `manager_web` 是两个独立服务，不能把 Web HTML 重新内嵌回 API 根路径。
-- `control_server` 可以复用 `manager_api/config`、`manager_api/protocol`、`manager_api/storage` 下的代码，但 Light 模式不能依赖 manager-api HTTP 服务已启动。
 - WebRTC server 只处理信令消息和 room 配对，不参与音视频媒体转发。
 
 #### Server 连接逻辑
-
-Light 模式：
-
-```text
-接收端 Android
-  → connectRemoteReceiver(server, 42110, device_id, token)
-
-发送端 Android
-  → connectRemoteSender(server, 42110, sender_id, target_device_id, token)
-
-control_server
-  → 按 device_id 维护接收端连接
-  → 将发送端控制帧转发给目标接收端
-  → 将接收端状态帧回传给发送端
-```
-
-Full 模式：
 
 ```text
 接收端登录 manager-api
   → POST /api/auth/login
   → POST /api/receivers 注册/更新自动生成的 device_id
-  → 再连接 control_server
+  → 携带用户 token 连接 control_server
 
 发送端登录 manager-api
   → POST /api/auth/login
   → GET /api/receivers 查询同账号接收端
   → 选择 device_id
-  → 再连接 control_server
+  → 携带用户 token 连接 control_server
 ```
 
 SQLite 负责保存用户、设备、事件和离线命令队列；在线控制路径仍优先走 `control_server` 的实时 TCP 连接。
@@ -324,7 +301,7 @@ AA 55 02 MODE 00 00 00 00 00 SUM
 - 不要把运行产物、缓存、训练中间文件提交到 Git。
 - 不要重新引入顶层 `server/app.py`、`server/common/`、`server/config/`、`server/protocol/`、`server/storage/`。
 - Python server 运行时从 `server/` 目录启动，不依赖顶层 `server` 作为 Python package。
-- Full 模式下 `manager_api` 和 `manager_web` 必须保持独立服务，不能把 Web HTML 再内嵌回 API 根路径。
+- 账号模式下 `manager_api` 和 `manager_web` 必须保持独立服务，不能把 Web HTML 再内嵌回 API 根路径。
 - WebRTC server 只做信令转发，不处理媒体流。
 
 ### Android 规范
@@ -333,7 +310,7 @@ AA 55 02 MODE 00 00 00 00 00 SUM
 - 网络模式入口、发送端/接收端流程优先在 `MainActivity.kt` 中维护。
 - 控制通道相关修改优先看 `TcpControl.kt`。
 - WebRTC 相关修改优先看 `WebRtcCall.kt`。
-- Full 模式 HTTP API 客户端在 `RemoteApi.kt`。
+- 账号模式 HTTP API 客户端在 `RemoteApi.kt`。
 - 接收端服务器模式的 `device_id` 由 `data/local/ReceiverIdentityStore.kt` 调用 `utils/DeviceIdUtils.kt` 自动生成并持久化，不要恢复成默认 `car-001` 手填流程。
 - 构建 Android 时需要 JDK 17。
 
@@ -346,9 +323,9 @@ AA 55 02 MODE 00 00 00 00 00 SUM
 ### Python Server 规范
 
 - 使用 Python 标准库实现，当前不依赖第三方包。
-- Light 部署不能依赖 manager-api 的 HTTP 服务；设备直连 `control_server` 必须可工作。
-- 允许 `control_server` 复用 `manager_api` 下的 config/protocol/storage 代码，但 Light 模式不应启动 HTTP API。
-- 修改认证、设备归属、命令队列时要同时考虑 Light 和 Full 两种部署。
+- 服务器部署必须启用 manager-api；设备连接 `control_server` 前必须先通过账号登录获取 token。
+- `control_server` 可以复用 `manager_api` 下的 config/protocol/storage 代码，但不能绕过账号 token 校验。
+- 修改认证、设备归属、命令队列时必须保证发送端和接收端只能访问同账号设备。
 - SQLite 默认路径由 `CRUISECAR_DB` 控制，未配置时位于 `server/cruisecar.db`。
 
 ### ML 规范
@@ -378,8 +355,7 @@ Python server 启动：
 
 ```bash
 cd server
-CRUISECAR_DEPLOYMENT=light python3 -m control_server.server
-CRUISECAR_DEPLOYMENT=full python3 -m control_server.server
+python3 -m control_server.server
 ```
 
 ESP32 构建：

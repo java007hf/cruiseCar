@@ -106,8 +106,8 @@ class ConnectionHub:
         device_id = str(meta.get("device_id") or meta.get("device-id") or "").strip()
         if not device_id:
             raise PermissionError("missing device_id")
-        self._check_token(self.store.get_receiver(device_id), meta.get("token"))
-        self.store.upsert_receiver(device_id, str(meta.get("name", "")), str(meta.get("token", "")))
+        user = self._require_user_token(meta.get("token"))
+        self.store.upsert_receiver(device_id, str(meta.get("name", "")), str(meta.get("token", "")), user["username"])
 
         async with self._lock:
             old = self.receivers.get(device_id)
@@ -127,12 +127,16 @@ class ConnectionHub:
             raise PermissionError("missing sender_id")
         if not target_device_id:
             raise PermissionError("missing target_device_id")
-        self._check_token(self.store.get_sender(sender_id), meta.get("token"))
+        user = self._require_user_token(meta.get("token"))
+        receiver = self.store.get_receiver(target_device_id)
+        if not receiver or receiver.get("owner_username") != user["username"]:
+            raise PermissionError("target receiver is not in this account")
         self.store.upsert_sender(
             sender_id,
             str(meta.get("name", "")),
             str(meta.get("token", "")),
             target_device_id,
+            user["username"],
         )
 
         async with self._lock:
@@ -218,12 +222,11 @@ class ConnectionHub:
                 self.store.set_sender_online(identity, False)
                 logger.info("sender offline sender_id=%s", identity)
 
-    def _check_token(self, row: dict[str, Any] | None, token: Any) -> None:
-        if self.store.user_by_token(str(token or "")):
-            return
-        expected = (row or {}).get("token") or self.config.auth_token
-        if expected and str(token or "") != str(expected):
-            raise PermissionError("invalid token")
+    def _require_user_token(self, token: Any) -> dict[str, Any]:
+        user = self.store.user_by_token(str(token or ""))
+        if not user:
+            raise PermissionError("account login required")
+        return user
 
     @staticmethod
     async def _write_json(writer: asyncio.StreamWriter, payload: dict[str, Any]) -> None:
@@ -261,19 +264,14 @@ async def main() -> None:
     config = load_config()
     store = Store(config.database_path)
     control_server = ControlServer(config=config, store=store)
-    webrtc_server = WebRtcSignalServer(config=config)
+    webrtc_server = WebRtcSignalServer(config=config, store=store)
 
     loop = asyncio.get_running_loop()
-    manager_api = None
-    manager_web = None
-    if config.deployment == "full":
-        manager_api = ManagerApi(config=config, store=store, hub=control_server.hub, event_loop=loop)
-        manager_api.start_in_thread()
-        manager_web = ManagerWeb(config=config)
-        manager_web.start_in_thread()
-        logging.info("deployment=full: control_server + webrtc_signal + manager-api + manager-web")
-    else:
-        logging.info("deployment=light: control_server + webrtc_signal, manager-api disabled")
+    manager_api = ManagerApi(config=config, store=store, hub=control_server.hub, event_loop=loop)
+    manager_api.start_in_thread()
+    manager_web = ManagerWeb(config=config)
+    manager_web.start_in_thread()
+    logging.info("deployment=full: control_server + webrtc_signal + manager-api + manager-web")
 
     stop_event = asyncio.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):

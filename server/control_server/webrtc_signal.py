@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from manager_api.config.settings import ServerConfig, load_config
+from manager_api.storage.store import Store
 
 
 logger = logging.getLogger(__name__)
@@ -35,8 +36,8 @@ class WebRtcSignalHub:
     server 不理解 SDP/ICE 内容，只按 room 在 caller/answerer 之间透明转发。
     """
 
-    def __init__(self, auth_token: str = ""):
-        self.auth_token = auth_token
+    def __init__(self, store: Store):
+        self.store = store
         self.rooms: dict[str, dict[str, WebRtcPeer]] = {}
         self._lock = asyncio.Lock()
 
@@ -53,8 +54,8 @@ class WebRtcSignalHub:
                 raise PermissionError("missing room_id")
             if role not in {"caller", "answerer"}:
                 raise PermissionError("role must be caller or answerer")
-            if self.auth_token and token != self.auth_token:
-                raise PermissionError("invalid token")
+            if not self.store.user_by_token(token):
+                raise PermissionError("account login required")
 
             await self._join(room_id, role, writer)
             await self._write_json_line(writer, {"ok": True, "room_id": room_id, "role": role})
@@ -134,9 +135,10 @@ class WebRtcSignalHub:
 
 
 class WebRtcSignalServer:
-    def __init__(self, config: ServerConfig | None = None):
+    def __init__(self, config: ServerConfig | None = None, store: Store | None = None):
         self.config = config or load_config()
-        self.hub = WebRtcSignalHub(auth_token=self.config.auth_token)
+        self.store = store or Store(self.config.database_path)
+        self.hub = WebRtcSignalHub(store=self.store)
 
     async def start(self) -> None:
         server = await asyncio.start_server(self.hub.handle_client, self.config.host, self.config.webrtc_port)

@@ -6,17 +6,23 @@ import com.cruisecar.app.domain.model.ReceiverIdentity
 class MainViewModel(
     private val receiverIdentityStore: ReceiverIdentityStore
 ) {
-    var state: AppState = AppState()
+    var state: AppState = receiverIdentityStore.getRemoteAccount().let { account ->
+        AppState(
+            remoteHost = account.host.ifBlank { DEFAULT_REMOTE_HOST },
+            remoteUsername = account.username,
+            remotePassword = account.password,
+            remoteToken = account.token,
+            remoteSenderId = account.senderId,
+            remoteManagerBaseUrl = account.managerBaseUrl
+        )
+    }
         private set
 
     fun dispatch(intent: AppIntent) {
         state = when (intent) {
             is AppIntent.SetConnectionMode -> state.copy(connectionMode = intent.mode)
-            is AppIntent.SetRemoteHost -> state.copy(remoteHost = intent.host)
-            is AppIntent.SetRemoteToken -> state.copy(remoteToken = intent.token)
             is AppIntent.SetRemoteDeviceId -> state.copy(remoteDeviceId = intent.deviceId)
             is AppIntent.SetRemoteSenderId -> state.copy(remoteSenderId = intent.senderId)
-            is AppIntent.SetRemoteManagerBaseUrl -> state.copy(remoteManagerBaseUrl = intent.baseUrl)
             is AppIntent.ReceiverIdentityLoaded -> state.copy(receiverIdentity = intent.identity)
         }
     }
@@ -27,5 +33,22 @@ class MainViewModel(
             dispatch(AppIntent.ReceiverIdentityLoaded(identity))
         }
         return identity
+    }
+
+    fun saveRemoteAccount(host: String, username: String, password: String, token: String, managerBaseUrl: String) {
+        val senderId = state.remoteSenderId.ifBlank { "phone-${System.currentTimeMillis() % 100000}" }
+        receiverIdentityStore.saveRemoteAccount(host, username, password, token, managerBaseUrl, senderId)
+        state = state.copy(
+            remoteHost = host,
+            remoteUsername = username,
+            remotePassword = password,
+            remoteToken = token,
+            remoteManagerBaseUrl = managerBaseUrl,
+            remoteSenderId = senderId
+        )
+    }
+
+    private companion object {
+        const val DEFAULT_REMOTE_HOST = "116.62.32.90"
     }
 }

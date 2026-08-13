@@ -1,35 +1,19 @@
 # CruiseCar Python server - Docker Compose.
 #
 # Usage:
-#   docker compose up light   # Light: control relay + WebRTC signaling relay
-#   docker compose up full    # Full: + manager-api (8088) + manager-web (8089)
+#   docker compose up server
 #
 # The SQLite DB lives in the `server-data` named volume so it survives
-# container restarts. Override CRUISECAR_AUTH_TOKEN in an .env file.
+# container restarts.
 
 services:
-  light:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: cruisecar-server:latest
-    environment:
-      CRUISECAR_DEPLOYMENT: light
-    ports:
-      - "42110:42110"   # sender/receiver TCP control relay
-      - "42112:42112"   # WebRTC signaling relay
-    volumes:
-      - server-data:/data
-    restart: unless-stopped
-
-  full:
+  server:
     build:
       context: .
       dockerfile: Dockerfile
     image: cruisecar-server:latest
     environment:
       CRUISECAR_DEPLOYMENT: full
-      CRUISECAR_AUTH_TOKEN: ${CRUISECAR_AUTH_TOKEN:-}
     ports:
       - "42110:42110"   # sender/receiver TCP control relay
       - "42112:42112"   # WebRTC signaling relay

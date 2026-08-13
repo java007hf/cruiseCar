@@ -132,6 +132,8 @@ class ManagerApi:
                         self._send_json({"ok": False, "error": "not found"}, HTTPStatus.NOT_FOUND)
                 except ValueError as exc:
                     self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                except PermissionError as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.FORBIDDEN)
                 except Exception as exc:
                     logger.exception("manager api request failed")
                     self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -142,7 +144,7 @@ class ManagerApi:
             def _authorized(self) -> bool:
                 header = self.headers.get("Authorization", "")
                 token = header[7:] if header.startswith("Bearer ") else header
-                return bool((api.config.auth_token and token == api.config.auth_token) or api.store.user_by_token(token))
+                return bool(api.store.user_by_token(token))
 
             def _current_user(self) -> dict[str, Any] | None:
                 header = self.headers.get("Authorization", "")

@@ -15,14 +15,13 @@ class ServerConfig:
     manager_port: int
     manager_web_port: int
     database_path: Path
-    auth_token: str
     heartbeat_timeout_seconds: int
 
 
 def load_config() -> ServerConfig:
-    deployment = os.getenv("CRUISECAR_DEPLOYMENT", os.getenv("CRUISECAR_MODE", "light")).lower()
-    if deployment not in {"light", "full"}:
-        raise ValueError("CRUISECAR_DEPLOYMENT must be light or full")
+    deployment = os.getenv("CRUISECAR_DEPLOYMENT", os.getenv("CRUISECAR_MODE", "full")).lower()
+    if deployment != "full":
+        raise ValueError("CRUISECAR_DEPLOYMENT must be full")
     return ServerConfig(
         deployment=deployment,
         host=os.getenv("CRUISECAR_HOST", "0.0.0.0"),
@@ -33,6 +32,5 @@ def load_config() -> ServerConfig:
         database_path=Path(
             os.getenv("CRUISECAR_DB", str(ROOT_DIR / "cruisecar.db"))
         ),
-        auth_token=os.getenv("CRUISECAR_AUTH_TOKEN", ""),
         heartbeat_timeout_seconds=int(os.getenv("CRUISECAR_HEARTBEAT_TIMEOUT", "20")),
     )

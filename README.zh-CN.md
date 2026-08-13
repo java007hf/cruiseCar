@@ -57,8 +57,8 @@ CruiseCar 是一个基于 ESP32 小车底盘和两台 Android 手机的智能巡
 │   └── scripts/
 ├── server/                      # Python 远程控制服务
 │   ├── control_server/          # TCP 控制转发 + WebRTC 信令转发
-│   ├── manager_api/             # Full 模式 HTTP API + 配置/协议/存储
-│   └── manager_web/             # Full 模式 Web 管理页，独立启动
+│   ├── manager_api/             # 账号 HTTP API + 配置/协议/存储
+│   └── manager_web/             # 账号 Web 管理页，独立启动
 ├── ml/                          # 训练、自动标注、模型导出和运行产物目录
 ├── docs/images/                 # README 图片
 ├── README.md                    # 英文概览
@@ -68,13 +68,12 @@ CruiseCar 是一个基于 ESP32 小车底盘和两台 Android 手机的智能巡
 
 ## Android App 模式
 
-应用首页提供六个入口，覆盖三类网络模式下的发送端/接收端角色：
+应用首页提供四个入口，覆盖两类网络模式下的发送端/接收端角色：
 
 - **局域网发送端 / 接收端**：发送端通过 UDP 广播发现接收端，再直连接收端手机。
-- **服务器 Light 发送端 / 接收端**：发送端和接收端输入同一个服务器 IP/域名。接收端自动生成稳定设备 ID；发送端填入该 ID 后通过轻量 relay 连接。
-- **服务器 Full 发送端 / 接收端**：发送端和接收端登录同一个账号。接收端加入账号成为设备，发送端从设备列表中选择接收端。
+- **服务器发送端 / 接收端**：发送端和接收端登录同一个账号。接收端加入账号成为设备，发送端从设备列表中选择接收端。
 
-接收端设备 ID 会根据 Android 设备信息和安装 ID 自动生成，用户不需要手动编造。
+接收端设备 ID 会根据 Android 设备信息和安装 ID 自动生成，用户不需要手动编造。Android App 内置服务器 `http://116.62.32.90/`，并会在本地保存上次填写的账号、密码、token 和发送端 ID，避免每次重复输入。
 
 ## Server 模式
 
@@ -83,19 +82,15 @@ CruiseCar 是一个基于 ESP32 小车底盘和两台 Android 手机的智能巡
 ```bash
 cd server
 
-# 轻量部署：仅控制转发 + WebRTC 信令转发。
-CRUISECAR_DEPLOYMENT=light python3 -m control_server.server
-
-# 全量部署：轻量能力 + manager-api + manager-web。
-CRUISECAR_DEPLOYMENT=full python3 -m control_server.server
+# 账号部署：控制转发 + WebRTC 信令转发 + manager-api + manager-web。
+python3 -m control_server.server
 ```
 
 `server/` 目录也提供 Docker 配置：
 
 ```bash
 cd server
-docker compose up light
-docker compose up full
+docker compose up server
 ```
 
 默认端口：
@@ -107,8 +102,8 @@ docker compose up full
 | 42102 | 局域网 WebRTC 信令 |
 | 42110 | 服务器 TCP 控制转发 |
 | 42112 | 服务器 WebRTC 信令转发 |
-| 8088 | Full 模式 manager-api |
-| 8089 | Full 模式 manager-web |
+| 8088 | 账号 manager-api |
+| 8089 | 账号 manager-web |
 
 ## ESP32 接线
 
@@ -153,7 +148,7 @@ Python server：
 ```bash
 cd server
 python3 -m compileall .
-CRUISECAR_DEPLOYMENT=light python3 -m control_server.server
+python3 -m control_server.server
 ```
 
 ESP32：

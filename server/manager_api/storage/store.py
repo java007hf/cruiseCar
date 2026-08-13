@@ -123,6 +123,9 @@ class Store:
     def upsert_receiver(self, device_id: str, name: str = "", token: str = "", owner_username: str = "") -> dict[str, Any]:
         now = time.time()
         with self.connect() as conn:
+            row = conn.execute("SELECT owner_username FROM receivers WHERE device_id=?", (device_id,)).fetchone()
+            if row and owner_username and row["owner_username"] and row["owner_username"] != owner_username:
+                raise PermissionError("receiver belongs to another account")
             conn.execute(
                 """
                 INSERT INTO receivers(device_id, owner_username, name, token, created_at, updated_at)
@@ -140,6 +143,9 @@ class Store:
     def upsert_sender(self, sender_id: str, name: str = "", token: str = "", target_device_id: str = "", owner_username: str = "") -> dict[str, Any]:
         now = time.time()
         with self.connect() as conn:
+            row = conn.execute("SELECT owner_username FROM senders WHERE sender_id=?", (sender_id,)).fetchone()
+            if row and owner_username and row["owner_username"] and row["owner_username"] != owner_username:
+                raise PermissionError("sender belongs to another account")
             conn.execute(
                 """
                 INSERT INTO senders(sender_id, owner_username, name, token, target_device_id, created_at, updated_at)

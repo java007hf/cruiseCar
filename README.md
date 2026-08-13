@@ -57,8 +57,8 @@ The current build uses the receiver Android phone as the onboard camera. ESP32, 
 │   └── scripts/
 ├── server/                      # Python remote control server
 │   ├── control_server/          # TCP control relay + WebRTC signaling relay
-│   ├── manager_api/             # Full-mode HTTP API + config/protocol/storage
-│   └── manager_web/             # Full-mode web UI, served separately
+│   ├── manager_api/             # Account HTTP API + config/protocol/storage
+│   └── manager_web/             # Account web UI, served separately
 ├── ml/                          # Training, auto-labeling, model export, runtime artifacts
 ├── docs/images/                 # README images
 ├── README.md                    # English overview
@@ -68,13 +68,12 @@ The current build uses the receiver Android phone as the onboard camera. ESP32, 
 
 ## Android App Modes
 
-The app home screen provides six entries, covering sender/receiver roles in three network modes:
+The app home screen provides four entries, covering sender/receiver roles in two network modes:
 
 - **LAN sender / LAN receiver**: sender discovers the receiver through UDP broadcast, then connects directly to the receiver phone.
-- **Server Light sender / receiver**: sender and receiver enter the same server IP/domain. The receiver automatically generates a stable device ID; the sender enters that ID to connect through the lightweight relay.
-- **Server Full sender / receiver**: sender and receiver log in with the same account. The receiver joins the account as a device, and the sender selects it from the device list.
+- **Server sender / receiver**: sender and receiver log in with the same account. The receiver joins the account as a device, and the sender selects it from the device list.
 
-Receiver-side device IDs are generated automatically from Android device information plus an install ID, so users do not need to manually invent one.
+Receiver-side device IDs are generated automatically from Android device information plus an install ID, so users do not need to manually invent one. The Android app uses the built-in server `http://116.62.32.90/` and stores the last account, password, token, and sender ID locally to avoid repeated input.
 
 ## Server Modes
 
@@ -83,19 +82,15 @@ Start from the `server/` directory:
 ```bash
 cd server
 
-# Lightweight deployment: control relay + WebRTC signaling relay only.
-CRUISECAR_DEPLOYMENT=light python3 -m control_server.server
-
-# Full deployment: lightweight services + manager-api + manager-web.
-CRUISECAR_DEPLOYMENT=full python3 -m control_server.server
+# Account deployment: control relay + WebRTC signaling relay + manager-api + manager-web.
+python3 -m control_server.server
 ```
 
 Docker files are also provided under `server/`:
 
 ```bash
 cd server
-docker compose up light
-docker compose up full
+docker compose up server
 ```
 
 Default ports:
@@ -107,8 +102,8 @@ Default ports:
 | 42102 | LAN WebRTC signaling |
 | 42110 | Server TCP control relay |
 | 42112 | Server WebRTC signaling relay |
-| 8088 | Full-mode manager-api |
-| 8089 | Full-mode manager-web |
+| 8088 | account manager-api |
+| 8089 | account manager-web |
 
 ## ESP32 Wiring
 
@@ -153,7 +148,7 @@ Python server:
 ```bash
 cd server
 python3 -m compileall .
-CRUISECAR_DEPLOYMENT=light python3 -m control_server.server
+python3 -m control_server.server
 ```
 
 ESP32:

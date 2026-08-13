@@ -8,6 +8,7 @@ import java.util.UUID
 class ReceiverIdentityStore(context: Context) {
     private val appContext = context.applicationContext
     private val prefs = appContext.getSharedPreferences("receiver_identity", Context.MODE_PRIVATE)
+    private val accountPrefs = appContext.getSharedPreferences("remote_account", Context.MODE_PRIVATE)
 
     fun getOrCreate(): ReceiverIdentity {
         val savedId = prefs.getString(KEY_DEVICE_ID, "").orEmpty()
@@ -26,9 +27,53 @@ class ReceiverIdentityStore(context: Context) {
         return identity
     }
 
+    fun getRemoteAccount(): RemoteAccount {
+        return RemoteAccount(
+            host = accountPrefs.getString(KEY_REMOTE_HOST, "").orEmpty(),
+            username = accountPrefs.getString(KEY_REMOTE_USERNAME, "").orEmpty(),
+            password = accountPrefs.getString(KEY_REMOTE_PASSWORD, "").orEmpty(),
+            token = accountPrefs.getString(KEY_REMOTE_TOKEN, "").orEmpty(),
+            managerBaseUrl = accountPrefs.getString(KEY_REMOTE_MANAGER_BASE_URL, "").orEmpty(),
+            senderId = accountPrefs.getString(KEY_REMOTE_SENDER_ID, "").orEmpty()
+        )
+    }
+
+    fun saveRemoteAccount(
+        host: String,
+        username: String,
+        password: String,
+        token: String,
+        managerBaseUrl: String,
+        senderId: String
+    ) {
+        accountPrefs.edit()
+            .putString(KEY_REMOTE_HOST, host)
+            .putString(KEY_REMOTE_USERNAME, username)
+            .putString(KEY_REMOTE_PASSWORD, password)
+            .putString(KEY_REMOTE_TOKEN, token)
+            .putString(KEY_REMOTE_MANAGER_BASE_URL, managerBaseUrl)
+            .putString(KEY_REMOTE_SENDER_ID, senderId)
+            .apply()
+    }
+
     private companion object {
         const val KEY_INSTALL_ID = "install_id"
         const val KEY_DEVICE_ID = "device_id"
         const val KEY_DISPLAY_NAME = "display_name"
+        const val KEY_REMOTE_HOST = "remote_host"
+        const val KEY_REMOTE_USERNAME = "remote_username"
+        const val KEY_REMOTE_PASSWORD = "remote_password"
+        const val KEY_REMOTE_TOKEN = "remote_token"
+        const val KEY_REMOTE_MANAGER_BASE_URL = "remote_manager_base_url"
+        const val KEY_REMOTE_SENDER_ID = "remote_sender_id"
     }
 }
+
+data class RemoteAccount(
+    val host: String,
+    val username: String,
+    val password: String,
+    val token: String,
+    val managerBaseUrl: String,
+    val senderId: String
+)
