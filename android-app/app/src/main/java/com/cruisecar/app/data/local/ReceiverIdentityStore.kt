@@ -28,10 +28,10 @@ class ReceiverIdentityStore(context: Context) {
     }
 
     fun getRemoteAccount(): RemoteAccount {
+        clearLegacySavedPassword()
         return RemoteAccount(
             host = accountPrefs.getString(KEY_REMOTE_HOST, "").orEmpty(),
             username = accountPrefs.getString(KEY_REMOTE_USERNAME, "").orEmpty(),
-            password = accountPrefs.getString(KEY_REMOTE_PASSWORD, "").orEmpty(),
             token = accountPrefs.getString(KEY_REMOTE_TOKEN, "").orEmpty(),
             managerBaseUrl = accountPrefs.getString(KEY_REMOTE_MANAGER_BASE_URL, "").orEmpty(),
             senderId = accountPrefs.getString(KEY_REMOTE_SENDER_ID, "").orEmpty()
@@ -41,7 +41,6 @@ class ReceiverIdentityStore(context: Context) {
     fun saveRemoteAccount(
         host: String,
         username: String,
-        password: String,
         token: String,
         managerBaseUrl: String,
         senderId: String
@@ -49,11 +48,17 @@ class ReceiverIdentityStore(context: Context) {
         accountPrefs.edit()
             .putString(KEY_REMOTE_HOST, host)
             .putString(KEY_REMOTE_USERNAME, username)
-            .putString(KEY_REMOTE_PASSWORD, password)
             .putString(KEY_REMOTE_TOKEN, token)
             .putString(KEY_REMOTE_MANAGER_BASE_URL, managerBaseUrl)
             .putString(KEY_REMOTE_SENDER_ID, senderId)
+            .remove(KEY_LEGACY_REMOTE_PASSWORD)
             .apply()
+    }
+
+    private fun clearLegacySavedPassword() {
+        if (accountPrefs.contains(KEY_LEGACY_REMOTE_PASSWORD)) {
+            accountPrefs.edit().remove(KEY_LEGACY_REMOTE_PASSWORD).apply()
+        }
     }
 
     private companion object {
@@ -62,7 +67,7 @@ class ReceiverIdentityStore(context: Context) {
         const val KEY_DISPLAY_NAME = "display_name"
         const val KEY_REMOTE_HOST = "remote_host"
         const val KEY_REMOTE_USERNAME = "remote_username"
-        const val KEY_REMOTE_PASSWORD = "remote_password"
+        const val KEY_LEGACY_REMOTE_PASSWORD = "remote_password"
         const val KEY_REMOTE_TOKEN = "remote_token"
         const val KEY_REMOTE_MANAGER_BASE_URL = "remote_manager_base_url"
         const val KEY_REMOTE_SENDER_ID = "remote_sender_id"
@@ -72,7 +77,6 @@ class ReceiverIdentityStore(context: Context) {
 data class RemoteAccount(
     val host: String,
     val username: String,
-    val password: String,
     val token: String,
     val managerBaseUrl: String,
     val senderId: String

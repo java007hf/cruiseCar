@@ -133,7 +133,7 @@ class MainActivity : Activity() {
         layout.addView(title("服务器账号登录"))
         val state = viewModel.state
         val userInput = input("账号", state.remoteUsername)
-        val passInput = input("密码", state.remotePassword).apply {
+        val passInput = input("密码", "").apply {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         }
         val receiverIdentity = viewModel.receiverIdentity()
@@ -155,7 +155,7 @@ class MainActivity : Activity() {
                     }
                     val managerBaseUrl = "http://$host:$remoteManagerPort"
                     val token = RemoteApi.login(managerBaseUrl, username, password)
-                    viewModel.saveRemoteAccount(host, username, password, token, managerBaseUrl)
+                    viewModel.saveRemoteAccount(host, username, token, managerBaseUrl)
                     setConnectionMode(ConnectionMode.SERVER)
                     if (isSender) {
                         val devices = RemoteApi.listReceivers(managerBaseUrl, token)

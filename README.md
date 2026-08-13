@@ -73,7 +73,7 @@ The app home screen provides four entries, covering sender/receiver roles in two
 - **LAN sender / LAN receiver**: sender discovers the receiver through UDP broadcast, then connects directly to the receiver phone.
 - **Server sender / receiver**: sender and receiver log in with the same account. The receiver joins the account as a device, and the sender selects it from the device list.
 
-Receiver-side device IDs are generated automatically from Android device information plus an install ID, so users do not need to manually invent one. The Android app uses the built-in server `http://116.62.32.90/` and stores the last account, password, token, and sender ID locally to avoid repeated input.
+Receiver-side device IDs are generated automatically from Android device information plus an install ID, so users do not need to manually invent one. The Android app uses the built-in server `http://116.62.32.90/` and stores the last account, token, and sender ID locally to avoid repeated input. Passwords are only used for the login request and are not persisted.
 
 ## Server Modes
 

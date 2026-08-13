@@ -7,7 +7,6 @@ data class AppState(
     val connectionMode: ConnectionMode = ConnectionMode.LAN,
     val remoteHost: String = "",
     val remoteUsername: String = "",
-    val remotePassword: String = "",
     val remoteToken: String = "",
     val remoteDeviceId: String = "",
     val remoteSenderId: String = "",

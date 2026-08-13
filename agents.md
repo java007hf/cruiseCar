@@ -70,7 +70,7 @@ android-app/app/src/main/java/com/cruisecar/app/
 
 Android 侧按轻量 MVI 方式组织：
 
-- `AppState` 是单一状态树，保存当前连接模式、服务器地址、账号、密码、token、接收端 device id、发送端 id、manager-api 地址、接收端身份等。
+- `AppState` 是单一状态树，保存当前连接模式、服务器地址、账号、token、接收端 device id、发送端 id、manager-api 地址、接收端身份等；密码只作为登录请求的临时输入，不进入状态树。
 - `AppIntent` 表示 UI 或业务触发的状态变更，例如切换连接模式、设置远程地址、加载接收端身份。
 - `MainViewModel` 是状态规约器，所有跨页面配置变更必须通过 `dispatch(AppIntent)` 更新 `state`。
 - `MainActivity` 只读取 `viewModel.state` 渲染页面或启动连接，不应重新引入散落的 `remoteHost`、`remoteToken`、`connectionMode` 等 Activity 字段。
@@ -88,7 +88,7 @@ Android 侧按轻量 MVI 方式组织：
 
 #### 服务器账号保存
 
-- `ReceiverIdentityStore` 同时使用 `SharedPreferences("remote_account")` 保存内置服务器地址、账号、密码、token、manager-api 地址和发送端 ID。
+- `ReceiverIdentityStore` 同时使用 `SharedPreferences("remote_account")` 保存内置服务器地址、账号、token、manager-api 地址和发送端 ID，并会清理旧版本遗留的本地密码字段。
 - `MainViewModel` 初始化时加载本地账号信息；服务器地址为空时默认使用 `116.62.32.90`。
 - `MainActivity` 不再要求用户输入服务器地址，服务器账号登录页只展示内置服务器 `http://116.62.32.90/`。
 - 账号登录成功后立即回写本地配置，后续打开服务器发送端/接收端页面会自动回填，不需要每次重新输入。

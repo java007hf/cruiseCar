@@ -10,7 +10,6 @@ class MainViewModel(
         AppState(
             remoteHost = account.host.ifBlank { DEFAULT_REMOTE_HOST },
             remoteUsername = account.username,
-            remotePassword = account.password,
             remoteToken = account.token,
             remoteSenderId = account.senderId,
             remoteManagerBaseUrl = account.managerBaseUrl
@@ -35,13 +34,12 @@ class MainViewModel(
         return identity
     }
 
-    fun saveRemoteAccount(host: String, username: String, password: String, token: String, managerBaseUrl: String) {
+    fun saveRemoteAccount(host: String, username: String, token: String, managerBaseUrl: String) {
         val senderId = state.remoteSenderId.ifBlank { "phone-${System.currentTimeMillis() % 100000}" }
-        receiverIdentityStore.saveRemoteAccount(host, username, password, token, managerBaseUrl, senderId)
+        receiverIdentityStore.saveRemoteAccount(host, username, token, managerBaseUrl, senderId)
         state = state.copy(
             remoteHost = host,
             remoteUsername = username,
-            remotePassword = password,
             remoteToken = token,
             remoteManagerBaseUrl = managerBaseUrl,
             remoteSenderId = senderId
