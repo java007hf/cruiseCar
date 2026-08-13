@@ -89,6 +89,8 @@ CRUISECAR_DEPLOYMENT=light python3 -m control_server.server
 CRUISECAR_DEPLOYMENT=full python3 -m control_server.server
 ```
 
+Docker 部署：`server/` 下已提供 `Dockerfile` 与 `docker-compose.yml`（light/full 两种 profile）。镜像基于 `python:3.11-slim`，纯标准库无需 `pip install`；容器内工作目录为 `/app/server`，`CRUISECAR_DB` 默认 `/data/cruisecar.db`，需挂载卷才能持久化 SQLite。
+
 端口约定：
 
 ```text

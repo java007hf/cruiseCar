@@ -114,6 +114,43 @@ GET  /api/events?limit=100
 
 浏览器打开 `http://server-ip:8089/` 可使用 `manager_web` 进行登录、加入接收端、查看设备列表和事件；页面会调用 `http://server-ip:8088` 上的 `manager_api`。
 
+### Docker 部署
+
+server 是纯标准库 Python（无需 `pip install`），可以直接容器化。`server/` 目录下已提供 `Dockerfile` 和 `docker-compose.yml`。
+
+```bash
+cd server
+
+# 构建镜像（一次即可）。
+docker build -t cruisecar-server .
+
+# 轻量模式（控制转发 + WebRTC 信令转发）。
+docker run --rm -p 42110:42110 -p 42112:42112 \
+  -e CRUISECAR_DEPLOYMENT=light \
+  -v "$(pwd)/data:/data" \
+  cruisecar-server
+
+# 全量模式（额外启用 manager-api 8088 和 manager-web 8089）。
+docker run --rm -p 42110:42110 -p 42112:42112 -p 8088:8088 -p 8089:8089 \
+  -e CRUISECAR_DEPLOYMENT=full \
+  -e CRUISECAR_AUTH_TOKEN=your-token \
+  -v "$(pwd)/data:/data" \
+  cruisecar-server
+```
+
+或使用 Compose 配置（`server-data` 卷用于跨重启持久化 SQLite 数据库）：
+
+```bash
+docker compose up light   # 轻量模式
+docker compose up full    # 全量模式
+```
+
+注意事项：
+
+- 容器内工作目录为 `/app/server`，以便 `control_server.*` / `manager_api.*` 等相对导入正确解析。
+- `CRUISECAR_DB` 默认指向 `/data/cruisecar.db`，挂载卷到该路径即可持久化数据。
+- 媒体流仍走 WebRTC P2P，容器只转发信令；严格 NAT 环境请在 Android 的 ICE 列表中加入 TURN 服务器。
+
 ## 目录结构
 
 ```text

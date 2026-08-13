@@ -114,6 +114,43 @@ GET  /api/events?limit=100
 
 Open `http://server-ip:8089/` to use `manager_web` for login, receiver registration, device list, and event inspection. The web page calls `manager_api` on `http://server-ip:8088`.
 
+### Docker deployment
+
+The server is pure standard-library Python (no pip install), so it containerizes trivially. A `Dockerfile` and `docker-compose.yml` live in `server/`.
+
+```bash
+cd server
+
+# Build the image once.
+docker build -t cruisecar-server .
+
+# Light mode (control relay + WebRTC signaling relay).
+docker run --rm -p 42110:42110 -p 42112:42112 \
+  -e CRUISECAR_DEPLOYMENT=light \
+  -v "$(pwd)/data:/data" \
+  cruisecar-server
+
+# Full mode (adds manager-api on 8088 and manager-web on 8089).
+docker run --rm -p 42110:42110 -p 42112:42112 -p 8088:8088 -p 8089:8089 \
+  -e CRUISECAR_DEPLOYMENT=full \
+  -e CRUISECAR_AUTH_TOKEN=your-token \
+  -v "$(pwd)/data:/data" \
+  cruisecar-server
+```
+
+Or use Compose profiles (`server-data` volume keeps the SQLite DB across restarts):
+
+```bash
+docker compose up light   # light mode
+docker compose up full    # full mode
+```
+
+Notes:
+
+- The container working directory is `/app/server` so the `control_server.*` / `manager_api.*` imports resolve.
+- `CRUISECAR_DB` defaults to `/data/cruisecar.db`; mount a volume there to persist data.
+- Media still flows WebRTC P2P; the container only relays signaling. For restrictive NAT, add a TURN server to the Android ICE list.
+
 ## Directory Layout
 
 ```text
