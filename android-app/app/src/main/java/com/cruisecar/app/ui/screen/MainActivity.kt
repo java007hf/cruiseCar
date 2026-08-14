@@ -730,7 +730,6 @@ class MainActivity : Activity() {
 
         layout.addView(button("自动扫描并连接 ESP32") { connectEsp32ByScan() })
         layout.addView(button("BLE 扫描附近设备") { blePairing.start() })
-        layout.addView(infoText("接收服务会在进入页面后自动启动；如果服务器连接断开，会自动重试连接。"))
 
         setContentView(withLog(layout))
         preview.start()
