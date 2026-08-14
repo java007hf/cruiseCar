@@ -13,6 +13,7 @@ import java.io.OutputStream
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 class ControlServer(private val port: Int, private val onFrame: (ByteArray, ControlFrame) -> Unit) {
     private val running = AtomicBoolean(false)
@@ -104,6 +105,8 @@ class ControlClient {
     private var output: OutputStream? = null
     private var readThread: Thread? = null
     private var skipHandshakeAck = false
+    /** 连接世代计数: 每次 connect/close 递增, 用于丢弃断连期间排队的过期发送任务。 */
+    private val connectionEpoch = AtomicInteger(0)
 
     var onStatus: ((Boolean, ControlMode) -> Unit)? = null
     var onReceiverGone: (() -> Unit)? = null
@@ -216,6 +219,9 @@ class ControlClient {
 
     fun isConnected(): Boolean = socket?.isConnected == true && output != null && running.get()
 
+    /** 当前连接世代; 发送任务应在提交时记录该值, 执行时比对, 不一致即说明连接已变更。 */
+    fun connectionEpoch(): Int = connectionEpoch.get()
+
     fun close() {
         running.set(false)
         output = null
@@ -223,6 +229,7 @@ class ControlClient {
         socket?.close()
         socket = null
         readThread = null
+        connectionEpoch.incrementAndGet()
     }
 }
 

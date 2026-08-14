@@ -109,10 +109,16 @@ def mode_packet(mode: str | int | ControlMode) -> bytes:
     return bytes(packet)
 
 
+# 舵机物理行程安全下限: 与 Android 发送端 ServoVerticalView 的 130°~180° 对齐,
+# 低于 130° 会损坏舵机。这里作为最后一道防线, 无论命令来自 Web 还是 HTTP API 都限制下限。
+SERVO_ANGLE_MIN = 130
+SERVO_ANGLE_MAX = 180
+
+
 def servo_packet(index: int = 0, angle: int = 90) -> bytes:
     packet = base_packet(FrameType.SERVO)
     packet[3] = clamp_byte(index)
-    packet[4] = max(0, min(int(angle), 180))
+    packet[4] = max(SERVO_ANGLE_MIN, min(int(angle), SERVO_ANGLE_MAX))
     packet[9] = checksum(packet)
     return bytes(packet)
 

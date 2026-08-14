@@ -43,6 +43,7 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import com.cruisecar.app.data.local.ReceiverIdentityStore
@@ -650,7 +651,7 @@ class MainActivity : Activity() {
             senderLayout = null
             showHomeScreen(RootTab.CONNECT)
         }
-        val layout = rootLayout()
+        val (scroll, layout) = scrollableRoot()
         senderLayout = layout
         layout.addView(title("发送端多模式控制"))
 
@@ -672,7 +673,7 @@ class MainActivity : Activity() {
             }
         }
         videoArea.onServoChanged = { angle -> sendServoToReceiver(angle) }
-        layout.addView(videoArea, LinearLayout.LayoutParams(-1, 0, 2.4f))
+        layout.addView(videoArea, LinearLayout.LayoutParams(-1, dp(320)))
 
         /* 接收端状态(ESP32 连接态 + 接收端当前模式)由接收端 1Hz 回传, 此处展示 */
         senderReceiverStatusView = TextView(this).apply {
@@ -731,18 +732,18 @@ class MainActivity : Activity() {
         layout.addView(button("返回") {
             backAction?.invoke()
         })
-        setContentView(withLog(layout))
+        setContentView(withLog(layout, scroll))
     }
 
     private fun showReceiverScreen() {
         backAction = { stopReceiverServices(); receiverLayout = null; showHomeScreen(RootTab.CONNECT) }
-        val layout = rootLayout()
+        val (scroll, layout) = scrollableRoot()
         receiverLayout = layout
         layout.addView(title("接收端多模式中转"))
 
         val preview = CameraPreviewView(this)
         cameraPreview = preview
-        layout.addView(preview, LinearLayout.LayoutParams(-1, 0, 1.5f))
+        layout.addView(preview, LinearLayout.LayoutParams(-1, dp(240)))
 
         receiverEspStatusView = TextView(this).apply {
             text = "未连接"
@@ -762,7 +763,7 @@ class MainActivity : Activity() {
         layout.addView(button("自动扫描并连接 ESP32") { connectEsp32ByScan() })
         layout.addView(button("BLE 扫描附近设备") { blePairing.start() })
 
-        setContentView(withLog(layout))
+        setContentView(withLog(layout, scroll))
         preview.start()
         startReceiverServices()
     }
@@ -1042,7 +1043,7 @@ class MainActivity : Activity() {
     private fun createReceiverVideoRenderer(): SurfaceViewRenderer {
         val renderer = SurfaceViewRenderer(this).apply { visibility = View.VISIBLE }
         receiverVideoRenderer = renderer
-        receiverLayout?.addView(renderer, LinearLayout.LayoutParams(-1, 0, 1.5f))
+        receiverLayout?.addView(renderer, LinearLayout.LayoutParams(-1, dp(220)))
         return renderer
     }
 
@@ -1211,12 +1212,12 @@ class MainActivity : Activity() {
         lastSenderAtMs = now
 
         senderExecutor.execute {
+            val epoch = controlClient.connectionEpoch()
             try {
-                if (controlClient.isConnected()) {
+                /* 断连后重连, 连接世代已变化, 丢弃过期任务, 不把未发送的消息重发给接收端 */
+                if (controlClient.isConnected() && controlClient.connectionEpoch() == epoch) {
                     controlClient.send(state)
                     log("TCP sent: ${state.toHexLine()}")
-                } else {
-                    log("Not connected: scan and connect receiver first")
                 }
             } catch (e: Exception) {
                 log("Send failed: ${e.message}")
@@ -1229,6 +1230,7 @@ class MainActivity : Activity() {
            等该任务发送时自然会带上最新值。这样队列里最多 1 个待发任务,
            延迟被限制在"一次 TCP 写"以内, 不会随拖动时长累积。 */
         val shouldSchedule: Boolean
+        val epoch = controlClient.connectionEpoch()
         synchronized(senderServoLock) {
             senderServoTargetAngle = angle
             shouldSchedule = !senderServoSendScheduled
@@ -1242,11 +1244,10 @@ class MainActivity : Activity() {
                 senderServoTargetAngle
             }
             try {
-                if (controlClient.isConnected()) {
+                /* 断连后重连, 连接世代已变化, 丢弃过期任务, 不把未发送的消息重发给接收端 */
+                if (controlClient.isConnected() && controlClient.connectionEpoch() == epoch) {
                     controlClient.sendServo(angle = target)
                     log("舵机指令已发送: idx=0 angle=$target")
-                } else {
-                    log("未连接接收端: 请先扫描并连接接收端")
                 }
             } catch (e: Exception) {
                 log("舵机发送失败: ${e.message}")
@@ -1276,6 +1277,8 @@ class MainActivity : Activity() {
 
     private fun rootLayout(): LinearLayout = viewFactory.rootLayout()
 
+    private fun scrollableRoot(): Pair<ScrollView, LinearLayout> = viewFactory.scrollableRoot()
+
     private fun row(): LinearLayout = viewFactory.row()
 
     private fun title(text: String): TextView = viewFactory.title(text)
@@ -1286,8 +1289,14 @@ class MainActivity : Activity() {
 
     private fun weightParams(): LinearLayout.LayoutParams = viewFactory.weightParams()
 
-    private fun withLog(content: LinearLayout): LinearLayout {
+    private fun withLog(content: LinearLayout): View {
         val screen = viewFactory.withLog(content)
+        logView = screen.logView
+        return screen.root
+    }
+
+    private fun withLog(content: LinearLayout, rootScroll: ScrollView): View {
+        val screen = viewFactory.withLog(content, rootScroll)
         logView = screen.logView
         return screen.root
     }
