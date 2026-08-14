@@ -632,6 +632,17 @@
         log('视频信令握手成功');
         return;
       }
+      if (message.type === 'peer_replaced') {
+        videoManuallyClosed = true;
+        disconnectVideo(false, false);
+        setVideoStatus('视频：已被新的发送端接管，已停止自动重连');
+        return;
+      }
+      if (message.type === 'peer_left') {
+        setVideoStatus('视频：对端已断开，等待自动重连');
+        scheduleVideoReconnect('对端断开');
+        return;
+      }
       if (!peerConnection) return;
       if (message.type === 'offer' || message.type === 'answer') {
         if (videoOfferTimer) {

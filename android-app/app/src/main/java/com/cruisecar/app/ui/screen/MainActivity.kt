@@ -974,7 +974,17 @@ class MainActivity : Activity() {
             this,
             WebRtcCall.Role.CALLER,
             renderer,
-            cameraFacing = WebRtcCall.CameraFacing.FRONT
+            cameraFacing = WebRtcCall.CameraFacing.FRONT,
+            onPeerDisconnected = {
+                runOnUiThread {
+                    log("Receiver video peer disconnected; closing current WebRTC call")
+                    releaseReceiverCall()
+                    if (receiverMode != ControlMode.SMART_FOLLOW) {
+                        cameraPreview?.visibility = View.VISIBLE
+                        cameraPreview?.start()
+                    }
+                }
+            }
         ) { msg -> log(msg) }
         val state = viewModel.state
         if (state.connectionMode == ConnectionMode.LAN) {

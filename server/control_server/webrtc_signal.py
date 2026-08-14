@@ -127,17 +127,28 @@ class WebRtcSignalHub:
         writer: asyncio.StreamWriter,
         send: Callable[[bytes], Awaitable[None]],
     ) -> None:
+        old: WebRtcPeer | None = None
         async with self._lock:
             room = self.rooms.setdefault(room_id, {})
             old = room.get(role)
-            if old and old.writer is not writer:
-                old.writer.close()
             room[role] = WebRtcPeer(room_id, role, writer, self._remote_addr(writer), time.time(), send)
             logger.info("webrtc peer online room=%s role=%s addr=%s", room_id, role, self._remote_addr(writer))
+        if old and old.writer is not writer:
+            try:
+                await old.send(
+                    json.dumps(
+                        {"type": "peer_replaced", "role": role, "room_id": room_id},
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                )
+            except Exception:
+                pass
+            old.writer.close()
 
     async def _leave(self, room_id: str, role: str, writer: asyncio.StreamWriter) -> None:
         if not room_id or not role:
             return
+        opposite_peer: WebRtcPeer | None = None
         async with self._lock:
             room = self.rooms.get(room_id)
             if not room:
@@ -145,9 +156,21 @@ class WebRtcSignalHub:
             peer = room.get(role)
             if peer and peer.writer is writer:
                 room.pop(role, None)
+                opposite_role = "answerer" if role == "caller" else "caller"
+                opposite_peer = room.get(opposite_role)
                 logger.info("webrtc peer offline room=%s role=%s", room_id, role)
             if not room:
                 self.rooms.pop(room_id, None)
+        if opposite_peer:
+            try:
+                await opposite_peer.send(
+                    json.dumps(
+                        {"type": "peer_left", "role": role, "room_id": room_id},
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                )
+            except Exception:
+                await self._leave(room_id, opposite_peer.role, opposite_peer.writer)
 
     async def _relay_loop_tcp(self, room_id: str, role: str, reader: asyncio.StreamReader) -> None:
         while True:

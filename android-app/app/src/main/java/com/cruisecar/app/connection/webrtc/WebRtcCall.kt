@@ -39,6 +39,7 @@ class WebRtcCall(
     private val role: Role,
     private val renderer: SurfaceViewRenderer,
     private val cameraFacing: CameraFacing = CameraFacing.BACK,
+    private val onPeerDisconnected: () -> Unit = {},
     private val onLog: (String) -> Unit
 ) {
     enum class Role { CALLER, ANSWERER }
@@ -273,6 +274,14 @@ class WebRtcCall(
 
     private fun handleSignal(message: JSONObject) {
         when (message.optString("type")) {
+            "peer_replaced" -> {
+                onLog("WebRTC peer replaced: ${message.optString("role")}")
+                onPeerDisconnected()
+            }
+            "peer_left" -> {
+                onLog("WebRTC peer left: ${message.optString("role")}")
+                onPeerDisconnected()
+            }
             "offer", "answer" -> {
                 onLog("WebRTC received ${message.optString("type")}")
                 val type = SessionDescription.Type.fromCanonicalForm(message.getString("type"))
