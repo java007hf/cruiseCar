@@ -293,7 +293,7 @@ class WebRtcCall(
                 }, sdp)
             }
             "candidate" -> {
-                onLog("WebRTC received ICE candidate")
+                onLog("WebRTC received ICE candidate: ${message.optString("candidate").summarizeIceCandidate()}")
                 peerConnection?.addIceCandidate(
                     IceCandidate(
                         message.getString("sdpMid"),
@@ -307,7 +307,7 @@ class WebRtcCall(
 
     private fun peerObserver() = object : PeerConnection.Observer {
         override fun onIceCandidate(candidate: IceCandidate) {
-            onLog("WebRTC sending ICE candidate")
+            onLog("WebRTC sending ICE candidate: ${candidate.sdp.summarizeIceCandidate()}")
             signal?.sendCandidate(candidate)
         }
 
@@ -340,7 +340,9 @@ class WebRtcCall(
 
         override fun onSignalingChange(state: PeerConnection.SignalingState) = Unit
         override fun onIceConnectionReceivingChange(receiving: Boolean) = Unit
-        override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) = Unit
+        override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {
+            onLog("WebRTC ICE gathering: $state")
+        }
         override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>) = Unit
         override fun onAddTrack(receiver: RtpReceiver, streams: Array<out MediaStream>) = Unit
         override fun onRemoveStream(stream: MediaStream) = Unit
@@ -405,6 +407,13 @@ class WebRtcCall(
 
     private fun iceServers(): List<PeerConnection.IceServer> =
         listOf(PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer())
+}
+
+private fun String.summarizeIceCandidate(): String {
+    val type = Regex(" typ ([a-zA-Z0-9]+)").find(this)?.groupValues?.getOrNull(1) ?: "unknown"
+    val protocol = Regex(" candidate:[^ ]+ [0-9]+ ([a-zA-Z]+)").find(this)?.groupValues?.getOrNull(1) ?: "unknown"
+    val relay = if (type == "relay") " TURN" else ""
+    return "$type/$protocol$relay"
 }
 
 private class SignalChannel(private val socket: Socket, private val skipHandshakeAck: Boolean = false) {

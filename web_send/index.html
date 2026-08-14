@@ -281,6 +281,12 @@
           <button id="connectVideoBtn" class="success">连接视频</button>
           <button id="disconnectVideoBtn" class="danger">断开视频</button>
         </div>
+        <label for="turnUrl">TURN 地址（可选）</label>
+        <input id="turnUrl" placeholder="turn:116.62.32.90:3478?transport=tcp" autocomplete="off" />
+        <label for="turnUser">TURN 用户名（可选）</label>
+        <input id="turnUser" autocomplete="off" />
+        <label for="turnPassword">TURN 密码（可选）</label>
+        <input id="turnPassword" type="password" autocomplete="off" />
         <p id="videoStatus">视频：未连接</p>
       </div>
 
@@ -297,7 +303,10 @@
       apiBase: 'http://116.62.32.90:8088',
       username: '',
       token: '',
-      receiverId: ''
+      receiverId: '',
+      turnUrl: '',
+      turnUser: '',
+      turnPassword: ''
     };
     const state = { ...DEFAULT_STATE, ...readState() };
     const els = {
@@ -319,6 +328,9 @@
       videoPlaceholder: document.querySelector('#videoPlaceholder'),
       connectVideoBtn: document.querySelector('#connectVideoBtn'),
       disconnectVideoBtn: document.querySelector('#disconnectVideoBtn'),
+      turnUrl: document.querySelector('#turnUrl'),
+      turnUser: document.querySelector('#turnUser'),
+      turnPassword: document.querySelector('#turnPassword'),
       videoStatus: document.querySelector('#videoStatus'),
       log: document.querySelector('#log'),
       lxOut: document.querySelector('#lxOut'),
@@ -344,10 +356,14 @@
     function init() {
       els.apiBase.value = state.apiBase;
       els.username.value = state.username;
+      els.turnUrl.value = state.turnUrl || '';
+      els.turnUser.value = state.turnUser || '';
+      els.turnPassword.value = state.turnPassword || '';
       updateLoginStatus();
       bindEvents();
       if (state.token) loadReceivers().catch(err => log('自动刷新设备失败: ' + err.message));
       log('页面已就绪，可在手机浏览器打开后控制服务器模式接收端。');
+      log(`浏览器能力: secure=${window.isSecureContext} RTCPeerConnection=${typeof RTCPeerConnection} WebSocket=${typeof WebSocket}`);
     }
 
     function bindEvents() {
@@ -508,6 +524,9 @@
       const receiverId = state.receiverId || els.receiverSelect.value;
       if (!state.token) throw new Error('请先登录账号');
       if (!receiverId) throw new Error('请先选择接收端设备');
+      if (typeof RTCPeerConnection !== 'function') {
+        throw new Error('当前浏览器不支持 RTCPeerConnection，或被浏览器策略禁用');
+      }
       if (!isRetry) {
         videoReconnectAttempts = 0;
         videoManuallyClosed = false;
@@ -521,9 +540,12 @@
         throw new Error('接收端当前离线，视频开启指令已入队；请先让接收端连上服务器控制端口 42110');
       }
 
-      peerConnection = new RTCPeerConnection({
-        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
-      });
+      const rtcConfig = {
+        iceServers: buildIceServers(),
+        iceCandidatePoolSize: 2
+      };
+      log('WebRTC ICE servers: ' + rtcConfig.iceServers.map(item => Array.isArray(item.urls) ? item.urls.join(',') : item.urls).join(' | '));
+      peerConnection = new RTCPeerConnection(rtcConfig);
       peerConnection.ontrack = event => {
         const [stream] = event.streams;
         if (stream) {
@@ -534,13 +556,23 @@
         }
       };
       peerConnection.onicecandidate = event => {
-        if (!event.candidate) return;
+        if (!event.candidate) {
+          log('ICE candidate gathering complete');
+          return;
+        }
+        log('local ICE: ' + summarizeCandidate(event.candidate.candidate));
         sendVideoSignal({
           type: 'candidate',
           sdpMid: event.candidate.sdpMid,
           sdpMLineIndex: event.candidate.sdpMLineIndex,
           candidate: event.candidate.candidate
         });
+      };
+      peerConnection.oniceconnectionstatechange = () => {
+        log('ICE state: ' + peerConnection.iceConnectionState);
+      };
+      peerConnection.onicegatheringstatechange = () => {
+        log('ICE gathering: ' + peerConnection.iceGatheringState);
       };
       peerConnection.onconnectionstatechange = () => {
         const connectionState = peerConnection.connectionState;
@@ -657,6 +689,7 @@
           setVideoStatus('已发送 answer，正在建立媒体连接...');
         }
       } else if (message.type === 'candidate') {
+        log('remote ICE: ' + summarizeCandidate(message.candidate || ''));
         await peerConnection.addIceCandidate({
           sdpMid: message.sdpMid,
           sdpMLineIndex: message.sdpMLineIndex,
@@ -674,6 +707,25 @@
       const api = new URL(trimSlash(state.apiBase));
       const protocol = api.protocol === 'https:' ? 'wss:' : 'ws:';
       return `${protocol}//${api.hostname}:42112/`;
+    }
+
+    function buildIceServers() {
+      const servers = [{ urls: 'stun:stun.l.google.com:19302' }];
+      if (state.turnUrl) {
+        const turn = { urls: state.turnUrl };
+        if (state.turnUser) turn.username = state.turnUser;
+        if (state.turnPassword) turn.credential = state.turnPassword;
+        servers.push(turn);
+      }
+      return servers;
+    }
+
+    function summarizeCandidate(candidate) {
+      const text = String(candidate || '');
+      const type = (text.match(/ typ ([a-zA-Z0-9]+)/) || [])[1] || 'unknown';
+      const protocol = (text.match(/ candidate:[^ ]+ [0-9]+ ([a-zA-Z]+)/) || [])[1] || 'unknown';
+      const relay = type === 'relay' ? ' TURN' : '';
+      return `${type}/${protocol}${relay}`;
     }
 
     function setVideoStatus(text) {
@@ -694,6 +746,9 @@
     function syncConfigFromInputs() {
       state.apiBase = trimSlash(els.apiBase.value.trim());
       state.username = els.username.value.trim();
+      state.turnUrl = els.turnUrl.value.trim();
+      state.turnUser = els.turnUser.value.trim();
+      state.turnPassword = els.turnPassword.value;
       saveState();
     }
 
@@ -719,7 +774,10 @@
         apiBase: state.apiBase,
         username: state.username,
         token: state.token,
-        receiverId: state.receiverId
+        receiverId: state.receiverId,
+        turnUrl: state.turnUrl,
+        turnUser: state.turnUser,
+        turnPassword: state.turnPassword
       }));
     }
   </script>
