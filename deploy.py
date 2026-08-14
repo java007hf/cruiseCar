@@ -32,6 +32,9 @@ LOG_FILE = os.path.join(SERVER_DIR, "cruisecar-server.log")
 SERVER_MODULE = "control_server.server"
 PROC_PATTERN = "python3 -m control_server.server"
 ENV_DEPLOYMENT = "full"
+# Optional env file (gitignored) holding TURN / other runtime secrets that the
+# server process should inherit on every (re)start. Lines are KEY=VALUE.
+ENV_FILE = os.path.join(SERVER_DIR, ".env")
 
 
 def _run(cmd, cwd=None):
@@ -109,9 +112,27 @@ def kill_old() -> None:
     time.sleep(1)
 
 
+def load_env_file(path: str) -> dict[str, str]:
+    """Parse a simple KEY=VALUE env file (no shell expansion). Missing -> {}."""
+    if not os.path.isfile(path):
+        return {}
+    parsed: dict[str, str] = {}
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            parsed[key.strip()] = value.strip()
+    return parsed
+
+
 def start_server(daemonize: bool) -> int:
     print("[deploy] starting server ...", flush=True)
     env = dict(os.environ)
+    env.update(load_env_file(ENV_FILE))
     env["CRUISECAR_DEPLOYMENT"] = ENV_DEPLOYMENT
 
     if daemonize:

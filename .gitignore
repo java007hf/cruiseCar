@@ -74,6 +74,10 @@ server/**/__pycache__/
 server/*.db
 server/*.db-shm
 server/*.db-wal
+# Server runtime secrets / env (holds TURN static-auth-secret — never commit)
+server/.env
+# Server stdout/stderr log written by deploy.py
+server/cruisecar-server.log
 
 # ---- esp32-firmware: CMake build output (regenerable, never track) ----
 esp32-firmware/build_codex/
