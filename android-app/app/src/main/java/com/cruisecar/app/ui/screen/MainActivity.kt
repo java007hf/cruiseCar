@@ -88,6 +88,9 @@ class MainActivity : Activity() {
     private val remoteWebRtcPort = 42112
     private val remoteManagerPort = 8088
     private val defaultRemoteHost = "116.62.32.90"
+    private val remoteTurnUrl = ""
+    private val remoteTurnUser = ""
+    private val remoteTurnPassword = ""
     private val controlClient = ControlClient()
     private val bluetooth = BluetoothSppClient()
     private val senderExecutor = Executors.newSingleThreadExecutor()
@@ -975,6 +978,7 @@ class MainActivity : Activity() {
             WebRtcCall.Role.CALLER,
             renderer,
             cameraFacing = WebRtcCall.CameraFacing.FRONT,
+            turnConfig = remoteTurnConfig(),
             onPeerDisconnected = {
                 runOnUiThread {
                     log("Receiver video peer disconnected; closing current WebRTC call")
@@ -1108,7 +1112,8 @@ class MainActivity : Activity() {
                 this,
                 WebRtcCall.Role.ANSWERER,
                 renderer,
-                cameraFacing = senderCameraFacing
+                cameraFacing = senderCameraFacing,
+                turnConfig = remoteTurnConfig()
             ) { msg -> log(msg) }
             log("WebRtcCall connect call on ${threadName()}")
             if (state.connectionMode == ConnectionMode.LAN) {
@@ -1130,6 +1135,13 @@ class MainActivity : Activity() {
         }
         senderVideoRenderer = null
     }
+
+    private fun remoteTurnConfig(): WebRtcCall.TurnConfig =
+        WebRtcCall.TurnConfig(
+            url = remoteTurnUrl,
+            username = remoteTurnUser,
+            credential = remoteTurnPassword
+        )
 
     private fun createSenderVideoRenderer(parent: FrameLayout? = null): SurfaceViewRenderer {
         log("createSenderVideoRenderer on ${threadName()}")

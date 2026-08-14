@@ -281,12 +281,6 @@
           <button id="connectVideoBtn" class="success">连接视频</button>
           <button id="disconnectVideoBtn" class="danger">断开视频</button>
         </div>
-        <label for="turnUrl">TURN 地址（可选）</label>
-        <input id="turnUrl" placeholder="turn:116.62.32.90:3478?transport=tcp" autocomplete="off" />
-        <label for="turnUser">TURN 用户名（可选）</label>
-        <input id="turnUser" autocomplete="off" />
-        <label for="turnPassword">TURN 密码（可选）</label>
-        <input id="turnPassword" type="password" autocomplete="off" />
         <p id="videoStatus">视频：未连接</p>
       </div>
 
@@ -303,10 +297,12 @@
       apiBase: 'http://116.62.32.90:8088',
       username: '',
       token: '',
-      receiverId: '',
-      turnUrl: '',
-      turnUser: '',
-      turnPassword: ''
+      receiverId: ''
+    };
+    const TURN_CONFIG = {
+      url: '',
+      username: '',
+      credential: ''
     };
     const state = { ...DEFAULT_STATE, ...readState() };
     const els = {
@@ -328,9 +324,6 @@
       videoPlaceholder: document.querySelector('#videoPlaceholder'),
       connectVideoBtn: document.querySelector('#connectVideoBtn'),
       disconnectVideoBtn: document.querySelector('#disconnectVideoBtn'),
-      turnUrl: document.querySelector('#turnUrl'),
-      turnUser: document.querySelector('#turnUser'),
-      turnPassword: document.querySelector('#turnPassword'),
       videoStatus: document.querySelector('#videoStatus'),
       log: document.querySelector('#log'),
       lxOut: document.querySelector('#lxOut'),
@@ -356,9 +349,6 @@
     function init() {
       els.apiBase.value = state.apiBase;
       els.username.value = state.username;
-      els.turnUrl.value = state.turnUrl || '';
-      els.turnUser.value = state.turnUser || '';
-      els.turnPassword.value = state.turnPassword || '';
       updateLoginStatus();
       bindEvents();
       if (state.token) loadReceivers().catch(err => log('自动刷新设备失败: ' + err.message));
@@ -711,10 +701,10 @@
 
     function buildIceServers() {
       const servers = [{ urls: 'stun:stun.l.google.com:19302' }];
-      if (state.turnUrl) {
-        const turn = { urls: state.turnUrl };
-        if (state.turnUser) turn.username = state.turnUser;
-        if (state.turnPassword) turn.credential = state.turnPassword;
+      if (TURN_CONFIG.url) {
+        const turn = { urls: TURN_CONFIG.url };
+        if (TURN_CONFIG.username) turn.username = TURN_CONFIG.username;
+        if (TURN_CONFIG.credential) turn.credential = TURN_CONFIG.credential;
         servers.push(turn);
       }
       return servers;
@@ -723,7 +713,7 @@
     function summarizeCandidate(candidate) {
       const text = String(candidate || '');
       const type = (text.match(/ typ ([a-zA-Z0-9]+)/) || [])[1] || 'unknown';
-      const protocol = (text.match(/ candidate:[^ ]+ [0-9]+ ([a-zA-Z]+)/) || [])[1] || 'unknown';
+      const protocol = (text.match(/candidate:[^ ]+ [0-9]+ ([a-zA-Z]+)/) || [])[1] || 'unknown';
       const relay = type === 'relay' ? ' TURN' : '';
       return `${type}/${protocol}${relay}`;
     }
@@ -746,9 +736,6 @@
     function syncConfigFromInputs() {
       state.apiBase = trimSlash(els.apiBase.value.trim());
       state.username = els.username.value.trim();
-      state.turnUrl = els.turnUrl.value.trim();
-      state.turnUser = els.turnUser.value.trim();
-      state.turnPassword = els.turnPassword.value;
       saveState();
     }
 
@@ -774,10 +761,7 @@
         apiBase: state.apiBase,
         username: state.username,
         token: state.token,
-        receiverId: state.receiverId,
-        turnUrl: state.turnUrl,
-        turnUser: state.turnUser,
-        turnPassword: state.turnPassword
+        receiverId: state.receiverId
       }));
     }
   </script>

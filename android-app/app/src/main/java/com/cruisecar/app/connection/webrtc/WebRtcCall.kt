@@ -39,11 +39,17 @@ class WebRtcCall(
     private val role: Role,
     private val renderer: SurfaceViewRenderer,
     private val cameraFacing: CameraFacing = CameraFacing.BACK,
+    private val turnConfig: TurnConfig = TurnConfig(),
     private val onPeerDisconnected: () -> Unit = {},
     private val onLog: (String) -> Unit
 ) {
     enum class Role { CALLER, ANSWERER }
     enum class CameraFacing { FRONT, BACK }
+    data class TurnConfig(
+        val url: String = "",
+        val username: String = "",
+        val credential: String = ""
+    )
 
     private val eglBase = EglBase.create()
     private var factory: PeerConnectionFactory? = null
@@ -176,7 +182,9 @@ class WebRtcCall(
         configureSpeakerRoute()
         signal = channel
         ensureFactory()
-        peerConnection = factory?.createPeerConnection(iceServers(), peerObserver())
+        val servers = iceServers()
+        onLog("WebRTC ICE servers: ${servers.joinToString { it.urls.joinToString("|") }}")
+        peerConnection = factory?.createPeerConnection(servers, peerObserver())
         addLocalMedia()
         channel.listen { message -> handleSignal(message) }
         if (createOffer) createOffer()
@@ -406,12 +414,22 @@ class WebRtcCall(
         "${Thread.currentThread().name}/${Thread.currentThread().id}"
 
     private fun iceServers(): List<PeerConnection.IceServer> =
-        listOf(PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer())
+        buildList {
+            add(PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer())
+            if (turnConfig.url.isNotBlank()) {
+                add(
+                    PeerConnection.IceServer.builder(turnConfig.url)
+                        .setUsername(turnConfig.username)
+                        .setPassword(turnConfig.credential)
+                        .createIceServer()
+                )
+            }
+        }
 }
 
 private fun String.summarizeIceCandidate(): String {
     val type = Regex(" typ ([a-zA-Z0-9]+)").find(this)?.groupValues?.getOrNull(1) ?: "unknown"
-    val protocol = Regex(" candidate:[^ ]+ [0-9]+ ([a-zA-Z]+)").find(this)?.groupValues?.getOrNull(1) ?: "unknown"
+    val protocol = Regex("candidate:[^ ]+ [0-9]+ ([a-zA-Z]+)").find(this)?.groupValues?.getOrNull(1) ?: "unknown"
     val relay = if (type == "relay") " TURN" else ""
     return "$type/$protocol$relay"
 }
