@@ -124,6 +124,8 @@ class MainActivity : Activity() {
     private var senderCameraButton: Button? = null
     private var lastSenderState: GamepadState? = null
     private var lastSenderAtMs: Long = 0
+    private var lastReceiverGamepadLogAtMs: Long = 0
+    private var lastReceiverForwardLogAtMs: Long = 0
     /* 舵机命令合并: 只保留"最新目标角度", 同一时刻最多排 1 个发送任务,
        避免拖动竖向舵机控件时大量回调把队列撑爆导致延迟累积。发送走独立线程,
        不与手柄发送争用同一执行器, 降低端到端延迟。 */
@@ -376,7 +378,8 @@ class MainActivity : Activity() {
         val layout = rootLayout()
         layout.addView(title("选择接收端"))
         devices.forEach { device ->
-            layout.addView(button("${device.name.ifBlank { device.deviceId }} | ${if (device.online) "在线" else "离线"} | ESP32=${device.espConnected}") {
+            val row = row()
+            row.addView(button("${device.name.ifBlank { device.deviceId }} | ${if (device.online) "在线" else "离线"} | ESP32=${device.espConnected}") {
                 viewModel.dispatch(AppIntent.SetLastRemoteDevice(device.deviceId, device.name, device.online, device.espConnected, device.mode))
                 log("已选择接收端: ${device.deviceId}")
                 if (stayInMine) {
@@ -385,10 +388,37 @@ class MainActivity : Activity() {
                     setConnectionMode(ConnectionMode.SERVER)
                     showSenderScreen()
                 }
-            })
+            }, LinearLayout.LayoutParams(0, -2, 1f))
+            row.addView(button("删除") { confirmDeleteReceiver(device, stayInMine) }, LinearLayout.LayoutParams(dp(86), -2).apply { leftMargin = dp(8) })
+            layout.addView(row)
         }
         layout.addView(button("返回") { showHomeScreen(if (stayInMine) RootTab.MINE else RootTab.CONNECT) })
         setContentView(withLog(layout))
+    }
+
+    private fun confirmDeleteReceiver(device: RemoteReceiver, stayInMine: Boolean) {
+        AlertDialog.Builder(this)
+            .setTitle("删除接收端")
+            .setMessage("确定从账号中删除 ${device.name.ifBlank { device.deviceId }}？离线设备可直接删除，在线设备需要先退出接收端。")
+            .setNegativeButton("取消", null)
+            .setPositiveButton("删除") { _, _ -> deleteReceiver(device, stayInMine) }
+            .show()
+    }
+
+    private fun deleteReceiver(device: RemoteReceiver, stayInMine: Boolean) {
+        val state = viewModel.state
+        Thread {
+            try {
+                RemoteApi.deleteReceiver(state.remoteManagerBaseUrl.ifBlank { "http://$defaultRemoteHost:$remoteManagerPort" }, state.remoteToken, device.deviceId)
+                if (state.remoteDeviceId == device.deviceId || state.lastRemoteDeviceId == device.deviceId) {
+                    viewModel.dispatch(AppIntent.ClearLastRemoteDevice)
+                }
+                log("已删除接收端: ${device.deviceId}")
+                loadDevicesAndShowPicker(stayInMine)
+            } catch (e: Exception) {
+                log("删除接收端失败: ${e.message}")
+            }
+        }.start()
     }
 
     private fun enterServerReceiver(identity: ReceiverIdentity) {
@@ -811,7 +841,12 @@ class MainActivity : Activity() {
     private fun handleReceiverControlFrame(packet: ByteArray, frame: ControlFrame) {
         when (frame) {
             is ControlFrame.Gamepad -> {
-                if (receiverMode == ControlMode.MANUAL) forwardToEsp32(packet, "Forwarded: ${packet.toHexLine()}")
+                if (receiverMode == ControlMode.MANUAL) {
+                    logReceiverGamepad(frame.state)
+                    forwardToEsp32(packet, "Forwarded: ${packet.toHexLine()}")
+                } else {
+                    logReceiverGamepad(frame.state, "ignored in ${receiverMode.label}")
+                }
             }
             is ControlFrame.Servo -> forwardToEsp32(packet, "Forwarded servo: idx=${frame.index} angle=${frame.angle}")
             is ControlFrame.Mode -> runOnUiThread {
@@ -834,12 +869,31 @@ class MainActivity : Activity() {
     private fun forwardToEsp32(packet: ByteArray, message: String) {
         if (bluetooth.isConnected()) {
             forwardExecutor.execute {
-                bluetooth.send(packet)
-                log(message)
+                if (bluetooth.send(packet)) {
+                    log(message)
+                } else {
+                    logReceiverForwardStatus("ESP32 send failed: ${packet.toHexLine()}")
+                    runOnUiThread { updateReceiverEspStatus(false) }
+                }
             }
         } else {
+            logReceiverForwardStatus("ESP32 not connected; received control frame but not forwarded: ${packet.toHexLine()}")
             runOnUiThread { updateReceiverEspStatus(false) }
         }
+    }
+
+    private fun logReceiverGamepad(state: GamepadState, suffix: String = "received") {
+        val now = System.currentTimeMillis()
+        if (now - lastReceiverGamepadLogAtMs < 800) return
+        lastReceiverGamepadLogAtMs = now
+        log("Receiver gamepad $suffix: lx=${state.lx} ly=${state.ly} rx=${state.rx} ry=${state.ry} buttons=${state.buttons}")
+    }
+
+    private fun logReceiverForwardStatus(message: String) {
+        val now = System.currentTimeMillis()
+        if (now - lastReceiverForwardLogAtMs < 1000) return
+        lastReceiverForwardLogAtMs = now
+        log(message)
     }
 
     private fun stopReceiverServices() {
@@ -872,8 +926,12 @@ class MainActivity : Activity() {
                 bluetooth.send(GamepadState().toPacket())
             }
             ControlMode.SMART_FOLLOW -> {
-                cameraPreview?.visibility = View.VISIBLE
-                cameraPreview?.start()
+                if (webRtcCall == null) {
+                    cameraPreview?.visibility = View.VISIBLE
+                    cameraPreview?.start()
+                } else {
+                    log("Smart follow selected while video is active; keep WebRTC video view")
+                }
                 smartFollow = SmartFollowController(
                     frameProvider = { cameraPreview?.snapshot(240, 180) },
                     onState = { state ->
@@ -903,7 +961,10 @@ class MainActivity : Activity() {
             }
             return
         }
-        if (webRtcCall != null) return
+        if (webRtcCall != null) {
+            log("Receiver video already active; restart for latest sender")
+            releaseReceiverCall()
+        }
         if (receiverMode != ControlMode.SMART_FOLLOW) {
             cameraPreview?.stop()
             cameraPreview?.visibility = View.GONE

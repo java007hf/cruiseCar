@@ -15,5 +15,6 @@ sealed class AppIntent {
         val espConnected: Boolean,
         val mode: String
     ) : AppIntent()
+    data object ClearLastRemoteDevice : AppIntent()
     data class ReceiverIdentityLoaded(val identity: ReceiverIdentity) : AppIntent()
 }

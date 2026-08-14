@@ -83,6 +83,16 @@ class ReceiverIdentityStore(context: Context) {
             .apply()
     }
 
+    fun clearLastRemoteDevice() {
+        accountPrefs.edit()
+            .remove(KEY_REMOTE_LAST_DEVICE_ID)
+            .remove(KEY_REMOTE_LAST_DEVICE_NAME)
+            .remove(KEY_REMOTE_LAST_DEVICE_ONLINE)
+            .remove(KEY_REMOTE_LAST_DEVICE_ESP_CONNECTED)
+            .remove(KEY_REMOTE_LAST_DEVICE_MODE)
+            .apply()
+    }
+
     private fun clearLegacySavedPassword() {
         if (accountPrefs.contains(KEY_LEGACY_REMOTE_PASSWORD)) {
             accountPrefs.edit().remove(KEY_LEGACY_REMOTE_PASSWORD).apply()

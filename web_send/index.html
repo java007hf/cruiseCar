@@ -333,6 +333,7 @@
     let sendTimer = null;
     let videoSocket = null;
     let peerConnection = null;
+    let videoOfferTimer = null;
 
     init();
 
@@ -544,6 +545,10 @@
       videoSocket.onopen = () => {
         setVideoStatus('信令已连接，等待接收端 offer...');
         sendVideoSignal({ role: 'answerer', room_id: receiverId, token: state.token });
+        videoOfferTimer = window.setTimeout(() => {
+          if (!peerConnection || peerConnection.remoteDescription) return;
+          setVideoStatus('视频：等待接收端 offer 超时，请确认同一时间只有一个视频发送端连接');
+        }, 8000);
       };
       videoSocket.onmessage = event => handleVideoSignal(event.data).catch(err => log('视频信令处理失败: ' + err.message));
       videoSocket.onerror = () => setVideoStatus('视频信令连接异常');
@@ -561,6 +566,10 @@
         videoSocket.onclose = null;
         videoSocket.close();
         videoSocket = null;
+      }
+      if (videoOfferTimer) {
+        window.clearTimeout(videoOfferTimer);
+        videoOfferTimer = null;
       }
       if (peerConnection) {
         peerConnection.close();
@@ -583,6 +592,10 @@
       }
       if (!peerConnection) return;
       if (message.type === 'offer' || message.type === 'answer') {
+        if (videoOfferTimer) {
+          window.clearTimeout(videoOfferTimer);
+          videoOfferTimer = null;
+        }
         await peerConnection.setRemoteDescription({ type: message.type, sdp: message.sdp });
         if (message.type === 'offer') {
           const answer = await peerConnection.createAnswer();

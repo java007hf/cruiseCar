@@ -58,6 +58,33 @@ class ManagerApi:
             def do_OPTIONS(self) -> None:
                 self._send_json({"ok": True})
 
+            def do_DELETE(self) -> None:
+                parsed = urlparse(self.path)
+                path = parsed.path.rstrip("/") or "/"
+                if not self._authorized():
+                    self._send_json({"ok": False, "error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
+                    return
+                try:
+                    if path.startswith("/api/receivers/"):
+                        device_id = path.split("/")[-1]
+                        user = self._current_user()
+                        receiver = api.store.get_receiver(device_id)
+                        if not receiver or not self._can_access(receiver):
+                            self._send_json({"ok": False, "error": "receiver not found"}, HTTPStatus.NOT_FOUND)
+                            return
+                        if api.hub and self._is_receiver_online(device_id):
+                            self._send_json({"ok": False, "error": "receiver is online, please stop it before deleting"}, HTTPStatus.CONFLICT)
+                            return
+                        deleted = api.store.delete_receiver(device_id, user["username"] if user else "")
+                        self._send_json({"ok": True, "data": {"deleted": deleted, "device_id": device_id}})
+                    else:
+                        self._send_json({"ok": False, "error": "not found"}, HTTPStatus.NOT_FOUND)
+                except PermissionError as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.FORBIDDEN)
+                except Exception as exc:
+                    logger.exception("manager api delete failed")
+                    self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+
             def do_GET(self) -> None:
                 parsed = urlparse(self.path)
                 path = parsed.path.rstrip("/") or "/"
@@ -155,6 +182,9 @@ class ManagerApi:
                 user = self._current_user()
                 return not user or not row.get("owner_username") or row.get("owner_username") == user.get("username")
 
+            def _is_receiver_online(self, device_id: str) -> bool:
+                return bool(api.hub and device_id in api.hub.receivers)
+
             def _read_json(self) -> dict[str, Any]:
                 length = int(self.headers.get("Content-Length", "0") or "0")
                 if length == 0:
@@ -167,7 +197,7 @@ class ManagerApi:
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(data)))
                 self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
                 self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
                 self.end_headers()
                 self.wfile.write(data)

@@ -50,6 +50,17 @@ class MainViewModel(
                     lastRemoteDeviceMode = intent.mode
                 )
             }
+            AppIntent.ClearLastRemoteDevice -> {
+                receiverIdentityStore.clearLastRemoteDevice()
+                state.copy(
+                    remoteDeviceId = "",
+                    lastRemoteDeviceId = "",
+                    lastRemoteDeviceName = "",
+                    lastRemoteDeviceOnline = false,
+                    lastRemoteDeviceEspConnected = false,
+                    lastRemoteDeviceMode = "manual"
+                )
+            }
             is AppIntent.ReceiverIdentityLoaded -> state.copy(receiverIdentity = intent.identity)
         }
     }

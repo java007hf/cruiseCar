@@ -43,6 +43,10 @@ object RemoteApi {
         return (0 until arr.length()).map { i -> arr.getJSONObject(i).toRemoteReceiver() }
     }
 
+    fun deleteReceiver(baseUrl: String, authToken: String, deviceId: String) {
+        request(baseUrl, "/api/receivers/${deviceId.urlEncode()}", "DELETE", null, authToken)
+    }
+
     private fun request(baseUrl: String, path: String, method: String, body: JSONObject?, token: String?): JSONObject {
         val url = URL(baseUrl.trimEnd('/') + path)
         val conn = (url.openConnection() as HttpURLConnection).apply {
@@ -70,5 +74,6 @@ object RemoteApi {
         espConnected = optBoolean("esp_connected", false),
         mode = optString("mode", "manual")
     )
-}
 
+    private fun String.urlEncode(): String = java.net.URLEncoder.encode(this, Charsets.UTF_8.name())
+}

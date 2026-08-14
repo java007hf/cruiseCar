@@ -200,6 +200,18 @@ class Store:
     def get_receiver(self, device_id: str) -> dict[str, Any] | None:
         return self._get_one("SELECT * FROM receivers WHERE device_id=?", (device_id,))
 
+    def delete_receiver(self, device_id: str, owner_username: str = "") -> bool:
+        with self.connect() as conn:
+            row = conn.execute("SELECT owner_username FROM receivers WHERE device_id=?", (device_id,)).fetchone()
+            if not row:
+                return False
+            if owner_username and row["owner_username"] and row["owner_username"] != owner_username:
+                raise PermissionError("receiver belongs to another account")
+            conn.execute("DELETE FROM receivers WHERE device_id=?", (device_id,))
+            conn.execute("DELETE FROM command_queue WHERE device_id=?", (device_id,))
+            conn.execute("DELETE FROM senders WHERE target_device_id=?", (device_id,))
+        return True
+
     def get_sender(self, sender_id: str) -> dict[str, Any] | None:
         return self._get_one("SELECT * FROM senders WHERE sender_id=?", (sender_id,))
 
