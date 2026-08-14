@@ -334,6 +334,10 @@
     let videoSocket = null;
     let peerConnection = null;
     let videoOfferTimer = null;
+    let videoReconnectTimer = null;
+    let videoReconnectAttempts = 0;
+    let videoManuallyClosed = false;
+    const MAX_VIDEO_RECONNECT_ATTEMPTS = 3;
 
     init();
 
@@ -351,13 +355,13 @@
       els.loadBtn.addEventListener('click', () => loadReceivers().catch(showError));
       els.connectEspBtn.addEventListener('click', () => sendCommand({ type: 'command', code: 1 }, '远程连接 ESP32'));
       els.stopBtn.addEventListener('click', stopCar);
-      els.connectVideoBtn.addEventListener('click', () => connectVideo().catch(showError));
-      els.disconnectVideoBtn.addEventListener('click', disconnectVideo);
+      els.connectVideoBtn.addEventListener('click', () => connectVideo(false).catch(showError));
+      els.disconnectVideoBtn.addEventListener('click', () => disconnectVideo(true));
       els.receiverSelect.addEventListener('change', () => {
         state.receiverId = els.receiverSelect.value;
         saveState();
         log('已选择接收端: ' + state.receiverId);
-        disconnectVideo();
+        disconnectVideo(true);
       });
       document.querySelectorAll('[data-mode]').forEach(btn => {
         btn.addEventListener('click', () => sendCommand({ type: 'mode', mode: btn.dataset.mode }, '切换模式 ' + btn.dataset.mode));
@@ -499,14 +503,18 @@
       return result;
     }
 
-    async function connectVideo() {
+    async function connectVideo(isRetry = false) {
       syncConfigFromInputs();
       const receiverId = state.receiverId || els.receiverSelect.value;
       if (!state.token) throw new Error('请先登录账号');
       if (!receiverId) throw new Error('请先选择接收端设备');
-      disconnectVideo(false);
+      if (!isRetry) {
+        videoReconnectAttempts = 0;
+        videoManuallyClosed = false;
+      }
+      disconnectVideo(false, false);
 
-      setVideoStatus('正在通知接收端开启视频...');
+      setVideoStatus(isRetry ? `正在重新连接视频(${videoReconnectAttempts}/${MAX_VIDEO_RECONNECT_ATTEMPTS})...` : '正在通知接收端开启视频...');
       const commandResult = await sendCommand({ type: 'mode', mode: 'video_call' }, '开启视频');
       if (!commandResult.delivered) {
         setVideoStatus('视频：接收端离线，无法建立连接');
@@ -521,6 +529,7 @@
         if (stream) {
           els.remoteVideo.srcObject = stream;
           els.videoPlaceholder.classList.add('hidden');
+          videoReconnectAttempts = 0;
           setVideoStatus('视频：已接收画面');
         }
       };
@@ -534,8 +543,12 @@
         });
       };
       peerConnection.onconnectionstatechange = () => {
-        setVideoStatus('视频连接：' + peerConnection.connectionState);
-        if (['failed', 'disconnected', 'closed'].includes(peerConnection.connectionState)) {
+        const connectionState = peerConnection.connectionState;
+        setVideoStatus('视频连接：' + connectionState);
+        if (['failed', 'disconnected'].includes(connectionState)) {
+          els.videoPlaceholder.classList.remove('hidden');
+          scheduleVideoReconnect('视频连接' + connectionState);
+        } else if (connectionState === 'closed') {
           els.videoPlaceholder.classList.remove('hidden');
         }
       };
@@ -547,20 +560,32 @@
         sendVideoSignal({ role: 'answerer', room_id: receiverId, token: state.token });
         videoOfferTimer = window.setTimeout(() => {
           if (!peerConnection || peerConnection.remoteDescription) return;
-          setVideoStatus('视频：等待接收端 offer 超时，请确认同一时间只有一个视频发送端连接');
+          setVideoStatus('视频：等待接收端 offer 超时，正在尝试重新触发接收端视频');
+          scheduleVideoReconnect('等待 offer 超时');
         }, 8000);
       };
       videoSocket.onmessage = event => handleVideoSignal(event.data).catch(err => log('视频信令处理失败: ' + err.message));
-      videoSocket.onerror = () => setVideoStatus('视频信令连接异常');
+      videoSocket.onerror = () => {
+        setVideoStatus('视频信令连接异常');
+        scheduleVideoReconnect('信令异常');
+      };
       videoSocket.onclose = () => {
-        if (peerConnection) setVideoStatus('视频信令已断开');
+        if (peerConnection) {
+          setVideoStatus('视频信令已断开');
+          scheduleVideoReconnect('信令断开');
+        }
       };
       log('视频信令连接: ' + wsUrl + ' room=' + receiverId);
     }
 
-    function disconnectVideo(sendOff = true) {
+    function disconnectVideo(sendOff = true, updateStatus = true) {
+      if (sendOff) videoManuallyClosed = true;
       if (sendOff) {
         sendCommand({ type: 'mode', mode: 'video_off' }, '关闭视频', true).catch(() => {});
+      }
+      if (videoReconnectTimer) {
+        window.clearTimeout(videoReconnectTimer);
+        videoReconnectTimer = null;
       }
       if (videoSocket) {
         videoSocket.onclose = null;
@@ -580,7 +605,24 @@
         els.remoteVideo.srcObject = null;
       }
       els.videoPlaceholder.classList.remove('hidden');
-      setVideoStatus('视频：未连接');
+      if (updateStatus) setVideoStatus('视频：未连接');
+    }
+
+    function scheduleVideoReconnect(reason) {
+      if (videoManuallyClosed || videoReconnectTimer) return;
+      if (videoReconnectAttempts >= MAX_VIDEO_RECONNECT_ATTEMPTS) {
+        setVideoStatus(`视频：自动重连失败，请重新点击连接视频（${reason}）`);
+        return;
+      }
+      videoReconnectAttempts += 1;
+      setVideoStatus(`视频：${reason}，准备自动重连 ${videoReconnectAttempts}/${MAX_VIDEO_RECONNECT_ATTEMPTS}`);
+      videoReconnectTimer = window.setTimeout(() => {
+        videoReconnectTimer = null;
+        connectVideo(true).catch(err => {
+          log('视频自动重连失败: ' + err.message);
+          scheduleVideoReconnect('重连失败');
+        });
+      }, 1200);
     }
 
     async function handleVideoSignal(raw) {
