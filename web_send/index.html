@@ -150,6 +150,42 @@
     .metric span { display: block; color: var(--muted); font-size: 12px; }
     .metric strong { font-size: 18px; }
 
+    .video-card {
+      position: relative;
+      width: 100%;
+      min-height: 240px;
+      display: grid;
+      place-items: center;
+      overflow: hidden;
+      border-radius: 18px;
+      border: 1px solid rgba(255,255,255,0.1);
+      background:
+        radial-gradient(circle at 50% 20%, rgba(53, 194, 255, 0.16), transparent 42%),
+        #020617;
+    }
+
+    #remoteVideo {
+      width: 100%;
+      min-height: 240px;
+      display: block;
+      object-fit: contain;
+      background: #000;
+    }
+
+    .video-placeholder {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      padding: 18px;
+      color: var(--muted);
+      text-align: center;
+      pointer-events: none;
+      background: linear-gradient(180deg, rgba(2, 6, 23, 0.42), rgba(2, 6, 23, 0.76));
+    }
+
+    .video-placeholder.hidden { display: none; }
+
     #log {
       min-height: 180px;
       max-height: 260px;
@@ -236,6 +272,19 @@
       </div>
 
       <div class="card">
+        <h2>接收端视频流</h2>
+        <div class="video-card">
+          <video id="remoteVideo" autoplay playsinline muted></video>
+          <div id="videoPlaceholder" class="video-placeholder">点击“连接视频”后，会通过服务器 WebRTC 信令接收车端摄像头画面。</div>
+        </div>
+        <div class="actions">
+          <button id="connectVideoBtn" class="success">连接视频</button>
+          <button id="disconnectVideoBtn" class="danger">断开视频</button>
+        </div>
+        <p id="videoStatus">视频：未连接</p>
+      </div>
+
+      <div class="card">
         <h2>日志</h2>
         <div id="log"></div>
       </div>
@@ -266,6 +315,11 @@
       statusText: document.querySelector('#statusText'),
       joystick: document.querySelector('#joystick'),
       stick: document.querySelector('#stick'),
+      remoteVideo: document.querySelector('#remoteVideo'),
+      videoPlaceholder: document.querySelector('#videoPlaceholder'),
+      connectVideoBtn: document.querySelector('#connectVideoBtn'),
+      disconnectVideoBtn: document.querySelector('#disconnectVideoBtn'),
+      videoStatus: document.querySelector('#videoStatus'),
       log: document.querySelector('#log'),
       lxOut: document.querySelector('#lxOut'),
       lyOut: document.querySelector('#lyOut'),
@@ -277,6 +331,8 @@
     let currentPad = { lx: 128, ly: 128, rx: 128, ry: 128, buttons: 0 };
     let lastSendAt = 0;
     let sendTimer = null;
+    let videoSocket = null;
+    let peerConnection = null;
 
     init();
 
@@ -294,10 +350,13 @@
       els.loadBtn.addEventListener('click', () => loadReceivers().catch(showError));
       els.connectEspBtn.addEventListener('click', () => sendCommand({ type: 'command', code: 1 }, '远程连接 ESP32'));
       els.stopBtn.addEventListener('click', stopCar);
+      els.connectVideoBtn.addEventListener('click', () => connectVideo().catch(showError));
+      els.disconnectVideoBtn.addEventListener('click', disconnectVideo);
       els.receiverSelect.addEventListener('change', () => {
         state.receiverId = els.receiverSelect.value;
         saveState();
         log('已选择接收端: ' + state.receiverId);
+        disconnectVideo();
       });
       document.querySelectorAll('[data-mode]').forEach(btn => {
         btn.addEventListener('click', () => sendCommand({ type: 'mode', mode: btn.dataset.mode }, '切换模式 ' + btn.dataset.mode));
@@ -437,6 +496,119 @@
       });
       if (!quiet) log(`${label || command.type} 已发送: ${result.delivered ? '实时送达' : '接收端离线，已入队'} ${result.packet_hex || ''}`);
       return result;
+    }
+
+    async function connectVideo() {
+      syncConfigFromInputs();
+      const receiverId = state.receiverId || els.receiverSelect.value;
+      if (!state.token) throw new Error('请先登录账号');
+      if (!receiverId) throw new Error('请先选择接收端设备');
+      disconnectVideo(false);
+
+      setVideoStatus('正在通知接收端开启视频...');
+      await sendCommand({ type: 'mode', mode: 'video_call' }, '开启视频');
+
+      peerConnection = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+      });
+      peerConnection.ontrack = event => {
+        const [stream] = event.streams;
+        if (stream) {
+          els.remoteVideo.srcObject = stream;
+          els.videoPlaceholder.classList.add('hidden');
+          setVideoStatus('视频：已接收画面');
+        }
+      };
+      peerConnection.onicecandidate = event => {
+        if (!event.candidate) return;
+        sendVideoSignal({
+          type: 'candidate',
+          sdpMid: event.candidate.sdpMid,
+          sdpMLineIndex: event.candidate.sdpMLineIndex,
+          candidate: event.candidate.candidate
+        });
+      };
+      peerConnection.onconnectionstatechange = () => {
+        setVideoStatus('视频连接：' + peerConnection.connectionState);
+        if (['failed', 'disconnected', 'closed'].includes(peerConnection.connectionState)) {
+          els.videoPlaceholder.classList.remove('hidden');
+        }
+      };
+
+      const wsUrl = buildWebRtcWsUrl();
+      videoSocket = new WebSocket(wsUrl);
+      videoSocket.onopen = () => {
+        setVideoStatus('信令已连接，等待接收端 offer...');
+        sendVideoSignal({ role: 'answerer', room_id: receiverId, token: state.token });
+      };
+      videoSocket.onmessage = event => handleVideoSignal(event.data).catch(err => log('视频信令处理失败: ' + err.message));
+      videoSocket.onerror = () => setVideoStatus('视频信令连接异常');
+      videoSocket.onclose = () => {
+        if (peerConnection) setVideoStatus('视频信令已断开');
+      };
+      log('视频信令连接: ' + wsUrl + ' room=' + receiverId);
+    }
+
+    function disconnectVideo(sendOff = true) {
+      if (sendOff) {
+        sendCommand({ type: 'mode', mode: 'video_off' }, '关闭视频', true).catch(() => {});
+      }
+      if (videoSocket) {
+        videoSocket.onclose = null;
+        videoSocket.close();
+        videoSocket = null;
+      }
+      if (peerConnection) {
+        peerConnection.close();
+        peerConnection = null;
+      }
+      if (els.remoteVideo.srcObject) {
+        els.remoteVideo.srcObject.getTracks().forEach(track => track.stop());
+        els.remoteVideo.srcObject = null;
+      }
+      els.videoPlaceholder.classList.remove('hidden');
+      setVideoStatus('视频：未连接');
+    }
+
+    async function handleVideoSignal(raw) {
+      const message = JSON.parse(raw);
+      if (message.ok !== undefined) {
+        if (!message.ok) throw new Error(message.error || '信令握手失败');
+        log('视频信令握手成功');
+        return;
+      }
+      if (!peerConnection) return;
+      if (message.type === 'offer' || message.type === 'answer') {
+        await peerConnection.setRemoteDescription({ type: message.type, sdp: message.sdp });
+        if (message.type === 'offer') {
+          const answer = await peerConnection.createAnswer();
+          await peerConnection.setLocalDescription(answer);
+          sendVideoSignal({ type: answer.type, sdp: answer.sdp });
+          setVideoStatus('已发送 answer，正在建立媒体连接...');
+        }
+      } else if (message.type === 'candidate') {
+        await peerConnection.addIceCandidate({
+          sdpMid: message.sdpMid,
+          sdpMLineIndex: message.sdpMLineIndex,
+          candidate: message.candidate
+        });
+      }
+    }
+
+    function sendVideoSignal(payload) {
+      if (!videoSocket || videoSocket.readyState !== WebSocket.OPEN) return;
+      videoSocket.send(JSON.stringify(payload));
+    }
+
+    function buildWebRtcWsUrl() {
+      const api = new URL(trimSlash(state.apiBase));
+      const protocol = api.protocol === 'https:' ? 'wss:' : 'ws:';
+      return `${protocol}//${api.hostname}:42112/`;
+    }
+
+    function setVideoStatus(text) {
+      els.videoStatus.textContent = text;
+      log(text);
     }
 
     async function request(path, options = {}) {

@@ -109,6 +109,7 @@ class MainActivity : Activity() {
     private var receiverEspStatusView: TextView? = null
     /* 接收端 → 发送端 状态回报定时任务句柄, stopReceiverServices 时取消 */
     private var receiverReporterTask: ScheduledFuture<*>? = null
+    private var receiverServicesStarted = false
     private var smartFollow: SmartFollowController? = null
     private var webRtcCall: WebRtcCall? = null
     private lateinit var logView: TextView
@@ -729,10 +730,11 @@ class MainActivity : Activity() {
 
         layout.addView(button("自动扫描并连接 ESP32") { connectEsp32ByScan() })
         layout.addView(button("BLE 扫描附近设备") { blePairing.start() })
-        layout.addView(button("启动接收服务") { startReceiverServices() })
+        layout.addView(infoText("接收服务会在进入页面后自动启动；如果服务器连接断开，会自动重试连接。"))
 
         setContentView(withLog(layout))
         preview.start()
+        startReceiverServices()
     }
 
     private fun updateReceiverEspStatus(connected: Boolean) {
@@ -756,6 +758,8 @@ class MainActivity : Activity() {
     }
 
     private fun startReceiverServices() {
+        if (receiverServicesStarted) return
+        receiverServicesStarted = true
         val state = viewModel.state
         if (state.connectionMode != ConnectionMode.LAN) {
             startRemoteReceiverServices()
@@ -782,23 +786,27 @@ class MainActivity : Activity() {
     private fun startRemoteReceiverServices() {
         val state = viewModel.state
         controlClient.onFrame = { packet, frame -> handleReceiverControlFrame(packet, frame) }
-        Thread {
-            try {
-                controlClient.connectRemoteReceiver(state.remoteHost, remoteControlPort, state.remoteDeviceId, state.remoteToken) { log(it) }
-                log("Remote receiver ready: device=${state.remoteDeviceId} server=${state.remoteHost}")
-            } catch (e: Exception) {
-                log("Remote receiver connect failed: ${e.message}")
-            }
-        }.start()
+        controlClient.onReceiverGone = {
+            log("Remote receiver disconnected; waiting for retry")
+        }
         receiverReporterTask = receiverReporter.scheduleAtFixedRate({
             try {
+                if (!controlClient.isConnected()) {
+                    try {
+                        log("Remote receiver reconnecting: ${state.remoteHost}:$remoteControlPort device=${state.remoteDeviceId}")
+                        controlClient.connectRemoteReceiver(state.remoteHost, remoteControlPort, state.remoteDeviceId, state.remoteToken) { log(it) }
+                        log("Remote receiver ready: device=${state.remoteDeviceId} server=${state.remoteHost}")
+                    } catch (e: Exception) {
+                        log("Remote receiver retry failed: ${e.message}")
+                    }
+                }
                 if (controlClient.isConnected()) {
                     controlClient.sendRaw(StatusCommand.packet(bluetooth.isConnected(), receiverMode))
                 }
             } catch (e: Exception) {
                 log("Remote status report failed: ${e.message}")
             }
-        }, 1, 1, TimeUnit.SECONDS)
+        }, 0, 3, TimeUnit.SECONDS)
     }
 
     private fun handleReceiverControlFrame(packet: ByteArray, frame: ControlFrame) {
@@ -843,12 +851,15 @@ class MainActivity : Activity() {
         discoveryResponder?.stop()
         controlServer?.stop()
         controlClient.onFrame = null
+        controlClient.onReceiverGone = null
+        controlClient.close()
         discoveryResponder = null
         controlServer = null
         cameraPreview?.stop()
         cameraPreview?.visibility = View.VISIBLE
         releaseReceiverCall()
         receiverLayout = null
+        receiverServicesStarted = false
     }
 
     private fun applyReceiverDriveMode(mode: ControlMode) {
