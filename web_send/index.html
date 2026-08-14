@@ -506,7 +506,11 @@
       disconnectVideo(false);
 
       setVideoStatus('正在通知接收端开启视频...');
-      await sendCommand({ type: 'mode', mode: 'video_call' }, '开启视频');
+      const commandResult = await sendCommand({ type: 'mode', mode: 'video_call' }, '开启视频');
+      if (!commandResult.delivered) {
+        setVideoStatus('视频：接收端离线，无法建立连接');
+        throw new Error('接收端当前离线，视频开启指令已入队；请先让接收端连上服务器控制端口 42110');
+      }
 
       peerConnection = new RTCPeerConnection({
         iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
