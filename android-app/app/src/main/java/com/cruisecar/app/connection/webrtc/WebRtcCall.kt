@@ -39,14 +39,14 @@ class WebRtcCall(
     private val role: Role,
     private val renderer: SurfaceViewRenderer,
     private val cameraFacing: CameraFacing = CameraFacing.BACK,
-    private val turnConfig: TurnConfig = TurnConfig(),
+    private val iceServerProvider: () -> List<IceServerConfig> = { emptyList() },
     private val onPeerDisconnected: () -> Unit = {},
     private val onLog: (String) -> Unit
 ) {
     enum class Role { CALLER, ANSWERER }
     enum class CameraFacing { FRONT, BACK }
-    data class TurnConfig(
-        val url: String = "",
+    data class IceServerConfig(
+        val urls: List<String>,
         val username: String = "",
         val credential: String = ""
     )
@@ -415,14 +415,21 @@ class WebRtcCall(
 
     private fun iceServers(): List<PeerConnection.IceServer> =
         buildList {
-            add(PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer())
-            if (turnConfig.url.isNotBlank()) {
-                add(
-                    PeerConnection.IceServer.builder(turnConfig.url)
-                        .setUsername(turnConfig.username)
-                        .setPassword(turnConfig.credential)
-                        .createIceServer()
-                )
+            val remoteServers = try {
+                iceServerProvider()
+            } catch (e: Exception) {
+                onLog("WebRTC load ICE servers failed: ${e.message}")
+                emptyList()
+            }
+            val configs = remoteServers.ifEmpty {
+                listOf(IceServerConfig(listOf("stun:stun.l.google.com:19302")))
+            }
+            for (server in configs) {
+                if (server.urls.isEmpty()) continue
+                val builder = PeerConnection.IceServer.builder(server.urls)
+                if (server.username.isNotBlank()) builder.setUsername(server.username)
+                if (server.credential.isNotBlank()) builder.setPassword(server.credential)
+                add(builder.createIceServer())
             }
         }
 }

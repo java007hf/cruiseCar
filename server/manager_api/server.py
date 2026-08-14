@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import threading
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING, Any
@@ -109,6 +113,12 @@ class ManagerApi:
                     user = self._current_user()
                     data = api.store.list_senders_for_user(user["username"]) if user else api.store.list_senders()
                     self._send_json({"ok": True, "data": data})
+                elif path == "/api/webrtc/ice-servers":
+                    user = self._current_user()
+                    if not user:
+                        self._send_json({"ok": False, "error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
+                        return
+                    self._send_json({"ok": True, "data": api.issue_ice_servers(user["username"])})
                 elif path == "/api/events":
                     limit = int((query.get("limit") or [100])[0])
                     device_id = (query.get("device_id") or [""])[0]
@@ -213,6 +223,26 @@ class ManagerApi:
 
     def manager_web_url(self) -> str:
         return f"http://{self.config.host}:{self.config.manager_web_port}/"
+
+    def issue_ice_servers(self, username: str) -> dict[str, Any]:
+        servers: list[dict[str, Any]] = [{"urls": list(self.config.stun_urls)}] if self.config.stun_urls else []
+        expires_at = int(time.time()) + max(60, self.config.turn_ttl_seconds)
+        if self.config.turn_urls and self.config.turn_static_auth_secret:
+            turn_username = f"{expires_at}:{username}"
+            digest = hmac.new(
+                self.config.turn_static_auth_secret.encode("utf-8"),
+                turn_username.encode("utf-8"),
+                hashlib.sha1,
+            ).digest()
+            servers.append(
+                {
+                    "urls": list(self.config.turn_urls),
+                    "username": turn_username,
+                    "credential": base64.b64encode(digest).decode("ascii"),
+                    "credentialType": "password",
+                }
+            )
+        return {"ice_servers": servers, "expires_at": expires_at}
 
     def dispatch_command(self, device_id: str, command: dict[str, Any]) -> dict[str, Any]:
         if not self.store.get_receiver(device_id):

@@ -14,6 +14,10 @@ class ServerConfig:
     webrtc_port: int
     manager_port: int
     manager_web_port: int
+    stun_urls: tuple[str, ...]
+    turn_urls: tuple[str, ...]
+    turn_static_auth_secret: str
+    turn_ttl_seconds: int
     database_path: Path
     heartbeat_timeout_seconds: int
 
@@ -29,8 +33,17 @@ def load_config() -> ServerConfig:
         webrtc_port=int(os.getenv("CRUISECAR_WEBRTC_PORT", "42112")),
         manager_port=int(os.getenv("CRUISECAR_MANAGER_PORT", "8088")),
         manager_web_port=int(os.getenv("CRUISECAR_MANAGER_WEB_PORT", "8089")),
+        stun_urls=_csv_env("CRUISECAR_STUN_URLS", "stun:stun.l.google.com:19302"),
+        turn_urls=_csv_env("CRUISECAR_TURN_URLS", ""),
+        turn_static_auth_secret=os.getenv("CRUISECAR_TURN_STATIC_AUTH_SECRET", ""),
+        turn_ttl_seconds=int(os.getenv("CRUISECAR_TURN_TTL_SECONDS", "3600")),
         database_path=Path(
             os.getenv("CRUISECAR_DB", str(ROOT_DIR / "cruisecar.db"))
         ),
         heartbeat_timeout_seconds=int(os.getenv("CRUISECAR_HEARTBEAT_TIMEOUT", "20")),
     )
+
+
+def _csv_env(key: str, default: str) -> tuple[str, ...]:
+    value = os.getenv(key, default)
+    return tuple(item.strip() for item in value.split(",") if item.strip())

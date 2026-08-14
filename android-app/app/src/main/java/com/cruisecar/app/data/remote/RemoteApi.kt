@@ -15,6 +15,12 @@ data class RemoteReceiver(
     val mode: String
 )
 
+data class RemoteIceServer(
+    val urls: List<String>,
+    val username: String = "",
+    val credential: String = ""
+)
+
 object RemoteApi {
     fun login(baseUrl: String, username: String, password: String): String {
         val json = request(
@@ -45,6 +51,28 @@ object RemoteApi {
 
     fun deleteReceiver(baseUrl: String, authToken: String, deviceId: String) {
         request(baseUrl, "/api/receivers/${deviceId.urlEncode()}", "DELETE", null, authToken)
+    }
+
+    fun iceServers(baseUrl: String, authToken: String): List<RemoteIceServer> {
+        val json = request(baseUrl, "/api/webrtc/ice-servers", "GET", null, authToken)
+        val arr = json.getJSONObject("data").getJSONArray("ice_servers")
+        return (0 until arr.length()).mapNotNull { i ->
+            val item = arr.getJSONObject(i)
+            val urls = when (val raw = item.opt("urls")) {
+                is JSONArray -> (0 until raw.length()).map { idx -> raw.getString(idx) }
+                is String -> listOf(raw)
+                else -> emptyList()
+            }
+            if (urls.isEmpty()) {
+                null
+            } else {
+                RemoteIceServer(
+                    urls = urls,
+                    username = item.optString("username", ""),
+                    credential = item.optString("credential", "")
+                )
+            }
+        }
     }
 
     private fun request(baseUrl: String, path: String, method: String, body: JSONObject?, token: String?): JSONObject {

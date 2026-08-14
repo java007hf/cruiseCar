@@ -299,11 +299,6 @@
       token: '',
       receiverId: ''
     };
-    const TURN_CONFIG = {
-      url: '',
-      username: '',
-      credential: ''
-    };
     const state = { ...DEFAULT_STATE, ...readState() };
     const els = {
       apiBase: document.querySelector('#apiBase'),
@@ -531,7 +526,7 @@
       }
 
       const rtcConfig = {
-        iceServers: buildIceServers(),
+        iceServers: await loadIceServers(),
         iceCandidatePoolSize: 2
       };
       log('WebRTC ICE servers: ' + rtcConfig.iceServers.map(item => Array.isArray(item.urls) ? item.urls.join(',') : item.urls).join(' | '));
@@ -699,15 +694,15 @@
       return `${protocol}//${api.hostname}:42112/`;
     }
 
-    function buildIceServers() {
-      const servers = [{ urls: 'stun:stun.l.google.com:19302' }];
-      if (TURN_CONFIG.url) {
-        const turn = { urls: TURN_CONFIG.url };
-        if (TURN_CONFIG.username) turn.username = TURN_CONFIG.username;
-        if (TURN_CONFIG.credential) turn.credential = TURN_CONFIG.credential;
-        servers.push(turn);
+    async function loadIceServers() {
+      try {
+        const data = await request('/api/webrtc/ice-servers');
+        const servers = data.ice_servers || data.iceServers || [];
+        if (servers.length) return servers;
+      } catch (err) {
+        log('获取 ICE servers 失败，使用默认 STUN: ' + err.message);
       }
-      return servers;
+      return [{ urls: 'stun:stun.l.google.com:19302' }];
     }
 
     function summarizeCandidate(candidate) {

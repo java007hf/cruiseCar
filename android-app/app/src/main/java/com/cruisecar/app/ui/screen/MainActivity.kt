@@ -7,6 +7,7 @@ import com.cruisecar.app.connection.control.DiscoveryScanner
 import com.cruisecar.app.connection.esp32.BluetoothSppClient
 import com.cruisecar.app.connection.esp32.Esp32BlePairing
 import com.cruisecar.app.connection.webrtc.WebRtcCall
+import com.cruisecar.app.data.remote.RemoteIceServer
 import com.cruisecar.app.data.remote.RemoteApi
 import com.cruisecar.app.data.remote.RemoteReceiver
 import com.cruisecar.app.feature.follow.SmartFollowController
@@ -88,9 +89,6 @@ class MainActivity : Activity() {
     private val remoteWebRtcPort = 42112
     private val remoteManagerPort = 8088
     private val defaultRemoteHost = "116.62.32.90"
-    private val remoteTurnUrl = ""
-    private val remoteTurnUser = ""
-    private val remoteTurnPassword = ""
     private val controlClient = ControlClient()
     private val bluetooth = BluetoothSppClient()
     private val senderExecutor = Executors.newSingleThreadExecutor()
@@ -978,7 +976,7 @@ class MainActivity : Activity() {
             WebRtcCall.Role.CALLER,
             renderer,
             cameraFacing = WebRtcCall.CameraFacing.FRONT,
-            turnConfig = remoteTurnConfig(),
+            iceServerProvider = remoteIceServerProvider(),
             onPeerDisconnected = {
                 runOnUiThread {
                     log("Receiver video peer disconnected; closing current WebRTC call")
@@ -1113,7 +1111,7 @@ class MainActivity : Activity() {
                 WebRtcCall.Role.ANSWERER,
                 renderer,
                 cameraFacing = senderCameraFacing,
-                turnConfig = remoteTurnConfig()
+                iceServerProvider = remoteIceServerProvider()
             ) { msg -> log(msg) }
             log("WebRtcCall connect call on ${threadName()}")
             if (state.connectionMode == ConnectionMode.LAN) {
@@ -1136,11 +1134,21 @@ class MainActivity : Activity() {
         senderVideoRenderer = null
     }
 
-    private fun remoteTurnConfig(): WebRtcCall.TurnConfig =
-        WebRtcCall.TurnConfig(
-            url = remoteTurnUrl,
-            username = remoteTurnUser,
-            credential = remoteTurnPassword
+    private fun remoteIceServerProvider(): () -> List<WebRtcCall.IceServerConfig> = {
+        val state = viewModel.state
+        if (state.connectionMode != ConnectionMode.SERVER || state.remoteToken.isBlank()) {
+            emptyList()
+        } else {
+            val baseUrl = state.remoteManagerBaseUrl.ifBlank { "http://$defaultRemoteHost:$remoteManagerPort" }
+            RemoteApi.iceServers(baseUrl, state.remoteToken).map { it.toWebRtcIceServer() }
+        }
+    }
+
+    private fun RemoteIceServer.toWebRtcIceServer(): WebRtcCall.IceServerConfig =
+        WebRtcCall.IceServerConfig(
+            urls = urls,
+            username = username,
+            credential = credential
         )
 
     private fun createSenderVideoRenderer(parent: FrameLayout? = null): SurfaceViewRenderer {
