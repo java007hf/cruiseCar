@@ -11,8 +11,15 @@ class MainViewModel(
             remoteHost = account.host.ifBlank { DEFAULT_REMOTE_HOST },
             remoteUsername = account.username,
             remoteToken = account.token,
+            remoteDeviceId = account.lastDeviceId,
             remoteSenderId = account.senderId,
-            remoteManagerBaseUrl = account.managerBaseUrl
+            remoteManagerBaseUrl = account.managerBaseUrl,
+            remotePreferredRole = account.preferredRole.ifBlank { "sender" },
+            lastRemoteDeviceId = account.lastDeviceId,
+            lastRemoteDeviceName = account.lastDeviceName,
+            lastRemoteDeviceOnline = account.lastDeviceOnline,
+            lastRemoteDeviceEspConnected = account.lastDeviceEspConnected,
+            lastRemoteDeviceMode = account.lastDeviceMode
         )
     }
         private set
@@ -22,6 +29,27 @@ class MainViewModel(
             is AppIntent.SetConnectionMode -> state.copy(connectionMode = intent.mode)
             is AppIntent.SetRemoteDeviceId -> state.copy(remoteDeviceId = intent.deviceId)
             is AppIntent.SetRemoteSenderId -> state.copy(remoteSenderId = intent.senderId)
+            is AppIntent.SetRemotePreferredRole -> {
+                receiverIdentityStore.savePreferredRemoteRole(intent.role)
+                state.copy(remotePreferredRole = intent.role)
+            }
+            is AppIntent.SetLastRemoteDevice -> {
+                receiverIdentityStore.saveLastRemoteDevice(
+                    intent.deviceId,
+                    intent.name,
+                    intent.online,
+                    intent.espConnected,
+                    intent.mode
+                )
+                state.copy(
+                    remoteDeviceId = intent.deviceId,
+                    lastRemoteDeviceId = intent.deviceId,
+                    lastRemoteDeviceName = intent.name,
+                    lastRemoteDeviceOnline = intent.online,
+                    lastRemoteDeviceEspConnected = intent.espConnected,
+                    lastRemoteDeviceMode = intent.mode
+                )
+            }
             is AppIntent.ReceiverIdentityLoaded -> state.copy(receiverIdentity = intent.identity)
         }
     }

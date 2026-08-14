@@ -4,6 +4,7 @@ import logging
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -46,6 +47,12 @@ class ManagerWeb:
                     self._send_text("ok\n", "text/plain; charset=utf-8")
                 elif path == "/":
                     self._send_text(web.index_html(), "text/html; charset=utf-8")
+                elif path in {"/send", "/web_send"}:
+                    self.send_response(HTTPStatus.FOUND.value)
+                    self.send_header("Location", path + "/")
+                    self.end_headers()
+                elif path in {"/send/", "/web_send/"}:
+                    self._send_text(web.web_sender_html(), "text/html; charset=utf-8")
                 else:
                     self._send_text("not found\n", "text/plain; charset=utf-8", HTTPStatus.NOT_FOUND)
 
@@ -61,6 +68,12 @@ class ManagerWeb:
                 self.wfile.write(data)
 
         return Handler
+
+    def web_sender_html(self) -> str:
+        index_path = Path(__file__).resolve().parents[2] / "web_send" / "index.html"
+        if not index_path.exists():
+            return "<!doctype html><meta charset='utf-8'><title>web_send not found</title><body>web_send/index.html not found</body>"
+        return index_path.read_text(encoding="utf-8")
 
     def index_html(self) -> str:
         return f"""<!doctype html><html><head><meta charset='utf-8'><title>CruiseCar Manager</title>

@@ -1,0 +1,194 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1540" height="1600" viewBox="0 0 1540 1600">
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="18" stdDeviation="20" flood-color="#000" flood-opacity="0.20"/>
+    </filter>
+    <linearGradient id="darkBg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#111827"/>
+      <stop offset="1" stop-color="#05070b"/>
+    </linearGradient>
+    <linearGradient id="blueBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="0.52" stop-color="#0b2447"/>
+      <stop offset="1" stop-color="#031525"/>
+    </linearGradient>
+    <linearGradient id="lightBg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f8fbff"/>
+      <stop offset="1" stop-color="#eef4f8"/>
+    </linearGradient>
+    <linearGradient id="orangeBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#17120d"/>
+      <stop offset="1" stop-color="#26150a"/>
+    </linearGradient>
+    <style>
+      .label{font:700 30px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;fill:#111827}
+      .desc{font:500 18px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;fill:#64748b}
+      .phoneTitle{font:800 30px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;letter-spacing:-.5px}
+      .body{font:500 17px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+      .small{font:600 14px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+      .tab{font:800 18px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+      .mono{font:700 18px ui-monospace,SFMono-Regular,Menlo,monospace}
+    </style>
+  </defs>
+
+  <rect width="1540" height="1600" fill="#f1f5f9"/>
+  <text x="70" y="72" class="label">CruiseCar App 首页 UI 方向（4 选 1）</text>
+  <text x="70" y="108" class="desc">共同约束：底部只保留「连接 / 我的」两个 Tab；顶部保留页面标题 + 页面操作；登录使用弹窗。</text>
+
+  <!-- Option A -->
+  <g transform="translate(70 155)">
+    <text x="0" y="0" class="label">A. 暗黑驾驶舱</text>
+    <text x="0" y="32" class="desc">科技感强，适合小车/遥控器定位，推荐优先实现</text>
+    <g transform="translate(0 58)" filter="url(#shadow)">
+      <rect x="0" y="0" width="320" height="660" rx="34" fill="url(#darkBg)"/>
+      <rect x="22" y="22" width="276" height="42" rx="21" fill="#1f2937"/>
+      <text x="42" y="49" class="small" fill="#f8fafc">✦ CruiseCar</text>
+      <circle cx="248" cy="43" r="20" fill="#111827" stroke="#334155"/>
+      <text x="240" y="50" class="small" fill="#e2e8f0">⇄</text>
+      <circle cx="284" cy="43" r="20" fill="#111827" stroke="#334155"/>
+      <text x="276" y="50" class="small" fill="#e2e8f0">控</text>
+
+      <text x="24" y="105" class="phoneTitle" fill="#fff">连接</text>
+      <text x="24" y="132" class="body" fill="#94a3b8">服务器账号模式</text>
+
+      <rect x="24" y="156" width="272" height="120" rx="24" fill="#111827" stroke="#273244"/>
+      <text x="46" y="191" class="small" fill="#94a3b8">当前身份</text>
+      <text x="46" y="225" class="phoneTitle" fill="#f8fafc">发送端</text>
+      <rect x="204" y="186" width="62" height="62" rx="31" fill="#22c55e"/>
+      <text x="222" y="225" class="mono" fill="#052e16">ON</text>
+
+      <rect x="24" y="296" width="272" height="92" rx="22" fill="#172033"/>
+      <text x="46" y="331" class="body" fill="#cbd5e1">上次设备</text>
+      <text x="46" y="361" class="small" fill="#94a3b8">Car-Phone-92 · 在线 · ESP32 已连接</text>
+
+      <rect x="24" y="410" width="272" height="56" rx="28" fill="#fff"/>
+      <text x="100" y="446" class="tab" fill="#020617">连接上次设备</text>
+      <rect x="24" y="480" width="272" height="56" rx="28" fill="#1f2937" stroke="#334155"/>
+      <text x="105" y="516" class="tab" fill="#e2e8f0">切换接收端</text>
+
+      <rect x="30" y="576" width="260" height="56" rx="28" fill="#20242c"/>
+      <rect x="36" y="582" width="122" height="44" rx="22" fill="#4b5563"/>
+      <text x="78" y="611" class="tab" fill="#fff">连接</text>
+      <text x="203" y="611" class="tab" fill="#9ca3af">我的</text>
+    </g>
+  </g>
+
+  <!-- Option B -->
+  <g transform="translate(425 155)">
+    <text x="0" y="0" class="label">B. 极简白色</text>
+    <text x="0" y="32" class="desc">清爽、易读，偏工具 App；视觉风险最低</text>
+    <g transform="translate(0 58)" filter="url(#shadow)">
+      <rect x="0" y="0" width="320" height="660" rx="34" fill="url(#lightBg)"/>
+      <text x="24" y="56" class="small" fill="#64748b">CruiseCar</text>
+      <circle cx="252" cy="46" r="20" fill="#e2e8f0"/>
+      <text x="244" y="53" class="small" fill="#0f172a">⇄</text>
+      <circle cx="286" cy="46" r="20" fill="#0f172a"/>
+      <text x="278" y="53" class="small" fill="#fff">控</text>
+
+      <text x="24" y="108" class="phoneTitle" fill="#0f172a">连接</text>
+      <text x="24" y="136" class="body" fill="#64748b">欢迎回来，准备控制小车</text>
+      <rect x="24" y="166" width="272" height="132" rx="28" fill="#fff" stroke="#e2e8f0"/>
+      <text x="46" y="205" class="small" fill="#64748b">状态</text>
+      <text x="46" y="242" class="phoneTitle" fill="#0f172a">已登录</text>
+      <text x="46" y="270" class="body" fill="#64748b">Car-Phone-92 可连接</text>
+
+      <rect x="24" y="320" width="128" height="92" rx="22" fill="#eaf6ff"/>
+      <text x="46" y="354" class="small" fill="#0284c7">身份</text>
+      <text x="46" y="386" class="tab" fill="#0f172a">发送端</text>
+      <rect x="168" y="320" width="128" height="92" rx="22" fill="#ecfdf5"/>
+      <text x="190" y="354" class="small" fill="#16a34a">ESP32</text>
+      <text x="190" y="386" class="tab" fill="#0f172a">已连接</text>
+
+      <rect x="24" y="440" width="272" height="58" rx="29" fill="#0f172a"/>
+      <text x="102" y="477" class="tab" fill="#fff">开始连接</text>
+
+      <rect x="30" y="576" width="260" height="56" rx="28" fill="#fff" stroke="#e2e8f0"/>
+      <rect x="36" y="582" width="122" height="44" rx="22" fill="#0f172a"/>
+      <text x="78" y="611" class="tab" fill="#fff">连接</text>
+      <text x="203" y="611" class="tab" fill="#64748b">我的</text>
+    </g>
+  </g>
+
+  <!-- Option C -->
+  <g transform="translate(780 155)">
+    <text x="0" y="0" class="label">C. 蓝色玻璃态</text>
+    <text x="0" y="32" class="desc">更现代，有层次，适合展示设备状态</text>
+    <g transform="translate(0 58)" filter="url(#shadow)">
+      <rect x="0" y="0" width="320" height="660" rx="34" fill="url(#blueBg)"/>
+      <circle cx="60" cy="120" r="92" fill="#38bdf8" opacity="0.16"/>
+      <circle cx="285" cy="210" r="90" fill="#6366f1" opacity="0.16"/>
+      <rect x="24" y="24" width="150" height="44" rx="22" fill="#ffffff" opacity="0.12"/>
+      <text x="44" y="52" class="small" fill="#e0f2fe">CruiseCar</text>
+      <rect x="232" y="24" width="64" height="44" rx="22" fill="#ffffff" opacity="0.13"/>
+      <text x="244" y="52" class="small" fill="#fff">切换</text>
+
+      <text x="24" y="115" class="phoneTitle" fill="#fff">连接</text>
+      <text x="24" y="143" class="body" fill="#bae6fd">在线设备 1 台 · 信令正常</text>
+      <rect x="24" y="172" width="272" height="170" rx="30" fill="#ffffff" opacity="0.12" stroke="#7dd3fc"/>
+      <text x="48" y="217" class="small" fill="#bae6fd">Car-Phone-92</text>
+      <text x="48" y="259" class="phoneTitle" fill="#fff">准备就绪</text>
+      <rect x="48" y="286" width="96" height="28" rx="14" fill="#22c55e"/>
+      <text x="68" y="306" class="small" fill="#052e16">ONLINE</text>
+      <rect x="156" y="286" width="96" height="28" rx="14" fill="#0ea5e9"/>
+      <text x="174" y="306" class="small" fill="#e0f2fe">ESP32</text>
+
+      <rect x="24" y="370" width="272" height="58" rx="29" fill="#e0f2fe"/>
+      <text x="98" y="407" class="tab" fill="#082f49">连接设备</text>
+      <rect x="24" y="444" width="272" height="58" rx="29" fill="#ffffff" opacity="0.13"/>
+      <text x="102" y="481" class="tab" fill="#e0f2fe">设备列表</text>
+
+      <rect x="30" y="576" width="260" height="56" rx="28" fill="#ffffff" opacity="0.14"/>
+      <rect x="36" y="582" width="122" height="44" rx="22" fill="#e0f2fe"/>
+      <text x="78" y="611" class="tab" fill="#082f49">连接</text>
+      <text x="203" y="611" class="tab" fill="#bae6fd">我的</text>
+    </g>
+  </g>
+
+  <!-- Option D -->
+  <g transform="translate(1135 155)">
+    <text x="0" y="0" class="label">D. 越野仪表盘</text>
+    <text x="0" y="32" class="desc">更有“车”的品牌感，适合后续控制台扩展</text>
+    <g transform="translate(0 58)" filter="url(#shadow)">
+      <rect x="0" y="0" width="320" height="660" rx="34" fill="url(#orangeBg)"/>
+      <rect x="24" y="24" width="152" height="42" rx="21" fill="#2d2118"/>
+      <text x="44" y="51" class="small" fill="#fed7aa">CruiseCar</text>
+      <circle cx="252" cy="45" r="20" fill="#2d2118"/>
+      <text x="244" y="52" class="small" fill="#fed7aa">⇄</text>
+      <circle cx="286" cy="45" r="20" fill="#f97316"/>
+      <text x="278" y="52" class="small" fill="#fff">控</text>
+
+      <text x="24" y="116" class="phoneTitle" fill="#fff7ed">连接</text>
+      <text x="24" y="144" class="body" fill="#fdba74">驾驶模式 · 手动控制</text>
+      <rect x="24" y="170" width="272" height="120" rx="28" fill="#231811" stroke="#7c2d12"/>
+      <text x="46" y="205" class="small" fill="#fdba74">目标设备</text>
+      <text x="46" y="241" class="phoneTitle" fill="#fff7ed">Car-Phone</text>
+      <text x="46" y="266" class="small" fill="#fed7aa">在线 · ESP32 Ready</text>
+
+      <rect x="24" y="314" width="272" height="96" rx="22" fill="#2d2118"/>
+      <path d="M62 380 A54 54 0 0 1 170 380" fill="none" stroke="#f97316" stroke-width="10" stroke-linecap="round"/>
+      <text x="198" y="357" class="small" fill="#fdba74">信号</text>
+      <text x="198" y="386" class="tab" fill="#fff7ed">稳定</text>
+
+      <rect x="24" y="438" width="272" height="58" rx="29" fill="#f97316"/>
+      <text x="98" y="475" class="tab" fill="#fff">启动连接</text>
+
+      <rect x="30" y="576" width="260" height="56" rx="28" fill="#2d2118"/>
+      <rect x="36" y="582" width="122" height="44" rx="22" fill="#f97316"/>
+      <text x="78" y="611" class="tab" fill="#fff">连接</text>
+      <text x="203" y="611" class="tab" fill="#fed7aa">我的</text>
+    </g>
+  </g>
+
+  <g transform="translate(70 920)">
+    <rect x="0" y="0" width="1400" height="560" rx="34" fill="#fff"/>
+    <text x="36" y="58" class="label">选择建议</text>
+    <text x="36" y="104" class="desc">A 暗黑驾驶舱：最贴近你参考图的暗色社交 App 质感，同时符合遥控器/小车科技定位。</text>
+    <text x="36" y="142" class="desc">B 极简白色：最容易实现、可读性最好，但和参考图差异较大，适合偏工具属性。</text>
+    <text x="36" y="180" class="desc">C 蓝色玻璃态：科技感 + 设备状态可视化，后续加视频流/遥测面板会比较自然。</text>
+    <text x="36" y="218" class="desc">D 越野仪表盘：品牌感最强，适合把 CruiseCar 做成“驾驶控制台”，但需要更多视觉细节打磨。</text>
+    <text x="36" y="286" class="label">我推荐</text>
+    <text x="36" y="332" class="desc">如果你想接近参考图：选 A；如果你想更像智能小车控制台：选 C；如果你想稳妥上线：选 B。</text>
+    <text x="36" y="404" class="label">下一步</text>
+    <text x="36" y="450" class="desc">你选一个编号（A/B/C/D），我再按选中的方案把 Android App 首页的顶部导航、卡片、按钮、底部 Tab 全量调整。</text>
+  </g>
+</svg>

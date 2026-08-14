@@ -1,0 +1,485 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>CruiseCar Web 发送端</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0c1222;
+      --card: #172033;
+      --card-2: #202b42;
+      --text: #eef4ff;
+      --muted: #9fb0cc;
+      --accent: #35c2ff;
+      --accent-2: #4ade80;
+      --danger: #fb7185;
+      --border: rgba(255, 255, 255, 0.12);
+    }
+
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: radial-gradient(circle at 20% 0%, #1d3155 0, var(--bg) 42%);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      overscroll-behavior: none;
+      touch-action: manipulation;
+    }
+
+    main {
+      width: min(960px, 100%);
+      margin: 0 auto;
+      padding: 18px;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 16px;
+    }
+
+    h1 { margin: 0; font-size: 24px; }
+    h2 { margin: 0 0 12px; font-size: 18px; }
+    p { color: var(--muted); line-height: 1.5; }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .card {
+      background: linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.02)), var(--card);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 16px;
+      box-shadow: 0 18px 48px rgba(0, 0, 0, 0.22);
+    }
+
+    label { display: block; margin: 10px 0 6px; color: var(--muted); font-size: 13px; }
+    input, select {
+      width: 100%;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+      color: var(--text);
+      background: var(--card-2);
+      font-size: 16px;
+      outline: none;
+    }
+
+    button {
+      border: 0;
+      border-radius: 14px;
+      padding: 12px 14px;
+      color: #06101e;
+      background: var(--accent);
+      font-weight: 700;
+      font-size: 15px;
+      cursor: pointer;
+    }
+
+    button.secondary { background: #334155; color: var(--text); }
+    button.success { background: var(--accent-2); }
+    button.danger { background: var(--danger); color: #fff; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+    .actions > button { flex: 1 1 130px; }
+
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.08);
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--danger); }
+    .dot.ok { background: var(--accent-2); }
+
+    .joystick-wrap {
+      display: grid;
+      place-items: center;
+      min-height: 300px;
+    }
+
+    .joystick {
+      position: relative;
+      width: min(72vw, 310px);
+      height: min(72vw, 310px);
+      max-width: 310px;
+      max-height: 310px;
+      border-radius: 50%;
+      background:
+        radial-gradient(circle at center, transparent 0 38%, rgba(255,255,255,0.08) 39% 40%, transparent 41%),
+        linear-gradient(90deg, transparent 49%, rgba(255,255,255,0.12) 50%, transparent 51%),
+        linear-gradient(0deg, transparent 49%, rgba(255,255,255,0.12) 50%, transparent 51%),
+        #101a2d;
+      border: 1px solid var(--border);
+      box-shadow: inset 0 0 30px rgba(0,0,0,0.35);
+      touch-action: none;
+      user-select: none;
+    }
+
+    .stick {
+      position: absolute;
+      left: 50%; top: 50%;
+      width: 92px; height: 92px;
+      margin-left: -46px; margin-top: -46px;
+      border-radius: 50%;
+      background: radial-gradient(circle at 35% 30%, #ffffff, var(--accent));
+      box-shadow: 0 12px 28px rgba(53, 194, 255, 0.3);
+      transform: translate(0, 0);
+    }
+
+    .telemetry {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 12px;
+    }
+    .metric { background: rgba(255,255,255,0.06); padding: 10px; border-radius: 12px; text-align: center; }
+    .metric span { display: block; color: var(--muted); font-size: 12px; }
+    .metric strong { font-size: 18px; }
+
+    #log {
+      min-height: 180px;
+      max-height: 260px;
+      overflow: auto;
+      white-space: pre-wrap;
+      color: #cbd5e1;
+      background: rgba(0,0,0,0.24);
+      border-radius: 12px;
+      padding: 12px;
+      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    @media (max-width: 760px) {
+      main { padding: 12px; }
+      header { align-items: flex-start; flex-direction: column; }
+      .grid { grid-template-columns: 1fr; }
+      .card { padding: 14px; }
+      .joystick-wrap { min-height: 260px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>CruiseCar Web 发送端</h1>
+        <p>通过 manager-api 登录、选择接收端，并用网页虚拟摇杆下发控制指令。</p>
+      </div>
+      <div class="status"><span id="statusDot" class="dot"></span><span id="statusText">未登录</span></div>
+    </header>
+
+    <section class="grid">
+      <div class="card">
+        <h2>账号与设备</h2>
+        <label for="apiBase">Manager API 地址</label>
+        <input id="apiBase" value="http://116.62.32.90:8088" autocomplete="url" />
+
+        <label for="username">账号</label>
+        <input id="username" autocomplete="username" />
+
+        <label for="password">密码（仅登录使用，不保存）</label>
+        <input id="password" type="password" autocomplete="current-password" />
+
+        <div class="actions">
+          <button id="loginBtn">登录</button>
+          <button id="loadBtn" class="secondary">刷新设备</button>
+        </div>
+
+        <label for="receiverSelect">接收端设备</label>
+        <select id="receiverSelect"></select>
+
+        <div class="actions">
+          <button id="connectEspBtn" class="success">远程连接 ESP32</button>
+          <button id="stopBtn" class="danger">停止 / 回中</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>控制模式</h2>
+        <div class="actions">
+          <button data-mode="manual" class="secondary">手动</button>
+          <button data-mode="smart_follow" class="secondary">智能跟随</button>
+          <button data-mode="patrol" class="secondary">智能巡逻</button>
+        </div>
+
+        <label for="servo">舵机角度：<span id="servoValue">130</span>°</label>
+        <input id="servo" type="range" min="0" max="180" value="130" />
+
+        <div class="telemetry">
+          <div class="metric"><span>LX</span><strong id="lxOut">128</strong></div>
+          <div class="metric"><span>LY</span><strong id="lyOut">128</strong></div>
+          <div class="metric"><span>RX</span><strong id="rxOut">128</strong></div>
+          <div class="metric"><span>RY</span><strong id="ryOut">128</strong></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>虚拟摇杆</h2>
+        <div class="joystick-wrap">
+          <div id="joystick" class="joystick" aria-label="虚拟摇杆">
+            <div id="stick" class="stick"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>日志</h2>
+        <div id="log"></div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const STORAGE_KEY = 'cruisecar.webSender.v1';
+    const DEFAULT_STATE = {
+      apiBase: 'http://116.62.32.90:8088',
+      username: '',
+      token: '',
+      receiverId: ''
+    };
+    const state = { ...DEFAULT_STATE, ...readState() };
+    const els = {
+      apiBase: document.querySelector('#apiBase'),
+      username: document.querySelector('#username'),
+      password: document.querySelector('#password'),
+      loginBtn: document.querySelector('#loginBtn'),
+      loadBtn: document.querySelector('#loadBtn'),
+      receiverSelect: document.querySelector('#receiverSelect'),
+      connectEspBtn: document.querySelector('#connectEspBtn'),
+      stopBtn: document.querySelector('#stopBtn'),
+      servo: document.querySelector('#servo'),
+      servoValue: document.querySelector('#servoValue'),
+      statusDot: document.querySelector('#statusDot'),
+      statusText: document.querySelector('#statusText'),
+      joystick: document.querySelector('#joystick'),
+      stick: document.querySelector('#stick'),
+      log: document.querySelector('#log'),
+      lxOut: document.querySelector('#lxOut'),
+      lyOut: document.querySelector('#lyOut'),
+      rxOut: document.querySelector('#rxOut'),
+      ryOut: document.querySelector('#ryOut')
+    };
+
+    let pointerId = null;
+    let currentPad = { lx: 128, ly: 128, rx: 128, ry: 128, buttons: 0 };
+    let lastSendAt = 0;
+    let sendTimer = null;
+
+    init();
+
+    function init() {
+      els.apiBase.value = state.apiBase;
+      els.username.value = state.username;
+      updateLoginStatus();
+      bindEvents();
+      if (state.token) loadReceivers().catch(err => log('自动刷新设备失败: ' + err.message));
+      log('页面已就绪，可在手机浏览器打开后控制服务器模式接收端。');
+    }
+
+    function bindEvents() {
+      els.loginBtn.addEventListener('click', login);
+      els.loadBtn.addEventListener('click', () => loadReceivers().catch(showError));
+      els.connectEspBtn.addEventListener('click', () => sendCommand({ type: 'command', code: 1 }, '远程连接 ESP32'));
+      els.stopBtn.addEventListener('click', stopCar);
+      els.receiverSelect.addEventListener('change', () => {
+        state.receiverId = els.receiverSelect.value;
+        saveState();
+        log('已选择接收端: ' + state.receiverId);
+      });
+      document.querySelectorAll('[data-mode]').forEach(btn => {
+        btn.addEventListener('click', () => sendCommand({ type: 'mode', mode: btn.dataset.mode }, '切换模式 ' + btn.dataset.mode));
+      });
+      els.servo.addEventListener('input', () => {
+        els.servoValue.textContent = els.servo.value;
+      });
+      els.servo.addEventListener('change', () => sendCommand({ type: 'servo', index: 0, angle: Number(els.servo.value) }, '舵机角度 ' + els.servo.value));
+
+      els.joystick.addEventListener('pointerdown', onPointerDown);
+      els.joystick.addEventListener('pointermove', onPointerMove);
+      els.joystick.addEventListener('pointerup', onPointerUp);
+      els.joystick.addEventListener('pointercancel', onPointerUp);
+      window.addEventListener('blur', stopCar);
+    }
+
+    async function login() {
+      state.apiBase = trimSlash(els.apiBase.value.trim());
+      state.username = els.username.value.trim();
+      const password = els.password.value;
+      if (!state.apiBase || !state.username || !password) throw new Error('请填写 API 地址、账号和密码');
+      const data = await request('/api/auth/login', {
+        method: 'POST',
+        body: { username: state.username, password }
+      });
+      state.token = data.token;
+      els.password.value = '';
+      saveState();
+      updateLoginStatus();
+      log('登录成功: ' + state.username);
+      await loadReceivers();
+    }
+
+    async function loadReceivers() {
+      syncConfigFromInputs();
+      const rows = await request('/api/receivers');
+      els.receiverSelect.innerHTML = '';
+      if (!rows.length) {
+        els.receiverSelect.innerHTML = '<option value="">暂无接收端设备</option>';
+        state.receiverId = '';
+        saveState();
+        log('账号下暂无接收端，请先启动 Android 接收端加入账号。');
+        return;
+      }
+      for (const item of rows) {
+        const option = document.createElement('option');
+        option.value = item.device_id;
+        option.textContent = `${item.name || item.device_id} | ${item.online ? '在线' : '离线'} | ESP32=${!!item.esp_connected} | ${item.mode || 'manual'}`;
+        els.receiverSelect.appendChild(option);
+      }
+      const exists = rows.some(item => item.device_id === state.receiverId);
+      state.receiverId = exists ? state.receiverId : rows[0].device_id;
+      els.receiverSelect.value = state.receiverId;
+      saveState();
+      log(`已刷新 ${rows.length} 台接收端，当前选择: ${state.receiverId}`);
+    }
+
+    function onPointerDown(event) {
+      pointerId = event.pointerId;
+      els.joystick.setPointerCapture(pointerId);
+      updateJoystick(event);
+      sendTimer = window.setInterval(() => sendGamepad(false), 80);
+    }
+
+    function onPointerMove(event) {
+      if (event.pointerId !== pointerId) return;
+      updateJoystick(event);
+      sendGamepad(false);
+    }
+
+    function onPointerUp(event) {
+      if (event.pointerId !== pointerId) return;
+      pointerId = null;
+      if (sendTimer) window.clearInterval(sendTimer);
+      sendTimer = null;
+      resetJoystick();
+      sendGamepad(true);
+    }
+
+    function updateJoystick(event) {
+      const rect = els.joystick.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      const radius = rect.width / 2;
+      const max = radius - 46;
+      const dx = event.clientX - cx;
+      const dy = event.clientY - cy;
+      const distance = Math.min(Math.hypot(dx, dy), max);
+      const angle = Math.atan2(dy, dx);
+      const x = Math.cos(angle) * distance;
+      const y = Math.sin(angle) * distance;
+      const nx = max ? x / max : 0;
+      const ny = max ? y / max : 0;
+      els.stick.style.transform = `translate(${x}px, ${y}px)`;
+      currentPad = {
+        lx: clampByte(128 + nx * 127),
+        ly: clampByte(128 + ny * 127),
+        rx: 128,
+        ry: 128,
+        buttons: 0
+      };
+      updateMetrics();
+    }
+
+    function resetJoystick() {
+      currentPad = { lx: 128, ly: 128, rx: 128, ry: 128, buttons: 0 };
+      els.stick.style.transform = 'translate(0, 0)';
+      updateMetrics();
+    }
+
+    function updateMetrics() {
+      els.lxOut.textContent = currentPad.lx;
+      els.lyOut.textContent = currentPad.ly;
+      els.rxOut.textContent = currentPad.rx;
+      els.ryOut.textContent = currentPad.ry;
+    }
+
+    function sendGamepad(force) {
+      const now = Date.now();
+      if (!force && now - lastSendAt < 60) return;
+      lastSendAt = now;
+      sendCommand({ type: 'gamepad', ...currentPad }, null, true).catch(err => log('手柄发送失败: ' + err.message));
+    }
+
+    function stopCar() {
+      resetJoystick();
+      return sendCommand({ type: 'gamepad', lx: 128, ly: 128, rx: 128, ry: 128, buttons: 0 }, '停止 / 回中');
+    }
+
+    async function sendCommand(command, label, quiet = false) {
+      syncConfigFromInputs();
+      const receiverId = state.receiverId || els.receiverSelect.value;
+      if (!receiverId) throw new Error('请先选择接收端设备');
+      const result = await request(`/api/receivers/${encodeURIComponent(receiverId)}/commands`, {
+        method: 'POST',
+        body: command
+      });
+      if (!quiet) log(`${label || command.type} 已发送: ${result.delivered ? '实时送达' : '接收端离线，已入队'} ${result.packet_hex || ''}`);
+      return result;
+    }
+
+    async function request(path, options = {}) {
+      const init = { method: options.method || 'GET', headers: { 'Content-Type': 'application/json; charset=utf-8' } };
+      if (state.token) init.headers.Authorization = 'Bearer ' + state.token;
+      if (options.body) init.body = JSON.stringify(options.body);
+      const res = await fetch(trimSlash(state.apiBase) + path, init);
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok || !json.ok) throw new Error(json.error || `HTTP ${res.status}`);
+      return json.data;
+    }
+
+    function syncConfigFromInputs() {
+      state.apiBase = trimSlash(els.apiBase.value.trim());
+      state.username = els.username.value.trim();
+      saveState();
+    }
+
+    function updateLoginStatus() {
+      const loggedIn = !!state.token;
+      els.statusDot.classList.toggle('ok', loggedIn);
+      els.statusText.textContent = loggedIn ? `已登录 ${state.username}` : '未登录';
+    }
+
+    function log(message) {
+      const time = new Date().toLocaleTimeString();
+      els.log.textContent = `[${time}] ${message}\n` + els.log.textContent;
+    }
+
+    function showError(error) { log('错误: ' + error.message); }
+    function trimSlash(value) { return value.replace(/\/+$/, ''); }
+    function clampByte(value) { return Math.max(0, Math.min(255, Math.round(value))); }
+    function readState() {
+      try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); } catch { return {}; }
+    }
+    function saveState() {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({
+        apiBase: state.apiBase,
+        username: state.username,
+        token: state.token,
+        receiverId: state.receiverId
+      }));
+    }
+  </script>
+</body>
+</html>

@@ -9,8 +9,8 @@
 services:
   server:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: server/Dockerfile
     image: cruisecar-server:latest
     environment:
       CRUISECAR_DEPLOYMENT: full

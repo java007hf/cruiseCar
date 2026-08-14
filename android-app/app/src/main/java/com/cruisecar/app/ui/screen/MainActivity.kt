@@ -21,10 +21,13 @@ import com.cruisecar.app.ui.widget.CameraPreviewView
 import com.cruisecar.app.ui.widget.VideoGamepadView
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.os.Handler
@@ -32,6 +35,7 @@ import android.os.Looper
 import android.text.InputType
 import android.util.Log
 import android.view.Gravity
+import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
@@ -50,6 +54,30 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+
+private enum class RootTab { CONNECT, MINE }
+
+private const val ROLE_SENDER = "sender"
+private const val ROLE_RECEIVER = "receiver"
+private val HOME_BG_TOP = Color.rgb(15, 23, 42)
+private val HOME_BG_MID = Color.rgb(11, 36, 71)
+private val HOME_BG_BOTTOM = Color.rgb(3, 21, 37)
+private val HOME_CARD_BG = Color.argb(34, 255, 255, 255)
+private val HOME_CARD_STROKE = Color.argb(110, 125, 211, 252)
+private val HOME_TEXT_MUTED = Color.rgb(186, 230, 253)
+private val HOME_TEXT_SOFT = Color.rgb(224, 242, 254)
+private val HOME_ACCENT = Color.rgb(224, 242, 254)
+private val HOME_ACCENT_TEXT = Color.rgb(8, 47, 73)
+
+class ConnectPageFragment : android.app.Fragment() {
+    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View =
+        (activity as MainActivity).createConnectFragmentView()
+}
+
+class MinePageFragment : android.app.Fragment() {
+    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View =
+        (activity as MainActivity).createMineFragmentView()
+}
 
 class MainActivity : Activity() {
     private val tag = "CruiseCar"
@@ -103,6 +131,10 @@ class MainActivity : Activity() {
     private val senderServoLock = Any()
     private var backAction: (() -> Unit)? = null
     private lateinit var viewFactory: MainViewFactory
+    private var selectedRootTab = RootTab.CONNECT
+    private var homeContainerId: Int = View.generateViewId()
+    private var loginDialogAutoShown = false
+    private var loginDialog: AlertDialog? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -110,96 +142,462 @@ class MainActivity : Activity() {
         viewModel = MainViewModel(ReceiverIdentityStore(this))
         log("CruiseCar APK debug $appVersionLabel started")
         requestBasePermissions()
-        showRoleScreen()
+        showHomeScreen()
     }
 
-    private fun showRoleScreen() {
+    private fun showHomeScreen(tab: RootTab = selectedRootTab) {
         backAction = null
-        val layout = rootLayout()
-        layout.addView(title("CruiseCar $appVersionLabel"))
-        layout.addView(button("调试台 (识别 + 遥控)") {
-            startActivity(Intent(this, DebugActivity::class.java))
-        })
-        layout.addView(button("发送端 - 局域网") { setConnectionMode(ConnectionMode.LAN); showSenderScreen() })
-        layout.addView(button("接收端 - 局域网") { setConnectionMode(ConnectionMode.LAN); showReceiverScreen() })
-        layout.addView(button("发送端 - 服务器") { showServerSetup(isSender = true) })
-        layout.addView(button("接收端 - 服务器") { showServerSetup(isSender = false) })
-        setContentView(withLog(layout))
+        val targetTab = if (tab == RootTab.CONNECT && !hasRemoteLogin()) RootTab.MINE else tab
+        selectedRootTab = targetTab
+        val layout = homeShellLayout()
+        layout.addView(topNavigation(targetTab))
+        val fragmentContainer = FrameLayout(this).apply { id = homeContainerId }
+        layout.addView(fragmentContainer, LinearLayout.LayoutParams(-1, 0, 1f))
+        layout.addView(bottomNavigation(targetTab))
+        logView = TextView(this)
+        setContentView(layout)
+        showRootFragment(targetTab)
+        if (!hasRemoteLogin() && !loginDialogAutoShown) {
+            loginDialogAutoShown = true
+            Handler(Looper.getMainLooper()).post { showLoginDialog() }
+        }
     }
 
-    private fun showServerSetup(isSender: Boolean) {
-        backAction = { showRoleScreen() }
-        val layout = rootLayout()
-        layout.addView(title("服务器账号登录"))
+    private fun topNavigation(tab: RootTab): LinearLayout {
+        val nav = row().apply {
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(20), dp(18), dp(18), dp(8))
+            background = homeGradient()
+        }
+        val brand = TextView(this).apply {
+            text = "✦ CruiseCar"
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(HOME_TEXT_SOFT)
+            gravity = Gravity.CENTER
+            setPadding(dp(18), 0, dp(18), 0)
+            background = glassBg(dp(24))
+        }
+        nav.addView(brand, LinearLayout.LayoutParams(-2, dp(48)))
+        nav.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+        val iconGroup = row().apply {
+            gravity = Gravity.CENTER
+            setPadding(dp(8), 0, dp(8), 0)
+            background = roundedBg(Color.TRANSPARENT, dp(4))
+        }
+        if (tab == RootTab.CONNECT) {
+            iconGroup.addView(topTextButton(if (viewModel.state.remotePreferredRole == ROLE_RECEIVER) "接收端" else "发送端") { togglePreferredRole() })
+        } else {
+            iconGroup.addView(topIconButton(if (hasRemoteLogin()) "↻" else "+") { showLoginDialog() })
+            iconGroup.addView(topIconButton("⚙") { showSettingsScreen() })
+        }
+        nav.addView(iconGroup, LinearLayout.LayoutParams(-2, dp(56)))
+        return nav
+    }
+
+    private fun bottomNavigation(tab: RootTab): LinearLayout {
+        val holder = row().apply {
+            gravity = Gravity.CENTER
+            setPadding(dp(18), dp(8), dp(18), dp(18))
+            background = homeGradient()
+        }
+        val pill = row().apply {
+            gravity = Gravity.CENTER
+            setPadding(dp(4), dp(4), dp(4), dp(4))
+            background = roundedBg(Color.argb(36, 255, 255, 255), dp(34), strokeColor = Color.argb(58, 224, 242, 254))
+        }
+        pill.addView(bottomTabButton("连接", tab == RootTab.CONNECT) {
+            showHomeScreen(RootTab.CONNECT)
+        }, LinearLayout.LayoutParams(0, dp(56), 1f))
+        pill.addView(centerDivider(), LinearLayout.LayoutParams(dp(1), dp(24)))
+        pill.addView(bottomTabButton("我的", tab == RootTab.MINE) {
+            showHomeScreen(RootTab.MINE)
+        }, LinearLayout.LayoutParams(0, dp(56), 1f))
+        holder.addView(pill, LinearLayout.LayoutParams(-1, dp(66)))
+        return holder
+    }
+
+    private fun showRootFragment(tab: RootTab) {
+        val fragment = if (tab == RootTab.CONNECT) ConnectPageFragment() else MinePageFragment()
+        fragmentManager.beginTransaction()
+            .replace(homeContainerId, fragment)
+            .commitAllowingStateLoss()
+    }
+
+    internal fun createConnectFragmentView(): View {
+        val layout = homePageLayout()
+        addConnectTab(layout)
+        return layout
+    }
+
+    internal fun createMineFragmentView(): View {
+        val layout = homePageLayout()
+        addMineTab(layout)
+        return layout
+    }
+
+    private fun addConnectTab(layout: LinearLayout) {
         val state = viewModel.state
+        layout.addView(pageTitle("连接", "在线设备控制 · 服务器账号模式"))
+        layout.addView(connectHeroCard(state))
+        if (!hasRemoteLogin()) {
+            layout.addView(homeActionButton("去登录账号") { showHomeScreen(RootTab.MINE) })
+            layout.addView(infoText("首次使用服务器模式需要先登录；登录后会保存账号 token，下次打开可直接进入控制。"))
+            return
+        }
+
+        if (state.remotePreferredRole == ROLE_RECEIVER) {
+            val identity = viewModel.receiverIdentity()
+            viewModel.dispatch(AppIntent.SetRemoteDeviceId(identity.deviceId))
+            layout.addView(deviceIdentityView(identity))
+            layout.addView(homeActionButton("启动接收端") {
+                enterServerReceiver(identity)
+            })
+        } else {
+            layout.addView(lastDeviceInfoView())
+            layout.addView(homeActionButton(if (state.remoteDeviceId.isBlank()) "选择接收端设备" else "连接设备") {
+                if (state.remoteDeviceId.isBlank()) {
+                    loadDevicesAndShowPicker()
+                } else {
+                    setConnectionMode(ConnectionMode.SERVER)
+                    showSenderScreen()
+                }
+            })
+            layout.addView(homeActionButton("切换接收端设备", primary = false) { loadDevicesAndShowPicker() })
+        }
+    }
+
+    private fun addMineTab(layout: LinearLayout) {
+        val state = viewModel.state
+        layout.addView(pageTitle("我的", "账号、设备与偏好设置"))
+        layout.addView(accountHeroCard(state))
+        layout.addView(lastDeviceInfoView())
+        if (hasRemoteLogin()) {
+            layout.addView(homeActionButton("刷新设备信息", primary = false) { loadDevicesAndShowPicker(stayInMine = true) })
+        } else {
+            layout.addView(infoText("请点击右上角“登录”完成账号登录，登录后会保存 token，下次打开无需重新输入。"))
+        }
+    }
+
+    private fun showLoginDialog() {
+        if (loginDialog?.isShowing == true) return
+        val state = viewModel.state
+        val form = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(32, 8, 32, 0)
+        }
         val userInput = input("账号", state.remoteUsername)
         val passInput = input("密码", "").apply {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         }
-        val receiverIdentity = viewModel.receiverIdentity()
-        layout.addView(serverHostView())
-        layout.addView(userInput)
-        layout.addView(passInput)
-        if (!isSender) {
-            layout.addView(deviceIdentityView(receiverIdentity))
-        }
-        layout.addView(button(if (isSender) "登录并选择设备" else "登录并加入接收端") {
-            Thread {
-                try {
-                    val host = defaultRemoteHost
-                    val username = userInput.text.toString().trim()
-                    val password = passInput.text.toString()
-                    if (host.isBlank() || username.isBlank() || password.isBlank()) {
-                        toast("请填写服务器、账号和密码")
-                        return@Thread
-                    }
-                    val managerBaseUrl = "http://$host:$remoteManagerPort"
-                    val token = RemoteApi.login(managerBaseUrl, username, password)
-                    viewModel.saveRemoteAccount(host, username, token, managerBaseUrl)
-                    setConnectionMode(ConnectionMode.SERVER)
-                    if (isSender) {
-                        val devices = RemoteApi.listReceivers(managerBaseUrl, token)
-                        if (devices.isEmpty()) {
-                            log("账号下暂无接收端，请先用接收端加入")
-                        } else {
-                            viewModel.dispatch(AppIntent.SetRemoteSenderId("phone-${System.currentTimeMillis() % 100000}"))
-                            runOnUiThread { showDevicePicker(devices) }
-                        }
-                    } else {
-                        viewModel.dispatch(AppIntent.SetRemoteDeviceId(receiverIdentity.deviceId))
-                        RemoteApi.addReceiver(managerBaseUrl, token, receiverIdentity.deviceId, receiverIdentity.displayName)
-                        log("接收端已加入账号: ${receiverIdentity.displayName} (${receiverIdentity.deviceId})")
-                        runOnUiThread { showReceiverScreen() }
-                    }
-                } catch (e: Exception) {
-                    log("服务器登录/配置失败: ${e.message}")
+        form.addView(serverHostView())
+        form.addView(userInput)
+        form.addView(passInput)
+        loginDialog = AlertDialog.Builder(this)
+            .setTitle(if (hasRemoteLogin()) "重新登录" else "账号登录")
+            .setView(form)
+            .setNegativeButton("取消", null)
+            .setPositiveButton("登录", null)
+            .create()
+        loginDialog?.setOnShowListener { dialog ->
+            val alert = dialog as AlertDialog
+            alert.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val username = userInput.text.toString().trim()
+                val password = passInput.text.toString()
+                if (username.isBlank() || password.isBlank()) {
+                    toast("请填写账号和密码")
+                    return@setOnClickListener
                 }
-            }.start()
+                alert.dismiss()
+                loginFromInputs(username, password, navigateToConnect = true)
+            }
+        }
+        loginDialog?.show()
+    }
+
+    private fun showSettingsScreen() {
+        backAction = { showHomeScreen(RootTab.MINE) }
+        val layout = rootLayout()
+        layout.addView(title("设置"))
+        layout.addView(button("调试台 (识别 + 遥控)") {
+            startActivity(Intent(this, DebugActivity::class.java))
         })
-        layout.addView(button("返回") { showRoleScreen() })
+        layout.addView(button("发送端 - 局域网1") { setConnectionMode(ConnectionMode.LAN); showSenderScreen() })
+        layout.addView(button("接收端 - 局域网2") { setConnectionMode(ConnectionMode.LAN); showReceiverScreen() })
+        layout.addView(button("返回我的") { showHomeScreen(RootTab.MINE) })
         setContentView(withLog(layout))
     }
 
-    private fun showDevicePicker(devices: List<RemoteReceiver>) {
-        backAction = { showServerSetup(isSender = true) }
+    private fun loginFromInputs(username: String, password: String, navigateToConnect: Boolean) {
+        Thread {
+            try {
+                val host = defaultRemoteHost
+                if (host.isBlank() || username.isBlank() || password.isBlank()) {
+                    toast("请填写服务器、账号和密码")
+                    return@Thread
+                }
+                val managerBaseUrl = "http://$host:$remoteManagerPort"
+                val token = RemoteApi.login(managerBaseUrl, username, password)
+                viewModel.saveRemoteAccount(host, username, token, managerBaseUrl)
+                setConnectionMode(ConnectionMode.SERVER)
+                log("服务器账号登录成功: $username")
+                runOnUiThread { showHomeScreen(if (navigateToConnect) RootTab.CONNECT else RootTab.MINE) }
+            } catch (e: Exception) {
+                log("服务器登录/配置失败: ${e.message}")
+            }
+        }.start()
+    }
+
+    private fun loadDevicesAndShowPicker(stayInMine: Boolean = false) {
+        val state = viewModel.state
+        if (!hasRemoteLogin()) {
+            toast("请先登录账号")
+            showHomeScreen(RootTab.MINE)
+            return
+        }
+        Thread {
+            try {
+                val devices = RemoteApi.listReceivers(state.remoteManagerBaseUrl.ifBlank { "http://$defaultRemoteHost:$remoteManagerPort" }, state.remoteToken)
+                if (devices.isEmpty()) {
+                    log("账号下暂无接收端，请先用接收端加入")
+                    if (stayInMine) runOnUiThread { showHomeScreen(RootTab.MINE) }
+                } else {
+                    runOnUiThread { showDevicePicker(devices, stayInMine) }
+                }
+            } catch (e: Exception) {
+                log("获取设备列表失败: ${e.message}")
+            }
+        }.start()
+    }
+
+    private fun showDevicePicker(devices: List<RemoteReceiver>, stayInMine: Boolean = false) {
+        backAction = { showHomeScreen(if (stayInMine) RootTab.MINE else RootTab.CONNECT) }
         val layout = rootLayout()
         layout.addView(title("选择接收端"))
         devices.forEach { device ->
             layout.addView(button("${device.name.ifBlank { device.deviceId }} | ${if (device.online) "在线" else "离线"} | ESP32=${device.espConnected}") {
-                viewModel.dispatch(AppIntent.SetRemoteDeviceId(device.deviceId))
+                viewModel.dispatch(AppIntent.SetLastRemoteDevice(device.deviceId, device.name, device.online, device.espConnected, device.mode))
                 log("已选择接收端: ${device.deviceId}")
-                showSenderScreen()
+                if (stayInMine) {
+                    showHomeScreen(RootTab.MINE)
+                } else {
+                    setConnectionMode(ConnectionMode.SERVER)
+                    showSenderScreen()
+                }
             })
         }
-        layout.addView(button("返回") { showServerSetup(isSender = true) })
+        layout.addView(button("返回") { showHomeScreen(if (stayInMine) RootTab.MINE else RootTab.CONNECT) })
         setContentView(withLog(layout))
+    }
+
+    private fun enterServerReceiver(identity: ReceiverIdentity) {
+        val state = viewModel.state
+        if (!hasRemoteLogin()) {
+            showHomeScreen(RootTab.MINE)
+            return
+        }
+        Thread {
+            try {
+                val managerBaseUrl = state.remoteManagerBaseUrl.ifBlank { "http://$defaultRemoteHost:$remoteManagerPort" }
+                RemoteApi.addReceiver(managerBaseUrl, state.remoteToken, identity.deviceId, identity.displayName)
+                viewModel.dispatch(AppIntent.SetLastRemoteDevice(identity.deviceId, identity.displayName, online = true, espConnected = bluetooth.isConnected(), mode = receiverMode.name.lowercase()))
+                setConnectionMode(ConnectionMode.SERVER)
+                log("接收端已加入账号: ${identity.displayName} (${identity.deviceId})")
+                runOnUiThread { showReceiverScreen() }
+            } catch (e: Exception) {
+                log("接收端加入账号失败: ${e.message}")
+            }
+        }.start()
+    }
+
+    private fun infoText(text: String): TextView = TextView(this).apply {
+        this.text = text
+        textSize = 14f
+        setTextColor(HOME_TEXT_MUTED)
+        setPadding(dp(18), dp(16), dp(18), dp(16))
+        background = glassBg(dp(22))
+        layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) }
+    }
+
+    private fun pageTitle(title: String, subtitle: String): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(6), dp(10), dp(6), dp(18))
+        addView(TextView(this@MainActivity).apply {
+            text = title
+            textSize = 32f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+        })
+        addView(TextView(this@MainActivity).apply {
+            text = subtitle
+            textSize = 15f
+            setTextColor(HOME_TEXT_MUTED)
+            setPadding(0, dp(4), 0, 0)
+        })
+    }
+
+    private fun connectHeroCard(state: com.cruisecar.app.mvi.AppState): LinearLayout = glassCard().apply {
+        addView(TextView(this@MainActivity).apply {
+            text = if (hasRemoteLogin()) "${preferredRoleLabel()} · 准备就绪" else "等待登录"
+            textSize = 26f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+        })
+        addView(TextView(this@MainActivity).apply {
+            text = "服务器 http://$defaultRemoteHost/\n${if (hasRemoteLogin()) "已登录 ${state.remoteUsername}" else "登录后自动保存 token，下次无需重复输入"}"
+            textSize = 14f
+            setTextColor(HOME_TEXT_MUTED)
+            setPadding(0, dp(10), 0, dp(14))
+        })
+        val chips = row().apply { gravity = Gravity.CENTER_VERTICAL }
+        chips.addView(statusChip(if (hasRemoteLogin()) "ONLINE" else "LOGIN", hasRemoteLogin()))
+        chips.addView(statusChip(preferredRoleLabel(), true), LinearLayout.LayoutParams(-2, dp(30)).apply { leftMargin = dp(8) })
+        addView(chips)
+    }
+
+    private fun accountHeroCard(state: com.cruisecar.app.mvi.AppState): LinearLayout = glassCard().apply {
+        addView(TextView(this@MainActivity).apply {
+            text = state.remoteUsername.ifBlank { "未登录" }
+            textSize = 28f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+        })
+        addView(TextView(this@MainActivity).apply {
+            text = "Token：${if (state.remoteToken.isNotBlank()) "已保存" else "未保存"}\n发送端 ID：${state.remoteSenderId.ifBlank { "未生成" }}"
+            textSize = 14f
+            setTextColor(HOME_TEXT_MUTED)
+            setPadding(0, dp(10), 0, 0)
+        })
+    }
+
+    private fun glassCard(): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(22), dp(20), dp(22), dp(20))
+        background = glassBg(dp(28))
+        layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(14) }
+    }
+
+    private fun statusChip(text: String, active: Boolean): TextView = TextView(this).apply {
+        this.text = text
+        textSize = 12f
+        typeface = Typeface.DEFAULT_BOLD
+        gravity = Gravity.CENTER
+        setTextColor(if (active) Color.rgb(5, 46, 22) else HOME_TEXT_SOFT)
+        setPadding(dp(14), 0, dp(14), 0)
+        background = roundedBg(if (active) Color.rgb(34, 197, 94) else Color.argb(34, 255, 255, 255), dp(15), strokeColor = Color.argb(70, 224, 242, 254))
+        layoutParams = LinearLayout.LayoutParams(-2, dp(30))
+    }
+
+    private fun homeActionButton(text: String, primary: Boolean = true, onClick: () -> Unit): TextView = TextView(this).apply {
+        this.text = text
+        textSize = 17f
+        typeface = Typeface.DEFAULT_BOLD
+        gravity = Gravity.CENTER
+        setTextColor(if (primary) HOME_ACCENT_TEXT else HOME_TEXT_SOFT)
+        setPadding(dp(16), 0, dp(16), 0)
+        background = roundedBg(if (primary) HOME_ACCENT else Color.argb(34, 255, 255, 255), dp(28), strokeColor = if (primary) HOME_ACCENT else HOME_CARD_STROKE)
+        layoutParams = LinearLayout.LayoutParams(-1, dp(56)).apply { bottomMargin = dp(12) }
+        setOnClickListener { onClick() }
+    }
+
+    private fun homeShellLayout(): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        background = homeGradient()
+    }
+
+    private fun homePageLayout(): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(20), dp(6), dp(20), dp(10))
+        background = homeGradient()
+    }
+
+    private fun topTextButton(text: String, onClick: () -> Unit): TextView = TextView(this).apply {
+        this.text = text
+        textSize = 14f
+        typeface = Typeface.DEFAULT_BOLD
+        gravity = Gravity.CENTER
+        setTextColor(HOME_TEXT_SOFT)
+        setPadding(dp(16), 0, dp(16), 0)
+        background = glassBg(dp(22))
+        setOnClickListener { onClick() }
+    }.also {
+        it.layoutParams = LinearLayout.LayoutParams(-2, dp(44)).apply { leftMargin = dp(8) }
+    }
+
+    private fun topIconButton(text: String, onClick: () -> Unit): TextView = TextView(this).apply {
+        this.text = text
+        textSize = 24f
+        typeface = Typeface.DEFAULT_BOLD
+        gravity = Gravity.CENTER
+        setTextColor(HOME_TEXT_SOFT)
+        background = glassBg(dp(22))
+        setOnClickListener { onClick() }
+    }.also {
+        it.layoutParams = LinearLayout.LayoutParams(dp(48), dp(48)).apply { leftMargin = dp(8) }
+    }
+
+    private fun centerDivider(): View = View(this).apply {
+        setBackgroundColor(Color.argb(95, 224, 242, 254))
+    }
+
+    private fun bottomTabButton(label: String, selected: Boolean, onClick: () -> Unit): TextView = TextView(this).apply {
+        text = label
+        textSize = 17f
+        typeface = Typeface.DEFAULT_BOLD
+        gravity = Gravity.CENTER
+        setTextColor(if (selected) HOME_ACCENT_TEXT else HOME_TEXT_MUTED)
+        background = if (selected) roundedBg(HOME_ACCENT, dp(28)) else roundedBg(Color.TRANSPARENT, dp(28))
+        setOnClickListener { onClick() }
+    }
+
+    private fun homeGradient(): GradientDrawable = GradientDrawable(
+        GradientDrawable.Orientation.TL_BR,
+        intArrayOf(HOME_BG_TOP, HOME_BG_MID, HOME_BG_BOTTOM)
+    )
+
+    private fun glassBg(radius: Int): GradientDrawable = roundedBg(HOME_CARD_BG, radius, HOME_CARD_STROKE)
+
+    private fun roundedBg(color: Int, radius: Int, strokeColor: Int? = null): GradientDrawable =
+        GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            setColor(color)
+            cornerRadius = radius.toFloat()
+            strokeColor?.let { setStroke(dp(1), it) }
+        }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density + 0.5f).toInt()
+
+    private fun lastDeviceInfoView(): TextView {
+        val state = viewModel.state
+        val deviceText = if (state.lastRemoteDeviceId.isBlank()) {
+            "上次连接设备：无"
+        } else {
+            "上次连接设备：${state.lastRemoteDeviceName.ifBlank { state.lastRemoteDeviceId }}\n设备 ID：${state.lastRemoteDeviceId}\n状态：${if (state.lastRemoteDeviceOnline) "在线" else "离线"} | ESP32=${state.lastRemoteDeviceEspConnected} | 模式=${state.lastRemoteDeviceMode}"
+        }
+        return infoText(deviceText)
+    }
+
+    private fun hasRemoteLogin(): Boolean =
+        viewModel.state.remoteUsername.isNotBlank() && viewModel.state.remoteToken.isNotBlank()
+
+    private fun preferredRoleLabel(): String =
+        if (viewModel.state.remotePreferredRole == ROLE_RECEIVER) "接收端" else "发送端"
+
+    private fun roleSwitchText(): String = "切换为${if (viewModel.state.remotePreferredRole == ROLE_RECEIVER) "发送端" else "接收端"}"
+
+    private fun togglePreferredRole() {
+        val nextRole = if (viewModel.state.remotePreferredRole == ROLE_RECEIVER) ROLE_SENDER else ROLE_RECEIVER
+        viewModel.dispatch(AppIntent.SetRemotePreferredRole(nextRole))
+        showHomeScreen(RootTab.CONNECT)
     }
 
     private fun deviceIdentityView(identity: ReceiverIdentity): TextView = TextView(this).apply {
         text = "接收端名称：${identity.displayName}\n接收端设备ID：${identity.deviceId}\n\n接收端会自动使用该 ID 加入服务器；发送端登录同一账号后可直接选择设备。"
         textSize = 14f
-        setTextColor(Color.rgb(70, 70, 70))
-        setPadding(0, 12, 0, 12)
+        setTextColor(HOME_TEXT_MUTED)
+        setPadding(dp(18), dp(16), dp(18), dp(16))
+        background = glassBg(dp(22))
+        layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) }
     }
 
     private fun serverHostView(): TextView = TextView(this).apply {
@@ -218,7 +616,7 @@ class MainActivity : Activity() {
             releaseSenderCall()
             senderVideoArea = null
             senderLayout = null
-            showRoleScreen()
+            showHomeScreen(RootTab.CONNECT)
         }
         val layout = rootLayout()
         senderLayout = layout
@@ -305,7 +703,7 @@ class MainActivity : Activity() {
     }
 
     private fun showReceiverScreen() {
-        backAction = { stopReceiverServices(); receiverLayout = null; showRoleScreen() }
+        backAction = { stopReceiverServices(); receiverLayout = null; showHomeScreen(RootTab.CONNECT) }
         val layout = rootLayout()
         receiverLayout = layout
         layout.addView(title("接收端多模式中转"))

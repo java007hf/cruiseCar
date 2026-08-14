@@ -34,7 +34,13 @@ class ReceiverIdentityStore(context: Context) {
             username = accountPrefs.getString(KEY_REMOTE_USERNAME, "").orEmpty(),
             token = accountPrefs.getString(KEY_REMOTE_TOKEN, "").orEmpty(),
             managerBaseUrl = accountPrefs.getString(KEY_REMOTE_MANAGER_BASE_URL, "").orEmpty(),
-            senderId = accountPrefs.getString(KEY_REMOTE_SENDER_ID, "").orEmpty()
+            senderId = accountPrefs.getString(KEY_REMOTE_SENDER_ID, "").orEmpty(),
+            preferredRole = accountPrefs.getString(KEY_REMOTE_PREFERRED_ROLE, "sender").orEmpty(),
+            lastDeviceId = accountPrefs.getString(KEY_REMOTE_LAST_DEVICE_ID, "").orEmpty(),
+            lastDeviceName = accountPrefs.getString(KEY_REMOTE_LAST_DEVICE_NAME, "").orEmpty(),
+            lastDeviceOnline = accountPrefs.getBoolean(KEY_REMOTE_LAST_DEVICE_ONLINE, false),
+            lastDeviceEspConnected = accountPrefs.getBoolean(KEY_REMOTE_LAST_DEVICE_ESP_CONNECTED, false),
+            lastDeviceMode = accountPrefs.getString(KEY_REMOTE_LAST_DEVICE_MODE, "manual").orEmpty()
         )
     }
 
@@ -55,6 +61,28 @@ class ReceiverIdentityStore(context: Context) {
             .apply()
     }
 
+    fun savePreferredRemoteRole(role: String) {
+        accountPrefs.edit()
+            .putString(KEY_REMOTE_PREFERRED_ROLE, role)
+            .apply()
+    }
+
+    fun saveLastRemoteDevice(
+        deviceId: String,
+        name: String,
+        online: Boolean,
+        espConnected: Boolean,
+        mode: String
+    ) {
+        accountPrefs.edit()
+            .putString(KEY_REMOTE_LAST_DEVICE_ID, deviceId)
+            .putString(KEY_REMOTE_LAST_DEVICE_NAME, name)
+            .putBoolean(KEY_REMOTE_LAST_DEVICE_ONLINE, online)
+            .putBoolean(KEY_REMOTE_LAST_DEVICE_ESP_CONNECTED, espConnected)
+            .putString(KEY_REMOTE_LAST_DEVICE_MODE, mode)
+            .apply()
+    }
+
     private fun clearLegacySavedPassword() {
         if (accountPrefs.contains(KEY_LEGACY_REMOTE_PASSWORD)) {
             accountPrefs.edit().remove(KEY_LEGACY_REMOTE_PASSWORD).apply()
@@ -71,6 +99,12 @@ class ReceiverIdentityStore(context: Context) {
         const val KEY_REMOTE_TOKEN = "remote_token"
         const val KEY_REMOTE_MANAGER_BASE_URL = "remote_manager_base_url"
         const val KEY_REMOTE_SENDER_ID = "remote_sender_id"
+        const val KEY_REMOTE_PREFERRED_ROLE = "remote_preferred_role"
+        const val KEY_REMOTE_LAST_DEVICE_ID = "remote_last_device_id"
+        const val KEY_REMOTE_LAST_DEVICE_NAME = "remote_last_device_name"
+        const val KEY_REMOTE_LAST_DEVICE_ONLINE = "remote_last_device_online"
+        const val KEY_REMOTE_LAST_DEVICE_ESP_CONNECTED = "remote_last_device_esp_connected"
+        const val KEY_REMOTE_LAST_DEVICE_MODE = "remote_last_device_mode"
     }
 }
 
@@ -79,5 +113,11 @@ data class RemoteAccount(
     val username: String,
     val token: String,
     val managerBaseUrl: String,
-    val senderId: String
+    val senderId: String,
+    val preferredRole: String,
+    val lastDeviceId: String,
+    val lastDeviceName: String,
+    val lastDeviceOnline: Boolean,
+    val lastDeviceEspConnected: Boolean,
+    val lastDeviceMode: String
 )

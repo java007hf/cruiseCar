@@ -10,10 +10,12 @@ RUN groupadd --system cruisecar && useradd --system --gid cruisecar --create-hom
 # working directory MUST be /app/server.
 WORKDIR /app/server
 
-# Only copy the Python sources; keep the SQLite DB on a mounted volume.
-COPY control_server/ ./control_server/
-COPY manager_api/     ./manager_api/
-COPY manager_web/     ./manager_web/
+# Only copy the Python and static web sources; keep the SQLite DB on a mounted volume.
+# Build context is the repository root; see server/docker-compose.yml.
+COPY server/control_server/ ./control_server/
+COPY server/manager_api/     ./manager_api/
+COPY server/manager_web/     ./manager_web/
+COPY web_send/ /app/web_send/
 
 # Default deployment; override at runtime with `docker run -e CRUISECAR_DEPLOYMENT=full`.
 ENV CRUISECAR_DEPLOYMENT=light \
