@@ -1140,7 +1140,9 @@ class MainActivity : Activity() {
             emptyList()
         } else {
             val baseUrl = state.remoteManagerBaseUrl.ifBlank { "http://$defaultRemoteHost:$remoteManagerPort" }
-            RemoteApi.iceServers(baseUrl, state.remoteToken).map { it.toWebRtcIceServer() }
+            val servers = RemoteApi.iceServers(baseUrl, state.remoteToken)
+            log("Loaded ICE servers from manager-api: count=${servers.size} turn=${servers.any { item -> item.urls.any { it.startsWith("turn:", ignoreCase = true) } }}")
+            servers.map { it.toWebRtcIceServer() }
         }
     }
 

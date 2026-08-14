@@ -333,6 +333,7 @@
     let sendTimer = null;
     let videoSocket = null;
     let peerConnection = null;
+    let pendingRemoteCandidates = [];
     let videoOfferTimer = null;
     let videoReconnectTimer = null;
     let videoReconnectAttempts = 0;
@@ -617,6 +618,7 @@
         peerConnection.close();
         peerConnection = null;
       }
+      pendingRemoteCandidates = [];
       if (els.remoteVideo.srcObject) {
         els.remoteVideo.srcObject.getTracks().forEach(track => track.stop());
         els.remoteVideo.srcObject = null;
@@ -667,6 +669,7 @@
           videoOfferTimer = null;
         }
         await peerConnection.setRemoteDescription({ type: message.type, sdp: message.sdp });
+        await flushPendingRemoteCandidates();
         if (message.type === 'offer') {
           const answer = await peerConnection.createAnswer();
           await peerConnection.setLocalDescription(answer);
@@ -675,12 +678,28 @@
         }
       } else if (message.type === 'candidate') {
         log('remote ICE: ' + summarizeCandidate(message.candidate || ''));
-        await peerConnection.addIceCandidate({
+        const candidate = {
           sdpMid: message.sdpMid,
           sdpMLineIndex: message.sdpMLineIndex,
           candidate: message.candidate
-        });
+        };
+        if (!peerConnection.remoteDescription) {
+          pendingRemoteCandidates.push(candidate);
+          log('remote ICE queued until offer is set');
+        } else {
+          await peerConnection.addIceCandidate(candidate);
+        }
       }
+    }
+
+    async function flushPendingRemoteCandidates() {
+      if (!peerConnection || !peerConnection.remoteDescription || !pendingRemoteCandidates.length) return;
+      const queued = pendingRemoteCandidates;
+      pendingRemoteCandidates = [];
+      for (const candidate of queued) {
+        await peerConnection.addIceCandidate(candidate);
+      }
+      log(`flushed ${queued.length} queued remote ICE candidates`);
     }
 
     function sendVideoSignal(payload) {

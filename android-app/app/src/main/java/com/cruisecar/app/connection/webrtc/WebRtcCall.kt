@@ -62,6 +62,7 @@ class WebRtcCall(
     private var audioManager: AudioManager? = null
     private var previousAudioMode: Int? = null
     private var previousSpeakerphoneOn: Boolean? = null
+    private val pendingRemoteCandidates = mutableListOf<IceCandidate>()
     private val running = AtomicBoolean(false)
 
     init {
@@ -158,6 +159,7 @@ class WebRtcCall(
         serverSocket = null
         peerConnection?.close()
         peerConnection = null
+        pendingRemoteCandidates.clear()
         localCapturer?.stopCapture()
         localCapturer?.dispose()
         localCapturer = null
@@ -296,21 +298,35 @@ class WebRtcCall(
                 val sdp = SessionDescription(type, message.getString("sdp"))
                 peerConnection?.setRemoteDescription(object : SimpleSdpObserver() {
                     override fun onSetSuccess() {
+                        flushPendingRemoteCandidates()
                         if (type == SessionDescription.Type.OFFER) createAnswer()
                     }
                 }, sdp)
             }
             "candidate" -> {
-                onLog("WebRTC received ICE candidate: ${message.optString("candidate").summarizeIceCandidate()}")
-                peerConnection?.addIceCandidate(
-                    IceCandidate(
-                        message.getString("sdpMid"),
-                        message.getInt("sdpMLineIndex"),
-                        message.getString("candidate")
-                    )
+                val candidate = IceCandidate(
+                    message.getString("sdpMid"),
+                    message.getInt("sdpMLineIndex"),
+                    message.getString("candidate")
                 )
+                onLog("WebRTC received ICE candidate: ${candidate.sdp.summarizeIceCandidate()}")
+                if (peerConnection?.remoteDescription == null) {
+                    pendingRemoteCandidates += candidate
+                    onLog("WebRTC queued remote ICE until SDP is set")
+                } else {
+                    peerConnection?.addIceCandidate(candidate)
+                }
             }
         }
+    }
+
+    private fun flushPendingRemoteCandidates() {
+        val pc = peerConnection ?: return
+        if (pendingRemoteCandidates.isEmpty()) return
+        val queued = pendingRemoteCandidates.toList()
+        pendingRemoteCandidates.clear()
+        queued.forEach { pc.addIceCandidate(it) }
+        onLog("WebRTC flushed ${queued.size} queued remote ICE candidates")
     }
 
     private fun peerObserver() = object : PeerConnection.Observer {
