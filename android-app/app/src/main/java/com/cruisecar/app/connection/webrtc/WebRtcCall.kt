@@ -33,6 +33,7 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 class WebRtcCall(
     private val context: Context,
@@ -64,6 +65,7 @@ class WebRtcCall(
     private var previousSpeakerphoneOn: Boolean? = null
     private val pendingRemoteCandidates = mutableListOf<IceCandidate>()
     private val running = AtomicBoolean(false)
+    private val connectionGeneration = AtomicInteger(0)
 
     init {
         onLog("WebRTC $role created on ${threadName()}")
@@ -71,16 +73,20 @@ class WebRtcCall(
 
     fun startServer(port: Int) {
         onLog("WebRTC startServer on ${threadName()}")
-        if (!running.compareAndSet(false, true)) return
+        val generation = beginConnection()
         initRenderer()
         Thread {
             try {
                 serverSocket = ServerSocket(port)
                 onLog("WebRTC signaling server started on $port")
                 val socket = serverSocket?.accept() ?: return@Thread
+                if (!isCurrentConnection(generation)) {
+                    socket.close()
+                    return@Thread
+                }
                 onLog("WebRTC peer connected: ${socket.inetAddress.hostAddress}")
                 Thread.sleep(1000)
-                startPeer(SignalChannel(socket), createOffer = true)
+                startPeer(SignalChannel(socket), createOffer = true, generation = generation)
             } catch (e: Exception) {
                 if (running.get()) onLog("WebRTC server failed: ${e.message}")
             }
@@ -89,19 +95,23 @@ class WebRtcCall(
 
     fun connect(host: String, port: Int) {
         onLog("WebRTC connect requested on ${threadName()}")
-        close()
-        running.set(true)
+        val generation = beginConnection()
         initRenderer()
         Thread {
             var lastError: Exception? = null
             try {
                 Thread.sleep(800)
                 repeat(30) { attempt ->
+                    if (!isCurrentConnection(generation)) return@Thread
                     try {
                         onLog("WebRTC signaling connect attempt ${attempt + 1}: $host:$port")
                         val socket = Socket(host, port)
+                        if (!isCurrentConnection(generation)) {
+                            socket.close()
+                            return@Thread
+                        }
                         onLog("WebRTC signaling connected: $host:$port")
-                        startPeer(SignalChannel(socket), createOffer = false)
+                        startPeer(SignalChannel(socket), createOffer = false, generation = generation)
                         return@Thread
                     } catch (e: Exception) {
                         lastError = e
@@ -120,22 +130,30 @@ class WebRtcCall(
 
     fun connectRelay(host: String, port: Int, roomId: String, signalRole: Role, token: String = "") {
         onLog("WebRTC relay connect requested room=$roomId role=$signalRole")
-        close()
-        running.set(true)
+        val generation = beginConnection()
         initRenderer()
         Thread {
             var lastError: Exception? = null
             try {
                 repeat(30) { attempt ->
+                    if (!isCurrentConnection(generation)) return@Thread
                     try {
                         onLog("WebRTC relay connect attempt ${attempt + 1}: $host:$port")
                         val socket = Socket(host, port)
+                        if (!isCurrentConnection(generation)) {
+                            socket.close()
+                            return@Thread
+                        }
                         val helloRole = if (signalRole == Role.CALLER) "caller" else "answerer"
                         val hello = "{\"role\":\"$helloRole\",\"room_id\":\"${roomId.jsonEscape()}\",\"token\":\"${token.jsonEscape()}\"}\n"
                         socket.getOutputStream().write(hello.toByteArray(Charsets.UTF_8))
                         socket.getOutputStream().flush()
+                        if (!isCurrentConnection(generation)) {
+                            socket.close()
+                            return@Thread
+                        }
                         onLog("WebRTC relay connected: $host:$port room=$roomId")
-                        startPeer(SignalChannel(socket, skipHandshakeAck = true), createOffer = signalRole == Role.CALLER)
+                        startPeer(SignalChannel(socket, skipHandshakeAck = true), createOffer = signalRole == Role.CALLER, generation = generation)
                         return@Thread
                     } catch (e: Exception) {
                         lastError = e
@@ -152,6 +170,7 @@ class WebRtcCall(
 
     fun close() {
         onLog("WebRTC close on ${threadName()}")
+        connectionGeneration.incrementAndGet()
         running.set(false)
         signal?.close()
         signal = null
@@ -179,7 +198,21 @@ class WebRtcCall(
         eglBase.release()
     }
 
-    private fun startPeer(channel: SignalChannel, createOffer: Boolean) {
+    private fun beginConnection(): Int {
+        close()
+        val generation = connectionGeneration.incrementAndGet()
+        running.set(true)
+        return generation
+    }
+
+    private fun isCurrentConnection(generation: Int): Boolean =
+        running.get() && connectionGeneration.get() == generation
+
+    private fun startPeer(channel: SignalChannel, createOffer: Boolean, generation: Int) {
+        if (!isCurrentConnection(generation)) {
+            channel.close()
+            return
+        }
         onLog("WebRTC startPeer createOffer=$createOffer on ${threadName()}")
         configureSpeakerRoute()
         signal = channel
@@ -188,7 +221,13 @@ class WebRtcCall(
         onLog("WebRTC ICE servers: ${servers.joinToString { it.urls.joinToString("|") }}")
         peerConnection = factory?.createPeerConnection(servers, peerObserver())
         addLocalMedia()
-        channel.listen { message -> handleSignal(message) }
+        if (!channel.listen { message ->
+                if (isCurrentConnection(generation)) handleSignal(message)
+            }) {
+            onLog("WebRTC signal listener failed to start")
+            channel.close()
+            return
+        }
         if (createOffer) createOffer()
     }
 
@@ -462,8 +501,8 @@ private class SignalChannel(private val socket: Socket, private val skipHandshak
     private val output = DataOutputStream(socket.getOutputStream())
     private val running = AtomicBoolean(true)
 
-    fun listen(onMessage: (JSONObject) -> Unit) {
-        Thread {
+    fun listen(onMessage: (JSONObject) -> Unit): Boolean {
+        val thread = Thread {
             if (skipHandshakeAck) {
                 try {
                     val ack = StringBuilder()
@@ -487,7 +526,20 @@ private class SignalChannel(private val socket: Socket, private val skipHandshak
                     break
                 }
             }
-        }.start()
+        }
+        return try {
+            thread.name = "webrtc-signal"
+            thread.start()
+            true
+        } catch (_: OutOfMemoryError) {
+            running.set(false)
+            close()
+            false
+        } catch (_: RuntimeException) {
+            running.set(false)
+            close()
+            false
+        }
     }
 
     @Synchronized
