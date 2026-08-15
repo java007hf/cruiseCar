@@ -1,14 +1,17 @@
 package com.cruisecar.app.connection.control
 
+import com.cruisecar.app.BuildConfig
 import com.cruisecar.app.protocol.ControlCommand
 import com.cruisecar.app.protocol.ControlFrame
 import com.cruisecar.app.protocol.ControlMode
 import com.cruisecar.app.protocol.ControlProtocol
+import com.cruisecar.app.protocol.DebugTracePacket
 import com.cruisecar.app.protocol.GamepadState
 import com.cruisecar.app.protocol.ModeCommand
 import com.cruisecar.app.protocol.ServoCommand
 import com.cruisecar.app.protocol.toHexLine
 import java.io.BufferedInputStream
+import java.io.InputStream
 import java.io.OutputStream
 import java.net.ServerSocket
 import java.net.Socket
@@ -44,26 +47,24 @@ class ControlServer(private val port: Int, private val onFrame: (ByteArray, Cont
         try {
             client.use {
                 val input = BufferedInputStream(it.getInputStream())
-                val frame = ByteArray(ControlProtocol.PACKET_SIZE)
                 while (running.get()) {
-                    var offset = 0
-                    var eof = false
-                    while (offset < frame.size) {
-                        val read = input.read(frame, offset, frame.size - offset)
-                        if (read < 0) { eof = true; break }
-                        offset += read
-                    }
-                    if (eof || !running.get()) break
-                    val packet = frame.copyOf()
+                    val transport = readControlTransport(input) ?: break
+                    if (!running.get()) break
+                    val packet = DebugTracePacket.controlPacket(transport)
                     val parsed = ControlProtocol.parse(packet)
                     if (parsed != null) {
                         try {
-                            onFrame(packet, parsed)
+                            val stamped = if (DebugTracePacket.isTrace(transport)) {
+                                DebugTracePacket.mark(transport, DebugTracePacket.STAGE_RECEIVER_TCP_RECEIVED)
+                            } else {
+                                transport
+                            }
+                            onFrame(stamped, parsed)
                         } catch (e: Exception) {
                             onLog("Frame handling error: ${e.message}")
                         }
                     } else {
-                        onLog("Dropped invalid control frame: ${packet.toHexLine()}")
+                        onLog("Dropped invalid control frame: ${transport.toHexLine()}")
                     }
                 }
             }
@@ -111,6 +112,7 @@ class ControlClient {
     var onStatus: ((Boolean, ControlMode) -> Unit)? = null
     var onReceiverGone: (() -> Unit)? = null
     var onFrame: ((ByteArray, ControlFrame) -> Unit)? = null
+    var debugTraceEnabled: Boolean = BuildConfig.DEBUG
 
     fun connect(host: String, port: Int, onLog: (String) -> Unit) {
         close()
@@ -155,7 +157,6 @@ class ControlClient {
     private fun startReadLoop() {
         val input = socket?.getInputStream() ?: return
         readThread = Thread {
-            val frame = ByteArray(ControlProtocol.PACKET_SIZE)
             try {
                 if (skipHandshakeAck) {
                     while (true) {
@@ -164,20 +165,19 @@ class ControlClient {
                     }
                 }
                 while (running.get() && socket?.isConnected == true) {
-                    var offset = 0
-                    var eof = false
-                    while (offset < frame.size) {
-                        val read = input.read(frame, offset, frame.size - offset)
-                        if (read < 0) { eof = true; break }
-                        offset += read
-                    }
-                    if (eof || !running.get()) break
-                    val parsed = ControlProtocol.parse(frame.copyOf())
+                    val transport = readControlTransport(input) ?: break
+                    if (!running.get()) break
+                    val packet = DebugTracePacket.controlPacket(transport)
+                    val parsed = ControlProtocol.parse(packet)
                     if (parsed is ControlFrame.Status) {
                         onStatus?.invoke(parsed.espConnected, parsed.mode)
                     } else if (parsed != null) {
-                        val packet = frame.copyOf()
-                        onFrame?.invoke(packet, parsed)
+                        val stamped = if (DebugTracePacket.isTrace(transport)) {
+                            DebugTracePacket.mark(transport, DebugTracePacket.STAGE_RECEIVER_TCP_RECEIVED)
+                        } else {
+                            transport
+                        }
+                        onFrame?.invoke(stamped, parsed)
                     }
                 }
             } catch (ignored: Exception) {
@@ -188,33 +188,45 @@ class ControlClient {
     }
 
     @Synchronized
-    fun send(state: GamepadState) {
-        output?.write(state.toPacket())
-        output?.flush()
+    fun send(state: GamepadState, createdAtMs: Long = System.currentTimeMillis()) {
+        sendPacket(state.toPacket(), traceStage = DebugTracePacket.STAGE_SENDER_CREATED, traceAtMs = createdAtMs)
     }
 
     @Synchronized
     fun sendMode(mode: ControlMode) {
-        output?.write(ModeCommand.packet(mode))
-        output?.flush()
+        sendPacket(ModeCommand.packet(mode), traceStage = DebugTracePacket.STAGE_SENDER_CREATED)
     }
 
     @Synchronized
     fun sendServo(index: Int = 0, angle: Int) {
-        output?.write(ServoCommand.packet(index, angle))
-        output?.flush()
+        sendPacket(ServoCommand.packet(index, angle), traceStage = DebugTracePacket.STAGE_SENDER_CREATED)
     }
 
     @Synchronized
     fun sendCommand(code: Int) {
-        output?.write(ControlCommand.packet(code))
-        output?.flush()
+        sendPacket(ControlCommand.packet(code), traceStage = DebugTracePacket.STAGE_SENDER_CREATED)
     }
 
     @Synchronized
     fun sendRaw(packet: ByteArray) {
         output?.write(packet)
         output?.flush()
+    }
+
+    private fun sendPacket(packet: ByteArray, traceStage: Int, traceAtMs: Long = System.currentTimeMillis()) {
+        val out = output ?: return
+        val transport = if (debugTraceEnabled) {
+            DebugTracePacket.wrap(packet, traceStage, traceAtMs)
+        } else {
+            packet
+        }
+        val stamped = if (DebugTracePacket.isTrace(transport)) {
+            DebugTracePacket.mark(transport, DebugTracePacket.STAGE_SENDER_TCP_WRITE)
+        } else {
+            transport
+        }
+        out.write(stamped)
+        out.flush()
     }
 
     fun isConnected(): Boolean = socket?.isConnected == true && output != null && running.get()
@@ -231,6 +243,47 @@ class ControlClient {
         readThread = null
         connectionEpoch.incrementAndGet()
     }
+}
+
+private fun readControlTransport(input: InputStream): ByteArray? {
+    while (true) {
+        val first = input.read()
+        if (first < 0) return null
+        if (first != ControlProtocol.HEADER_0) continue
+        val second = input.read()
+        if (second < 0) return null
+        if (second != ControlProtocol.HEADER_1) continue
+        val type = input.read()
+        if (type < 0) return null
+        if (type == DebugTracePacket.TYPE_TRACE) {
+            val payloadSize = input.read()
+            if (payloadSize < 0) return null
+            val frame = ByteArray(4 + payloadSize + 1)
+            frame[0] = first.toByte()
+            frame[1] = second.toByte()
+            frame[2] = type.toByte()
+            frame[3] = payloadSize.toByte()
+            if (!readFully(input, frame, 4, payloadSize + 1)) return null
+            return frame
+        }
+        val frame = ByteArray(ControlProtocol.PACKET_SIZE)
+        frame[0] = first.toByte()
+        frame[1] = second.toByte()
+        frame[2] = type.toByte()
+        if (!readFully(input, frame, 3, ControlProtocol.PACKET_SIZE - 3)) return null
+        return frame
+    }
+}
+
+private fun readFully(input: InputStream, out: ByteArray, offset: Int, length: Int): Boolean {
+    var cursor = offset
+    val end = offset + length
+    while (cursor < end) {
+        val read = input.read(out, cursor, end - cursor)
+        if (read < 0) return false
+        cursor += read
+    }
+    return true
 }
 
 private fun String.jsonEscape(): String =

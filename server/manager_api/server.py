@@ -14,7 +14,13 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlparse
 
 from manager_api.config.settings import ServerConfig, load_config
-from manager_api.protocol.control_protocol import packet_from_command, packet_to_hex, parse_packet
+from manager_api.protocol.control_protocol import (
+    TRACE_STAGE_SENDER_CREATED,
+    packet_from_command,
+    packet_to_hex,
+    parse_packet,
+    trace_mark,
+)
 from manager_api.storage.store import Store
 
 if TYPE_CHECKING:
@@ -248,17 +254,22 @@ class ManagerApi:
         if not self.store.get_receiver(device_id):
             raise ValueError("receiver not found")
         packet = packet_from_command(command)
+        transport = (
+            trace_mark(packet, TRACE_STAGE_SENDER_CREATED, command.get("client_sent_at_ms"))
+            if command.get("debug_trace")
+            else packet
+        )
         packet_hex = packet_to_hex(packet)
         parsed = parse_packet(packet)
 
         delivered = False
         if self.hub and self.event_loop and self.event_loop.is_running():
-            future = asyncio.run_coroutine_threadsafe(self.hub.send_to_receiver(device_id, packet), self.event_loop)
+            future = asyncio.run_coroutine_threadsafe(self.hub.send_to_receiver(device_id, transport), self.event_loop)
             delivered = bool(future.result(timeout=3))
 
         queue_id = None
         if not delivered:
-            queue_id = self.store.enqueue_command(device_id, packet, packet_hex)
+            queue_id = self.store.enqueue_command(device_id, transport, packet_to_hex(transport))
 
         self.store.add_event(
             "manager_to_receiver" if delivered else "manager_to_queue",

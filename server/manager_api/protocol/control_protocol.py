@@ -2,11 +2,25 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
+import struct
+import time
 
 
 PACKET_SIZE = 10
 HEADER_0 = 0xAA
 HEADER_1 = 0x55
+TRACE_TYPE = 0xF0
+TRACE_VERSION = 1
+TRACE_TIMESTAMP_COUNT = 8
+TRACE_PAYLOAD_SIZE = 1 + 4 + PACKET_SIZE + TRACE_TIMESTAMP_COUNT * 8
+TRACE_FRAME_SIZE = 4 + TRACE_PAYLOAD_SIZE + 1
+TRACE_STAGE_SENDER_CREATED = 0
+TRACE_STAGE_SENDER_TCP_WRITE = 1
+TRACE_STAGE_SERVER_RECEIVED = 2
+TRACE_STAGE_SERVER_FORWARD = 3
+TRACE_STAGE_RECEIVER_TCP_RECEIVED = 4
+TRACE_STAGE_RECEIVER_BT_ENQUEUE = 5
+TRACE_STAGE_RECEIVER_BT_WRITE = 6
 
 
 class FrameType(IntEnum):
@@ -34,8 +48,20 @@ class ParsedFrame:
     payload: dict
 
 
+@dataclass(frozen=True)
+class TraceFrame:
+    seq: int
+    packet: bytes
+    timestamps: tuple[int, ...]
+
+
 def checksum(packet: bytes | bytearray) -> int:
     return sum(packet[: PACKET_SIZE - 1]) & 0xFF
+
+
+def checksum_bytes(data: bytes | bytearray, count: int | None = None) -> int:
+    limit = len(data) if count is None else count
+    return sum(data[:limit]) & 0xFF
 
 
 def is_valid_packet(packet: bytes | bytearray) -> bool:
@@ -71,6 +97,67 @@ def parse_packet(packet: bytes | bytearray) -> ParsedFrame | None:
         payload = {"code": packet[3]}
 
     return ParsedFrame(frame_type=frame_type, payload=payload)
+
+
+def is_trace_frame(data: bytes | bytearray) -> bool:
+    return len(data) >= 4 and data[0] == HEADER_0 and data[1] == HEADER_1 and data[2] == TRACE_TYPE
+
+
+def parse_trace_frame(data: bytes | bytearray) -> TraceFrame | None:
+    if not is_trace_frame(data) or len(data) != TRACE_FRAME_SIZE:
+        return None
+    if data[3] != TRACE_PAYLOAD_SIZE:
+        return None
+    if checksum_bytes(data, len(data) - 1) != data[-1]:
+        return None
+    payload = bytes(data[4:-1])
+    version = payload[0]
+    if version != TRACE_VERSION:
+        return None
+    seq = struct.unpack_from("<I", payload, 1)[0]
+    packet_start = 1 + 4
+    packet = payload[packet_start : packet_start + PACKET_SIZE]
+    ts_start = packet_start + PACKET_SIZE
+    timestamps = struct.unpack_from("<" + "Q" * TRACE_TIMESTAMP_COUNT, payload, ts_start)
+    return TraceFrame(seq=seq, packet=packet, timestamps=timestamps)
+
+
+def control_packet_from_transport(data: bytes | bytearray) -> bytes:
+    trace = parse_trace_frame(data)
+    return trace.packet if trace else bytes(data)
+
+
+def trace_mark(data: bytes | bytearray, stage: int, now_ms: int | None = None) -> bytes:
+    now = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    trace = parse_trace_frame(data)
+    if trace:
+        timestamps = list(trace.timestamps)
+        seq = trace.seq
+        packet = trace.packet
+    else:
+        timestamps = [0] * TRACE_TIMESTAMP_COUNT
+        seq = int(now & 0xFFFFFFFF)
+        packet = bytes(data)
+    if 0 <= stage < TRACE_TIMESTAMP_COUNT:
+        timestamps[stage] = now
+    return trace_encode(seq, packet, timestamps)
+
+
+def trace_encode(seq: int, packet: bytes | bytearray, timestamps: list[int] | tuple[int, ...]) -> bytes:
+    if len(packet) != PACKET_SIZE:
+        raise ValueError("debug trace must wrap a 10-byte control packet")
+    frame = bytearray(TRACE_FRAME_SIZE)
+    frame[0] = HEADER_0
+    frame[1] = HEADER_1
+    frame[2] = TRACE_TYPE
+    frame[3] = TRACE_PAYLOAD_SIZE
+    frame[4] = TRACE_VERSION
+    struct.pack_into("<I", frame, 5, int(seq) & 0xFFFFFFFF)
+    frame[9:19] = bytes(packet)
+    padded = list(timestamps[:TRACE_TIMESTAMP_COUNT]) + [0] * TRACE_TIMESTAMP_COUNT
+    struct.pack_into("<" + "Q" * TRACE_TIMESTAMP_COUNT, frame, 19, *[int(v) for v in padded[:TRACE_TIMESTAMP_COUNT]])
+    frame[-1] = checksum_bytes(frame, len(frame) - 1)
+    return bytes(frame)
 
 
 def packet_to_hex(packet: bytes | bytearray) -> str:

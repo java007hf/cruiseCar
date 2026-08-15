@@ -9,7 +9,17 @@ from dataclasses import dataclass
 from typing import Any
 
 from manager_api.config.settings import ServerConfig, load_config
-from manager_api.protocol.control_protocol import PACKET_SIZE, FrameType, packet_to_hex, parse_packet
+from manager_api.protocol.control_protocol import (
+    PACKET_SIZE,
+    TRACE_TYPE,
+    FrameType,
+    control_packet_from_transport,
+    packet_to_hex,
+    parse_packet,
+    trace_mark,
+    TRACE_STAGE_SERVER_FORWARD,
+    TRACE_STAGE_SERVER_RECEIVED,
+)
 from manager_api.storage.store import Store
 
 
@@ -81,7 +91,8 @@ class ConnectionHub:
         if not session:
             return False
         try:
-            session.writer.write(packet)
+            transport = trace_mark(packet, TRACE_STAGE_SERVER_FORWARD) if len(packet) != PACKET_SIZE else packet
+            session.writer.write(transport)
             await session.writer.drain()
             return True
         except Exception:
@@ -151,7 +162,10 @@ class ConnectionHub:
 
     async def _receiver_loop(self, device_id: str, reader: asyncio.StreamReader) -> None:
         while True:
-            packet = await reader.readexactly(PACKET_SIZE)
+            transport = await read_control_transport(reader)
+            if len(transport) != PACKET_SIZE:
+                transport = trace_mark(transport, TRACE_STAGE_SERVER_RECEIVED)
+            packet = control_packet_from_transport(transport)
             parsed = parse_packet(packet)
             packet_hex = packet_to_hex(packet)
             if parsed is None:
@@ -177,7 +191,10 @@ class ConnectionHub:
 
     async def _sender_loop(self, sender_id: str, reader: asyncio.StreamReader) -> None:
         while True:
-            packet = await reader.readexactly(PACKET_SIZE)
+            transport = await read_control_transport(reader)
+            if len(transport) != PACKET_SIZE:
+                transport = trace_mark(transport, TRACE_STAGE_SERVER_RECEIVED)
+            packet = control_packet_from_transport(transport)
             parsed = parse_packet(packet)
             packet_hex = packet_to_hex(packet)
             session = self.senders.get(sender_id)
@@ -186,9 +203,9 @@ class ConnectionHub:
                 self.store.add_event("sender_invalid", packet_hex, device_id=target_device_id, sender_id=sender_id)
                 continue
 
-            delivered = await self.send_to_receiver(target_device_id, packet)
+            delivered = await self.send_to_receiver(target_device_id, transport)
             if not delivered:
-                self.store.enqueue_command(target_device_id, packet, packet_hex)
+                self.store.enqueue_command(target_device_id, transport, packet_to_hex(transport))
             self.store.add_event(
                 "sender_to_receiver" if delivered else "sender_to_queue",
                 packet_hex,
@@ -239,6 +256,23 @@ class ConnectionHub:
         if isinstance(peer, tuple) and len(peer) >= 2:
             return f"{peer[0]}:{peer[1]}"
         return str(peer or "")
+
+
+async def read_control_transport(reader: asyncio.StreamReader) -> bytes:
+    while True:
+        first = await reader.readexactly(1)
+        if first[0] != 0xAA:
+            continue
+        second = await reader.readexactly(1)
+        if second[0] != 0x55:
+            continue
+        frame_type = await reader.readexactly(1)
+        if frame_type[0] == TRACE_TYPE:
+            payload_len = await reader.readexactly(1)
+            rest = await reader.readexactly(payload_len[0] + 1)
+            return first + second + frame_type + payload_len + rest
+        rest = await reader.readexactly(PACKET_SIZE - 3)
+        return first + second + frame_type + rest
 
 
 class ControlServer:

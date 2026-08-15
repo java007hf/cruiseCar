@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 
 #include "driver/gpio.h"
@@ -20,6 +21,7 @@
 #include "esp_hidh_gattc.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_spp_api.h"
 #include "nvs_flash.h"
 
@@ -30,6 +32,10 @@
 #define LED_GPIO GPIO_NUM_2
 #define SPP_SERVER_NAME "CruiseCar-SPP"
 #define PACKET_SIZE 10
+#define TRACE_TYPE 0xF0
+#define TRACE_PAYLOAD_SIZE (1 + 4 + PACKET_SIZE + 8 * 8)
+#define TRACE_FRAME_SIZE (4 + TRACE_PAYLOAD_SIZE + 1)
+#define TRACE_TIMESTAMP_COUNT 8
 #define SCAN_SECONDS 8
 #define RESCAN_DELAY_MS 3000
 #define CONTROL_VERBOSE_LOG 0
@@ -38,8 +44,9 @@
 #define SPP_STALE_MS 3000
 
 static const char *TAG = "cruise_car";
-static uint8_t rx_buffer[PACKET_SIZE];
+static uint8_t rx_buffer[TRACE_FRAME_SIZE];
 static size_t rx_len;
+static size_t rx_expected_len;
 static volatile bool spp_connected;
 static volatile bool hidh_opening;
 static volatile bool hidh_connected;
@@ -58,6 +65,15 @@ typedef struct {
     uint32_t buttons;
 } gamepad_state_t;
 
+typedef struct {
+    uint32_t seq;
+    uint64_t timestamps[TRACE_TIMESTAMP_COUNT];
+    uint64_t esp_rx_ms;
+    uint8_t frame_type;
+} trace_log_item_t;
+
+static QueueHandle_t trace_log_queue;
+
 static uint8_t checksum(const uint8_t *packet)
 {
     uint16_t sum = 0;
@@ -65,6 +81,32 @@ static uint8_t checksum(const uint8_t *packet)
         sum += packet[i];
     }
     return (uint8_t)(sum & 0xFF);
+}
+
+static uint8_t checksum_len(const uint8_t *data, size_t len_without_checksum)
+{
+    uint16_t sum = 0;
+    for (size_t i = 0; i < len_without_checksum; i++) {
+        sum += data[i];
+    }
+    return (uint8_t)(sum & 0xFF);
+}
+
+static uint32_t read_u32_le(const uint8_t *data)
+{
+    return (uint32_t)data[0] |
+           ((uint32_t)data[1] << 8) |
+           ((uint32_t)data[2] << 16) |
+           ((uint32_t)data[3] << 24);
+}
+
+static uint64_t read_u64_le(const uint8_t *data)
+{
+    uint64_t value = 0;
+    for (int i = 7; i >= 0; i--) {
+        value = (value << 8) | data[i];
+    }
+    return value;
 }
 
 static bool parse_spp_packet(const uint8_t *packet, gamepad_state_t *state)
@@ -233,11 +275,106 @@ static void apply_gamepad_state(const char *source, const gamepad_state_t *state
     car_control_update(state->lx, state->ly, state->rx, state->ry, state->buttons);
 }
 
+static void enqueue_trace_log(const uint8_t *trace_frame)
+{
+    if (trace_log_queue == NULL || trace_frame[3] != TRACE_PAYLOAD_SIZE) {
+        return;
+    }
+
+    const uint8_t *payload = &trace_frame[4];
+    if (payload[0] != 1) {
+        return;
+    }
+
+    trace_log_item_t item = {
+        .seq = read_u32_le(&payload[1]),
+        .esp_rx_ms = (uint64_t)(esp_timer_get_time() / 1000),
+        .frame_type = payload[1 + 4 + 2],
+    };
+    const uint8_t *ts = &payload[1 + 4 + PACKET_SIZE];
+    for (int i = 0; i < TRACE_TIMESTAMP_COUNT; i++) {
+        item.timestamps[i] = read_u64_le(&ts[i * 8]);
+    }
+    (void)xQueueSend(trace_log_queue, &item, 0);
+}
+
+static void trace_log_task(void *arg)
+{
+    (void)arg;
+    trace_log_item_t item;
+    while (true) {
+        if (xQueueReceive(trace_log_queue, &item, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        ESP_LOGI(TAG,
+                 "trace seq=%" PRIu32 " type=0x%02x esp_rx_ms=%" PRIu64
+                 " sender_created=%" PRIu64 " sender_tcp_write=%" PRIu64
+                 " server_received=%" PRIu64 " server_forward=%" PRIu64
+                 " receiver_tcp_received=%" PRIu64 " receiver_bt_enqueue=%" PRIu64
+                 " receiver_bt_write=%" PRIu64,
+                 item.seq,
+                 item.frame_type,
+                 item.esp_rx_ms,
+                 item.timestamps[0],
+                 item.timestamps[1],
+                 item.timestamps[2],
+                 item.timestamps[3],
+                 item.timestamps[4],
+                 item.timestamps[5],
+                 item.timestamps[6]);
+    }
+}
+
+static void trace_log_init(void)
+{
+    trace_log_queue = xQueueCreate(16, sizeof(trace_log_item_t));
+    ESP_RETURN_VOID_ON_FALSE(trace_log_queue != NULL, TAG, "create trace log queue");
+    BaseType_t ok = xTaskCreate(trace_log_task, "trace_log", 4096, NULL, 1, NULL);
+    ESP_RETURN_VOID_ON_FALSE(ok == pdPASS, TAG, "create trace log task");
+}
+
 static void maybe_stop_after_disconnect(void)
 {
     if (!spp_connected && !hidh_connected && !hidh_opening) {
         car_control_stop();
     }
+}
+
+static void handle_control_packet(const uint8_t *packet)
+{
+    if (checksum(packet) != packet[9]) {
+        ESP_LOGW(TAG, "invalid SPP checksum");
+    } else if (packet[2] == 0x01) {
+        gamepad_state_t state;
+        if (parse_spp_packet(packet, &state)) {
+            apply_gamepad_state("spp", &state);
+        } else {
+            ESP_LOGW(TAG, "bad gamepad packet");
+        }
+    } else if (packet[2] == 0x03) {
+        uint8_t sidx = 0;
+        uint16_t sangle = 0;
+        if (parse_servo_packet(packet, &sidx, &sangle)) {
+            car_control_servo_set(sidx, sangle);
+            ESP_LOGI(TAG, "spp servo idx=%u angle=%u", sidx, sangle);
+        } else {
+            ESP_LOGW(TAG, "bad servo packet");
+        }
+    } else {
+        ESP_LOGW(TAG, "unknown SPP packet type 0x%02x", packet[2]);
+    }
+}
+
+static void handle_trace_packet(const uint8_t *trace_frame)
+{
+    if (checksum_len(trace_frame, TRACE_FRAME_SIZE - 1) != trace_frame[TRACE_FRAME_SIZE - 1]) {
+        ESP_LOGW(TAG, "invalid SPP trace checksum");
+        return;
+    }
+    const uint8_t *payload = &trace_frame[4];
+    const uint8_t *packet = &payload[1 + 4];
+    enqueue_trace_log(trace_frame);
+    handle_control_packet(packet);
 }
 
 static void feed_spp_bytes(const uint8_t *data, size_t len)
@@ -252,29 +389,25 @@ static void feed_spp_bytes(const uint8_t *data, size_t len)
             continue;
         }
         rx_buffer[rx_len++] = data[i];
-        if (rx_len == PACKET_SIZE) {
-            if (checksum(rx_buffer) != rx_buffer[9]) {
-                ESP_LOGW(TAG, "invalid SPP checksum");
-            } else if (rx_buffer[2] == 0x01) {
-                gamepad_state_t state;
-                if (parse_spp_packet(rx_buffer, &state)) {
-                    apply_gamepad_state("spp", &state);
-                } else {
-                    ESP_LOGW(TAG, "bad gamepad packet");
-                }
-            } else if (rx_buffer[2] == 0x03) {
-                uint8_t sidx = 0;
-                uint16_t sangle = 0;
-                if (parse_servo_packet(rx_buffer, &sidx, &sangle)) {
-                    car_control_servo_set(sidx, sangle);
-                    ESP_LOGI(TAG, "spp servo idx=%u angle=%u", sidx, sangle);
-                } else {
-                    ESP_LOGW(TAG, "bad servo packet");
-                }
+        if (rx_len == 3) {
+            rx_expected_len = (rx_buffer[2] == TRACE_TYPE) ? 0 : PACKET_SIZE;
+        } else if (rx_len == 4 && rx_buffer[2] == TRACE_TYPE) {
+            if (rx_buffer[3] != TRACE_PAYLOAD_SIZE) {
+                ESP_LOGW(TAG, "invalid SPP trace payload size=%u", rx_buffer[3]);
+                rx_len = 0;
+                rx_expected_len = 0;
+                continue;
+            }
+            rx_expected_len = TRACE_FRAME_SIZE;
+        }
+        if (rx_expected_len > 0 && rx_len == rx_expected_len) {
+            if (rx_buffer[2] == TRACE_TYPE) {
+                handle_trace_packet(rx_buffer);
             } else {
-                ESP_LOGW(TAG, "unknown SPP packet type 0x%02x", rx_buffer[2]);
+                handle_control_packet(rx_buffer);
             }
             rx_len = 0;
+            rx_expected_len = 0;
         }
     }
 }
@@ -565,6 +698,7 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     ESP_ERROR_CHECK(car_control_init());
+    trace_log_init();
     indicator_led_init();
 
     ESP_LOGI(TAG, "Starting ESP32 SPP + HID gamepad receiver");

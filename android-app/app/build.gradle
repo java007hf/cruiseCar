@@ -26,6 +26,9 @@ android {
     androidResources {
         noCompress += "tflite"
     }
+    buildFeatures {
+        buildConfig = true
+    }
 }
 
 dependencies {

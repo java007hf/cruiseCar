@@ -14,6 +14,7 @@ import com.cruisecar.app.feature.follow.SmartFollowController
 import com.cruisecar.app.protocol.ControlFrame
 import com.cruisecar.app.protocol.ControlMode
 import com.cruisecar.app.protocol.ControlProtocol
+import com.cruisecar.app.protocol.DebugTracePacket
 import com.cruisecar.app.protocol.GamepadState
 import com.cruisecar.app.protocol.StatusCommand
 import com.cruisecar.app.protocol.toHexLine
@@ -870,11 +871,21 @@ class MainActivity : Activity() {
 
     private fun forwardToEsp32(packet: ByteArray, message: String) {
         if (bluetooth.isConnected()) {
+            val queuedPacket = if (DebugTracePacket.isTrace(packet)) {
+                DebugTracePacket.mark(packet, DebugTracePacket.STAGE_RECEIVER_BT_ENQUEUE)
+            } else {
+                packet
+            }
             forwardExecutor.execute {
-                if (bluetooth.send(packet)) {
+                val transport = if (DebugTracePacket.isTrace(queuedPacket)) {
+                    DebugTracePacket.mark(queuedPacket, DebugTracePacket.STAGE_RECEIVER_BT_WRITE)
+                } else {
+                    queuedPacket
+                }
+                if (bluetooth.send(transport)) {
                     log(message)
                 } else {
-                    logReceiverForwardStatus("ESP32 send failed: ${packet.toHexLine()}")
+                    logReceiverForwardStatus("ESP32 send failed: ${transport.toHexLine()}")
                     runOnUiThread { updateReceiverEspStatus(false) }
                 }
             }
@@ -1216,7 +1227,7 @@ class MainActivity : Activity() {
             try {
                 /* 断连后重连, 连接世代已变化, 丢弃过期任务, 不把未发送的消息重发给接收端 */
                 if (controlClient.isConnected() && controlClient.connectionEpoch() == epoch) {
-                    controlClient.send(state)
+                    controlClient.send(state, createdAtMs = now)
                     log("TCP sent: ${state.toHexLine()}")
                 }
             } catch (e: Exception) {

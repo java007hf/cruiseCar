@@ -237,6 +237,11 @@
         <label for="receiverSelect">接收端设备</label>
         <select id="receiverSelect"></select>
 
+        <label>
+          <input id="debugTrace" type="checkbox" />
+          Debug trace
+        </label>
+
         <div class="actions">
           <button id="connectEspBtn" class="success">远程连接 ESP32</button>
           <button id="stopBtn" class="danger">停止 / 回中</button>
@@ -297,7 +302,8 @@
       apiBase: 'http://116.62.32.90:8088',
       username: '',
       token: '',
-      receiverId: ''
+      receiverId: '',
+      debugTrace: false
     };
     const state = { ...DEFAULT_STATE, ...readState() };
     const els = {
@@ -307,6 +313,7 @@
       loginBtn: document.querySelector('#loginBtn'),
       loadBtn: document.querySelector('#loadBtn'),
       receiverSelect: document.querySelector('#receiverSelect'),
+      debugTrace: document.querySelector('#debugTrace'),
       connectEspBtn: document.querySelector('#connectEspBtn'),
       stopBtn: document.querySelector('#stopBtn'),
       servo: document.querySelector('#servo'),
@@ -345,6 +352,7 @@
     function init() {
       els.apiBase.value = state.apiBase;
       els.username.value = state.username;
+      els.debugTrace.checked = Boolean(state.debugTrace);
       updateLoginStatus();
       bindEvents();
       if (state.token) loadReceivers().catch(err => log('自动刷新设备失败: ' + err.message));
@@ -364,6 +372,11 @@
         saveState();
         log('已选择接收端: ' + state.receiverId);
         disconnectVideo(true);
+      });
+      els.debugTrace.addEventListener('change', () => {
+        state.debugTrace = els.debugTrace.checked;
+        saveState();
+        log('Debug trace ' + (state.debugTrace ? 'ON' : 'OFF'));
       });
       document.querySelectorAll('[data-mode]').forEach(btn => {
         btn.addEventListener('click', () => sendCommand({ type: 'mode', mode: btn.dataset.mode }, '切换模式 ' + btn.dataset.mode));
@@ -499,10 +512,15 @@
       if (!receiverId) throw new Error('请先选择接收端设备');
       const result = await request(`/api/receivers/${encodeURIComponent(receiverId)}/commands`, {
         method: 'POST',
-        body: command
+        body: withDebugTrace(command)
       });
       if (!quiet) log(`${label || command.type} 已发送: ${result.delivered ? '实时送达' : '接收端离线，已入队'} ${result.packet_hex || ''}`);
       return result;
+    }
+
+    function withDebugTrace(command) {
+      if (!els.debugTrace.checked) return command;
+      return { ...command, debug_trace: true, client_sent_at_ms: Date.now() };
     }
 
     async function connectVideo(isRetry = false) {
@@ -775,7 +793,8 @@
         apiBase: state.apiBase,
         username: state.username,
         token: state.token,
-        receiverId: state.receiverId
+        receiverId: state.receiverId,
+        debugTrace: state.debugTrace
       }));
     }
   </script>
