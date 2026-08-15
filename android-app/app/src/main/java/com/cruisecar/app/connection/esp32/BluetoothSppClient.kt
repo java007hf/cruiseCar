@@ -25,6 +25,7 @@ class BluetoothSppClient {
     @Volatile private var connected = false
     @Volatile private var readThread: Thread? = null
     var onPacket: ((ByteArray) -> Unit)? = null
+    var onDisconnected: (() -> Unit)? = null
 
     private fun deviceTypeStr(type: Int): String = when (type) {
         BluetoothDevice.DEVICE_TYPE_CLASSIC -> "CLASSIC"
@@ -244,6 +245,7 @@ class BluetoothSppClient {
         } catch (e: IOException) {
             Log.e(TAG, "send failed, marking disconnected: ${e.message}")
             connected = false
+            onDisconnected?.invoke()
             false
         }
     }
@@ -271,7 +273,9 @@ class BluetoothSppClient {
             } catch (e: Exception) {
                 Log.e(TAG, "SPP read failed: ${e.message}", e)
             } finally {
+                val wasConnected = connected
                 connected = false
+                if (wasConnected) onDisconnected?.invoke()
             }
         }.also {
             it.name = "spp-read"

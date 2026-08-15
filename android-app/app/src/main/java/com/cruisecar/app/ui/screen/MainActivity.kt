@@ -122,6 +122,8 @@ class MainActivity : Activity() {
     /* 接收端 → 发送端 状态回报定时任务句柄, stopReceiverServices 时取消 */
     private var receiverReporterTask: ScheduledFuture<*>? = null
     private var receiverServicesStarted = false
+    private val esp32ConnectInProgress = AtomicBoolean(false)
+    private val esp32ReconnectScheduled = AtomicBoolean(false)
     private var smartFollow: SmartFollowController? = null
     private var webRtcCall: WebRtcCall? = null
     private lateinit var logView: TextView
@@ -156,6 +158,7 @@ class MainActivity : Activity() {
         viewFactory = MainViewFactory(this)
         viewModel = MainViewModel(ReceiverIdentityStore(this))
         bluetooth.onPacket = { packet -> handleEsp32Packet(packet) }
+        bluetooth.onDisconnected = { handleEsp32Disconnected() }
         controlClient.onDebugAck = { seq, rttMs -> log("Trace ACK seq=$seq rtt=${rttMs}ms") }
         log("CruiseCar APK debug $appVersionLabel started")
         requestBasePermissions()
@@ -793,17 +796,44 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun connectEsp32ByScan() {
+    private fun connectEsp32ByScan(autoRetry: Boolean = false) {
+        if (bluetooth.isConnected()) {
+            runOnUiThread { updateReceiverEspStatus(true) }
+            return
+        }
+        if (!esp32ConnectInProgress.compareAndSet(false, true)) return
+        esp32ReconnectScheduled.set(false)
         Thread {
             try {
+                log(if (autoRetry) "ESP32 reconnect scanning..." else "ESP32 auto-connect scanning...")
                 bluetooth.connectFirstByName(this, BluetoothSppClient.ESP32_DEVICE_NAME) { log(it) }
-                log("ESP32 auto-connect ready")
+                log(if (autoRetry) "ESP32 reconnect ready" else "ESP32 auto-connect ready")
                 runOnUiThread { updateReceiverEspStatus(true) }
             } catch (e: Exception) {
-                log("ESP32 auto-connect failed: ${e.message}")
+                log(if (autoRetry) "ESP32 reconnect failed: ${e.message}" else "ESP32 auto-connect failed: ${e.message}")
                 runOnUiThread { updateReceiverEspStatus(false) }
+                if (autoRetry) scheduleEsp32Reconnect()
+            } finally {
+                esp32ConnectInProgress.set(false)
             }
         }.start()
+    }
+
+    private fun handleEsp32Disconnected() {
+        logReceiverForwardStatus("ESP32 SPP disconnected; scheduling reconnect")
+        runOnUiThread { updateReceiverEspStatus(false) }
+        scheduleEsp32Reconnect()
+    }
+
+    private fun scheduleEsp32Reconnect(delayMs: Long = 1500L) {
+        if (!receiverServicesStarted || bluetooth.isConnected()) return
+        if (!esp32ReconnectScheduled.compareAndSet(false, true)) return
+        Handler(Looper.getMainLooper()).postDelayed({
+            esp32ReconnectScheduled.set(false)
+            if (receiverServicesStarted && !bluetooth.isConnected()) {
+                connectEsp32ByScan(autoRetry = true)
+            }
+        }, delayMs)
     }
 
     private fun startReceiverServices() {
@@ -905,11 +935,13 @@ class MainActivity : Activity() {
                 } else {
                     logReceiverForwardStatus("ESP32 send failed: ${transport.toHexLine()}")
                     runOnUiThread { updateReceiverEspStatus(false) }
+                    scheduleEsp32Reconnect()
                 }
             }
         } else {
             logReceiverForwardStatus("ESP32 not connected; received control frame but not forwarded: ${packet.toHexLine()}")
             runOnUiThread { updateReceiverEspStatus(false) }
+            scheduleEsp32Reconnect()
         }
     }
 
@@ -929,6 +961,7 @@ class MainActivity : Activity() {
         if (!bluetooth.isConnected()) {
             logReceiverForwardStatus("ESP32 not connected; received control frame but not forwarded: ${packet.toHexLine()}")
             runOnUiThread { updateReceiverEspStatus(false) }
+            scheduleEsp32Reconnect()
             return
         }
         val queuedPacket = if (DebugTracePacket.isTrace(packet)) {
@@ -959,6 +992,7 @@ class MainActivity : Activity() {
                 } else {
                     logReceiverForwardStatus("ESP32 send failed: ${transport.toHexLine()}")
                     runOnUiThread { updateReceiverEspStatus(false) }
+                    scheduleEsp32Reconnect()
                     break
                 }
             }
@@ -1001,6 +1035,7 @@ class MainActivity : Activity() {
         releaseReceiverCall()
         receiverLayout = null
         receiverServicesStarted = false
+        esp32ReconnectScheduled.set(false)
     }
 
     private fun applyReceiverDriveMode(mode: ControlMode) {
