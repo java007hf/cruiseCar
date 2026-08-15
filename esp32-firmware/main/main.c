@@ -39,19 +39,16 @@
 #define SCAN_SECONDS 8
 #define RESCAN_DELAY_MS 3000
 #define CONTROL_VERBOSE_LOG 0
-/* 若 SPP 已"连接"但超过此时长没有任何数据到达, 判定为上一次(非正常)断连未被
-   栈上报, 强制复位连接态并重启 SPP 服务, 避免卡在"假连接"(灯不闪且无法重连)。 */
-#define SPP_STALE_MS 3000
 
 static const char *TAG = "cruise_car";
 static uint8_t rx_buffer[TRACE_FRAME_SIZE];
 static size_t rx_len;
 static size_t rx_expected_len;
 static volatile bool spp_connected;
+static uint32_t spp_handle;
 static volatile bool hidh_opening;
 static volatile bool hidh_connected;
 static volatile TickType_t led_cmd_tick;   /* tick of last received command, 0 = none */
-static volatile TickType_t spp_last_data_tick; /* tick of last SPP byte received, 0 = none */
 #if CONTROL_VERBOSE_LOG
 static bool have_prev_buttons;
 static uint32_t prev_buttons;
@@ -374,12 +371,24 @@ static void handle_trace_packet(const uint8_t *trace_frame)
     const uint8_t *payload = &trace_frame[4];
     const uint8_t *packet = &payload[1 + 4];
     enqueue_trace_log(trace_frame);
+    if (spp_connected && spp_handle != 0) {
+        uint8_t ack[PACKET_SIZE] = {0};
+        uint32_t seq = read_u32_le(&payload[1]);
+        ack[0] = 0xAA;
+        ack[1] = 0x55;
+        ack[2] = 0x06;
+        ack[3] = (uint8_t)(seq & 0xFF);
+        ack[4] = (uint8_t)((seq >> 8) & 0xFF);
+        ack[5] = (uint8_t)((seq >> 16) & 0xFF);
+        ack[6] = (uint8_t)((seq >> 24) & 0xFF);
+        ack[9] = checksum(ack);
+        esp_spp_write(spp_handle, sizeof(ack), ack);
+    }
     handle_control_packet(packet);
 }
 
 static void feed_spp_bytes(const uint8_t *data, size_t len)
 {
-    spp_last_data_tick = xTaskGetTickCount();
     for (size_t i = 0; i < len; i++) {
         if (rx_len == 0 && data[i] != 0xAA) {
             continue;
@@ -426,10 +435,12 @@ static void spp_callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
         break;
     case ESP_SPP_SRV_OPEN_EVT:
         spp_connected = true;
+        spp_handle = param->srv_open.handle;
         ESP_LOGI(TAG, "SPP client connected");
         break;
     case ESP_SPP_CLOSE_EVT:
         spp_connected = false;
+        spp_handle = 0;
         ESP_LOGI(TAG, "SPP client disconnected");
         maybe_stop_after_disconnect();
         break;
@@ -442,12 +453,6 @@ static void spp_callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
 }
 
 /* 重启 SPP 服务, 让接收端在(非正常)断连后可以重新发起连接。 */
-static void spp_rearm(void)
-{
-    ESP_LOGI(TAG, "re-arming SPP server");
-    esp_spp_start_srv(ESP_SPP_SEC_NONE, ESP_SPP_ROLE_SLAVE, 0, SPP_SERVER_NAME);
-}
-
 static void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id, void *event_data)
 {
     (void)handler_args;
@@ -501,7 +506,7 @@ static void scan_and_connect_hid_task(void *arg)
     (void)arg;
 
     while (true) {
-        if (hidh_opening || hidh_connected) {
+        if (hidh_opening || hidh_connected || spp_connected) {
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
@@ -626,13 +631,6 @@ static void indicator_led_task(void *arg)
 
         /* 假连接看门狗: 已"连接"却长时间无数据 → 视为上次非正常断连未被栈上报,
            复位连接态并重启 SPP 服务, 使接收端可以重新连接。 */
-        if (spp_connected && (now - spp_last_data_tick) > pdMS_TO_TICKS(SPP_STALE_MS)) {
-            ESP_LOGW(TAG, "SPP stale (no data for %ums), assuming dead link", SPP_STALE_MS);
-            spp_connected = false;
-            maybe_stop_after_disconnect();
-            spp_rearm();
-        }
-
         if (!any_connected()) {
             /* not paired → blink every 500 ms */
             if ((now - blink_toggle_tick) >= pdMS_TO_TICKS(500)) {

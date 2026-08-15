@@ -179,6 +179,8 @@ class ConnectionHub:
                     str(parsed.payload.get("mode", "manual")),
                 )
                 await self._broadcast_status(device_id, packet)
+            elif parsed.frame_type == FrameType.DEBUG_ACK:
+                await self._broadcast_status(device_id, packet)
 
             self.store.add_event(
                 "receiver_to_server",

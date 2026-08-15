@@ -29,6 +29,7 @@ class FrameType(IntEnum):
     SERVO = 0x03
     STATUS = 0x04
     COMMAND = 0x05
+    DEBUG_ACK = 0x06
 
 
 class ControlMode(IntEnum):
@@ -93,6 +94,8 @@ def parse_packet(packet: bytes | bytearray) -> ParsedFrame | None:
         payload = {"index": packet[3], "angle": min(packet[4], 180)}
     elif frame_type == FrameType.STATUS:
         payload = {"esp_connected": packet[3] != 0, "mode": safe_mode(packet[4]).name.lower()}
+    elif frame_type == FrameType.DEBUG_ACK:
+        payload = {"seq": packet[3] | (packet[4] << 8) | (packet[5] << 16) | (packet[6] << 24)}
     else:
         payload = {"code": packet[3]}
 

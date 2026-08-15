@@ -10,7 +10,9 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.os.Build
 import android.util.Log
+import com.cruisecar.app.protocol.ControlProtocol
 import java.io.IOException
+import java.io.InputStream
 import java.io.OutputStream
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
@@ -21,6 +23,8 @@ class BluetoothSppClient {
     @Volatile private var socket: BluetoothSocket? = null
     @Volatile private var output: OutputStream? = null
     @Volatile private var connected = false
+    @Volatile private var readThread: Thread? = null
+    var onPacket: ((ByteArray) -> Unit)? = null
 
     private fun deviceTypeStr(type: Int): String = when (type) {
         BluetoothDevice.DEVICE_TYPE_CLASSIC -> "CLASSIC"
@@ -71,6 +75,7 @@ class BluetoothSppClient {
         }
         output = socket?.outputStream
         connected = true
+        startReadLoop()
         onLog("Bluetooth SPP connected: $address")
     }
 
@@ -221,6 +226,7 @@ class BluetoothSppClient {
         }
         output = socket?.outputStream
         connected = true
+        startReadLoop()
         onLog("Bluetooth SPP connected: ${device.name ?: device.address}")
     }
 
@@ -247,8 +253,51 @@ class BluetoothSppClient {
     fun close() {
         connected = false
         output = null
+        readThread = null
         socket?.close()
         socket = null
+    }
+
+    private fun startReadLoop() {
+        val input = socket?.inputStream ?: return
+        readThread = Thread {
+            while (connected) {
+                val packet = readPacket(input) ?: break
+                onPacket?.invoke(packet)
+            }
+            connected = false
+        }.also {
+            it.name = "spp-read"
+            it.start()
+        }
+    }
+
+    private fun readPacket(input: InputStream): ByteArray? {
+        while (connected) {
+            val first = input.read()
+            if (first < 0) return null
+            if (first != ControlProtocol.HEADER_0) continue
+            val second = input.read()
+            if (second < 0) return null
+            if (second != ControlProtocol.HEADER_1) continue
+            val frame = ByteArray(ControlProtocol.PACKET_SIZE)
+            frame[0] = first.toByte()
+            frame[1] = second.toByte()
+            if (!readFully(input, frame, 2, ControlProtocol.PACKET_SIZE - 2)) return null
+            return frame
+        }
+        return null
+    }
+
+    private fun readFully(input: InputStream, out: ByteArray, offset: Int, length: Int): Boolean {
+        var cursor = offset
+        val end = offset + length
+        while (cursor < end) {
+            val read = input.read(out, cursor, end - cursor)
+            if (read < 0) return false
+            cursor += read
+        }
+        return true
     }
 
     companion object {

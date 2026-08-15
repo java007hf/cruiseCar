@@ -15,6 +15,7 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.net.ServerSocket
 import java.net.Socket
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -108,10 +109,12 @@ class ControlClient {
     private var skipHandshakeAck = false
     /** 连接世代计数: 每次 connect/close 递增, 用于丢弃断连期间排队的过期发送任务。 */
     private val connectionEpoch = AtomicInteger(0)
+    private val pendingTraceCreatedAtMs = ConcurrentHashMap<Int, Long>()
 
     var onStatus: ((Boolean, ControlMode) -> Unit)? = null
     var onReceiverGone: (() -> Unit)? = null
     var onFrame: ((ByteArray, ControlFrame) -> Unit)? = null
+    var onDebugAck: ((seq: Int, rttMs: Long) -> Unit)? = null
     var debugTraceEnabled: Boolean = BuildConfig.DEBUG
 
     fun connect(host: String, port: Int, onLog: (String) -> Unit) {
@@ -171,6 +174,11 @@ class ControlClient {
                     val parsed = ControlProtocol.parse(packet)
                     if (parsed is ControlFrame.Status) {
                         onStatus?.invoke(parsed.espConnected, parsed.mode)
+                    } else if (parsed is ControlFrame.DebugAck) {
+                        val createdAt = pendingTraceCreatedAtMs.remove(parsed.seq)
+                        if (createdAt != null) {
+                            onDebugAck?.invoke(parsed.seq, System.currentTimeMillis() - createdAt)
+                        }
                     } else if (parsed != null) {
                         val stamped = if (DebugTracePacket.isTrace(transport)) {
                             DebugTracePacket.mark(transport, DebugTracePacket.STAGE_RECEIVER_TCP_RECEIVED)
@@ -225,6 +233,9 @@ class ControlClient {
         } else {
             transport
         }
+        DebugTracePacket.parse(stamped)?.let { trace ->
+            pendingTraceCreatedAtMs[trace.seq] = trace.timestamps[DebugTracePacket.STAGE_SENDER_CREATED]
+        }
         out.write(stamped)
         out.flush()
     }
@@ -238,6 +249,7 @@ class ControlClient {
         running.set(false)
         output = null
         skipHandshakeAck = false
+        pendingTraceCreatedAtMs.clear()
         socket?.close()
         socket = null
         readThread = null

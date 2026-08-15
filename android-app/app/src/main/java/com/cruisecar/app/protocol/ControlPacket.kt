@@ -8,6 +8,7 @@ sealed class ControlFrame {
     data class Servo(val index: Int, val angle: Int) : ControlFrame()
     data class Status(val espConnected: Boolean, val mode: ControlMode) : ControlFrame()
     data class Command(val code: Int) : ControlFrame()
+    data class DebugAck(val seq: Int) : ControlFrame()
 }
 
 enum class ControlMode(val wireValue: Int, val label: String) {
@@ -124,6 +125,7 @@ object ControlProtocol {
     const val TYPE_SERVO = 0x03
     const val TYPE_STATUS = 0x04
     const val TYPE_CMD = 0x05
+    const val TYPE_DEBUG_ACK = 0x06
     const val CMD_CONNECT_ESP32 = 0x01
 
     fun parse(packet: ByteArray): ControlFrame? {
@@ -152,6 +154,12 @@ object ControlProtocol {
                 mode = ControlMode.fromWire(packet[4].toInt() and 0xFF)
             )
             TYPE_CMD -> ControlFrame.Command(packet[3].toInt() and 0xFF)
+            TYPE_DEBUG_ACK -> ControlFrame.DebugAck(
+                seq = (packet[3].toInt() and 0xFF) or
+                    ((packet[4].toInt() and 0xFF) shl 8) or
+                    ((packet[5].toInt() and 0xFF) shl 16) or
+                    ((packet[6].toInt() and 0xFF) shl 24)
+            )
             else -> null
         }
     }

@@ -57,8 +57,15 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 private enum class RootTab { CONNECT, MINE }
+
+private data class PendingForwardPacket(
+    val packet: ByteArray,
+    val message: String
+)
 
 private const val ROLE_SENDER = "sender"
 private const val ROLE_RECEIVER = "receiver"
@@ -101,6 +108,8 @@ class MainActivity : Activity() {
     /* 接收端转发独立线程: 把蓝牙写从 TCP 读取线程挪开, 避免 ESP32 蓝牙写阻塞
        时反向压垮发送端 TCP(导致舵机/手柄指令在发送端排队、延迟累积)。 */
     private val forwardExecutor = Executors.newSingleThreadExecutor()
+    private val pendingGamepadForward = AtomicReference<PendingForwardPacket?>()
+    private val gamepadForwardScheduled = AtomicBoolean(false)
     /* 接收端状态回报 + ESP32 心跳的定时任务(1Hz) */
     private val receiverReporter: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
     private var cameraPreview: CameraPreviewView? = null
@@ -146,6 +155,8 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         viewFactory = MainViewFactory(this)
         viewModel = MainViewModel(ReceiverIdentityStore(this))
+        bluetooth.onPacket = { packet -> handleEsp32Packet(packet) }
+        controlClient.onDebugAck = { seq, rttMs -> log("Trace ACK seq=$seq rtt=${rttMs}ms") }
         log("CruiseCar APK debug $appVersionLabel started")
         requestBasePermissions()
         showHomeScreen()
@@ -846,7 +857,7 @@ class MainActivity : Activity() {
             is ControlFrame.Gamepad -> {
                 if (receiverMode == ControlMode.MANUAL) {
                     logReceiverGamepad(frame.state)
-                    forwardToEsp32(packet, "Forwarded: ${packet.toHexLine()}")
+                    forwardLatestGamepadToEsp32(packet, "Forwarded: ${packet.toHexLine()}")
                 } else {
                     logReceiverGamepad(frame.state, "ignored in ${receiverMode.label}")
                 }
@@ -866,6 +877,7 @@ class MainActivity : Activity() {
                 }
             }
             is ControlFrame.Status -> Unit
+            is ControlFrame.DebugAck -> Unit
         }
     }
 
@@ -892,6 +904,63 @@ class MainActivity : Activity() {
         } else {
             logReceiverForwardStatus("ESP32 not connected; received control frame but not forwarded: ${packet.toHexLine()}")
             runOnUiThread { updateReceiverEspStatus(false) }
+        }
+    }
+
+    private fun handleEsp32Packet(packet: ByteArray) {
+        val frame = ControlProtocol.parse(packet)
+        if (frame is ControlFrame.DebugAck) {
+            val state = viewModel.state
+            if (state.connectionMode == ConnectionMode.LAN) {
+                controlServer?.send(packet)
+            } else if (controlClient.isConnected()) {
+                controlClient.sendRaw(packet)
+            }
+        }
+    }
+
+    private fun forwardLatestGamepadToEsp32(packet: ByteArray, message: String) {
+        if (!bluetooth.isConnected()) {
+            logReceiverForwardStatus("ESP32 not connected; received control frame but not forwarded: ${packet.toHexLine()}")
+            runOnUiThread { updateReceiverEspStatus(false) }
+            return
+        }
+        val queuedPacket = if (DebugTracePacket.isTrace(packet)) {
+            DebugTracePacket.mark(packet, DebugTracePacket.STAGE_RECEIVER_BT_ENQUEUE)
+        } else {
+            packet
+        }
+        pendingGamepadForward.set(PendingForwardPacket(queuedPacket, message))
+        scheduleLatestGamepadDrain()
+    }
+
+    private fun scheduleLatestGamepadDrain() {
+        if (!gamepadForwardScheduled.compareAndSet(false, true)) return
+        forwardExecutor.execute { drainLatestGamepadForward() }
+    }
+
+    private fun drainLatestGamepadForward() {
+        try {
+            while (true) {
+                val next = pendingGamepadForward.getAndSet(null) ?: break
+                val transport = if (DebugTracePacket.isTrace(next.packet)) {
+                    DebugTracePacket.mark(next.packet, DebugTracePacket.STAGE_RECEIVER_BT_WRITE)
+                } else {
+                    next.packet
+                }
+                if (bluetooth.send(transport)) {
+                    log(next.message)
+                } else {
+                    logReceiverForwardStatus("ESP32 send failed: ${transport.toHexLine()}")
+                    runOnUiThread { updateReceiverEspStatus(false) }
+                    break
+                }
+            }
+        } finally {
+            gamepadForwardScheduled.set(false)
+            if (pendingGamepadForward.get() != null) {
+                scheduleLatestGamepadDrain()
+            }
         }
     }
 
