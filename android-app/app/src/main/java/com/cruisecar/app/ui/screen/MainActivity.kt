@@ -244,13 +244,13 @@ class MainActivity : Activity() {
     internal fun createConnectFragmentView(): View {
         val layout = homePageLayout()
         addConnectTab(layout)
-        return layout
+        return homePageScroll(layout)
     }
 
     internal fun createMineFragmentView(): View {
         val layout = homePageLayout()
         addMineTab(layout)
-        return layout
+        return homePageScroll(layout)
     }
 
     private fun addConnectTab(layout: LinearLayout) {
@@ -554,6 +554,12 @@ class MainActivity : Activity() {
         orientation = LinearLayout.VERTICAL
         setPadding(dp(20), dp(6), dp(20), dp(10))
         background = homeGradient()
+    }
+
+    private fun homePageScroll(content: LinearLayout): ScrollView = ScrollView(this).apply {
+        background = homeGradient()
+        isFillViewport = false
+        addView(content, FrameLayout.LayoutParams(-1, -2))
     }
 
     private fun topTextButton(text: String, onClick: () -> Unit): TextView = TextView(this).apply {

@@ -261,11 +261,18 @@ class BluetoothSppClient {
     private fun startReadLoop() {
         val input = socket?.inputStream ?: return
         readThread = Thread {
-            while (connected) {
-                val packet = readPacket(input) ?: break
-                onPacket?.invoke(packet)
+            try {
+                while (connected) {
+                    val packet = readPacket(input) ?: break
+                    onPacket?.invoke(packet)
+                }
+            } catch (e: IOException) {
+                Log.d(TAG, "SPP read ended: ${e.message}")
+            } catch (e: Exception) {
+                Log.e(TAG, "SPP read failed: ${e.message}", e)
+            } finally {
+                connected = false
             }
-            connected = false
         }.also {
             it.name = "spp-read"
             it.start()

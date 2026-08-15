@@ -60,9 +60,10 @@ class MainViewFactory(private val context: Context) {
 
     fun withLog(content: LinearLayout): ScreenWithLog {
         val logView = TextView(context).apply { textSize = 13f }
-        val scroll = ScrollView(context).apply { addView(logView) }
-        content.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
-        return ScreenWithLog(root = content, logView = logView)
+        val logScroll = ScrollView(context).apply { addView(logView) }
+        content.addView(logScroll, LinearLayout.LayoutParams(-1, dp(140)))
+        val rootScroll = ScrollView(context).apply { addView(content) }
+        return ScreenWithLog(root = rootScroll, logView = logView)
     }
 
     /** 用于已自带 ScrollView 根(scrollableRoot)的屏幕: 日志区改为固定高度, 避免 weight 在 ScrollView 中塌缩。 */
