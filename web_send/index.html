@@ -259,6 +259,9 @@
         <label for="servo">舵机角度：<span id="servoValue">130</span>°</label>
         <input id="servo" type="range" min="130" max="180" value="130" />
 
+        <label for="speed">最大速度: <span id="speedValue">30</span>%</label>
+        <input id="speed" type="range" min="10" max="100" value="30" />
+
         <div class="telemetry">
           <div class="metric"><span>LX</span><strong id="lxOut">128</strong></div>
           <div class="metric"><span>LY</span><strong id="lyOut">128</strong></div>
@@ -303,7 +306,8 @@
       username: '',
       token: '',
       receiverId: '',
-      debugTrace: false
+      debugTrace: false,
+      speedPercent: 30
     };
     const state = { ...DEFAULT_STATE, ...readState() };
     const els = {
@@ -318,6 +322,8 @@
       stopBtn: document.querySelector('#stopBtn'),
       servo: document.querySelector('#servo'),
       servoValue: document.querySelector('#servoValue'),
+      speed: document.querySelector('#speed'),
+      speedValue: document.querySelector('#speedValue'),
       statusDot: document.querySelector('#statusDot'),
       statusText: document.querySelector('#statusText'),
       joystick: document.querySelector('#joystick'),
@@ -353,6 +359,9 @@
       els.apiBase.value = state.apiBase;
       els.username.value = state.username;
       els.debugTrace.checked = Boolean(state.debugTrace);
+      state.speedPercent = clampSpeed(state.speedPercent);
+      els.speed.value = String(state.speedPercent);
+      els.speedValue.textContent = String(state.speedPercent);
       updateLoginStatus();
       bindEvents();
       if (state.token) loadReceivers().catch(err => log('自动刷新设备失败: ' + err.message));
@@ -385,6 +394,11 @@
         els.servoValue.textContent = els.servo.value;
       });
       els.servo.addEventListener('change', () => sendCommand({ type: 'servo', index: 0, angle: Number(els.servo.value) }, '舵机角度 ' + els.servo.value));
+      els.speed.addEventListener('input', () => {
+        state.speedPercent = clampSpeed(els.speed.value);
+        els.speedValue.textContent = String(state.speedPercent);
+        saveState();
+      });
 
       els.joystick.addEventListener('pointerdown', onPointerDown);
       els.joystick.addEventListener('pointermove', onPointerMove);
@@ -498,7 +512,7 @@
       const now = Date.now();
       if (!force && now - lastSendAt < 60) return;
       lastSendAt = now;
-      sendCommand({ type: 'gamepad', ...currentPad }, null, true).catch(err => log('手柄发送失败: ' + err.message));
+      sendCommand({ type: 'gamepad', ...scaledPad(currentPad) }, null, true).catch(err => log('手柄发送失败: ' + err.message));
     }
 
     function stopCar() {
@@ -521,6 +535,21 @@
     function withDebugTrace(command) {
       if (!els.debugTrace.checked) return command;
       return { ...command, debug_trace: true, client_sent_at_ms: Date.now() };
+    }
+
+    function scaledPad(pad) {
+      const factor = clampSpeed(state.speedPercent) / 100;
+      return {
+        ...pad,
+        lx: scaleAxis(pad.lx, factor),
+        ly: scaleAxis(pad.ly, factor),
+        rx: scaleAxis(pad.rx, factor),
+        ry: scaleAxis(pad.ry, factor)
+      };
+    }
+
+    function scaleAxis(axis, factor) {
+      return clampByte((Number(axis) - 128) * factor + 128);
     }
 
     async function connectVideo(isRetry = false) {
@@ -785,6 +814,7 @@
     function showError(error) { log('错误: ' + error.message); }
     function trimSlash(value) { return value.replace(/\/+$/, ''); }
     function clampByte(value) { return Math.max(0, Math.min(255, Math.round(value))); }
+    function clampSpeed(value) { return Math.max(10, Math.min(100, Math.round(Number(value) || 30))); }
     function readState() {
       try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); } catch { return {}; }
     }
@@ -794,7 +824,8 @@
         username: state.username,
         token: state.token,
         receiverId: state.receiverId,
-        debugTrace: state.debugTrace
+        debugTrace: state.debugTrace,
+        speedPercent: clampSpeed(state.speedPercent)
       }));
     }
   </script>
