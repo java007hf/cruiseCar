@@ -1,9 +1,0 @@
-menu "Gamepad HID Demo Configuration"
-    config EXAMPLE_SSP_ENABLED
-        bool "Secure Simple Pairing"
-        depends on BT_CLASSIC_ENABLED
-        default y
-        help
-            Enables Secure Simple Pairing for Classic Bluetooth HID devices.
-            Disable this only when testing legacy PIN pairing behavior.
-endmenu
