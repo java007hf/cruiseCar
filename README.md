@@ -110,7 +110,7 @@ Default ports:
 Debug trace is used to measure control latency from sender to ESP32 without changing the normal 10-byte control packet in release/normal mode. When enabled, the sender wraps the original control packet in a `0xF0` trace frame and each stage appends its timestamp. ESP32 still executes the original inner 10-byte packet.
 
 - **Phone sender**: install/run a debug Android APK, for example `cd android-app && ./gradlew :app:assembleDebug`. Android debug builds enable trace automatically through `BuildConfig.DEBUG`; release builds keep sending plain 10-byte packets.
-- **Web sender**: open `/send/` or `/web_send/`, select the receiver, then check `Debug trace`. Only commands sent while this checkbox is enabled include trace timestamps.
+- **Web sender**: open `/send/`, select the receiver, then check `Debug trace`. Only commands sent while this checkbox is enabled include trace timestamps.
 - **Server**: no separate switch is required. `control_server` and `manager-api` automatically recognize trace frames, append `server_received` / `server_forward`, and pass normal packets unchanged.
 - **ESP32**: no runtime switch is required. Flash firmware built from this repo; when a trace frame arrives over SPP, ESP32 executes the inner control packet and asynchronously prints one `trace seq=...` log line through a low-priority FreeRTOS log task.
 

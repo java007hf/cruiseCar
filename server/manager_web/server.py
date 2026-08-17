@@ -48,11 +48,11 @@ class ManagerWeb:
                     self._send_text("ok\n", "text/plain; charset=utf-8")
                 elif path == "/":
                     self._send_text(web.index_html(), "text/html; charset=utf-8")
-                elif raw_path in {"/send", "/web_send"}:
+                elif raw_path == "/send":
                     self.send_response(HTTPStatus.FOUND.value)
                     self.send_header("Location", raw_path + "/")
                     self.end_headers()
-                elif raw_path in {"/send/", "/web_send/"}:
+                elif raw_path == "/send/":
                     self._send_text(web.web_sender_html(), "text/html; charset=utf-8")
                 else:
                     self._send_text("not found\n", "text/plain; charset=utf-8", HTTPStatus.NOT_FOUND)
@@ -261,7 +261,7 @@ class ManagerWeb:
         <div class="signal-card">
           <div class="signal-title"><span>快速入口</span><span>WEB</span></div>
           <div class="actions">
-            <a class="link-btn secondary" href="/web_send/" target="_blank">/web_send/</a>
+            <a class="link-btn secondary" href="/send/" target="_blank">/send/</a>
           </div>
         </div>
       </aside>

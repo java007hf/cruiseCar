@@ -110,7 +110,7 @@ docker compose up server
 Debug trace 用于测量控制命令从发送端到 ESP32 的各阶段延迟。正常模式和 release 包仍发送原有 10 字节控制包；打开 debug trace 后，发送端会把原始 10 字节控制包包在 `0xF0` trace 帧里，各阶段只追加时间戳，ESP32 最终仍执行内部的原始控制包。
 
 - **手机发送端**：安装/运行 Android debug APK，例如 `cd android-app && ./gradlew :app:assembleDebug`。debug 构建会通过 `BuildConfig.DEBUG` 自动打开 trace；release 构建仍发送普通 10 字节包。
-- **Web 发送端**：打开 `/send/` 或 `/web_send/`，选择接收端设备后勾选 `Debug trace`。只有勾选期间发送的命令会携带 trace 时间戳。
+- **Web 发送端**：打开 `/send/`，选择接收端设备后勾选 `Debug trace`。只有勾选期间发送的命令会携带 trace 时间戳。
 - **Server**：不需要单独开关。`control_server` 和 `manager-api` 会自动识别 trace 帧，追加 `server_received` / `server_forward`，普通包保持原样转发。
 - **ESP32**：不需要运行时开关。刷入本仓库固件后，ESP32 收到 SPP trace 帧会执行内部控制包，并通过低优先级 FreeRTOS 日志任务异步输出一行 `trace seq=...`，避免在 SPP 回调里直接打日志影响延迟。
 
