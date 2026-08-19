@@ -81,6 +81,25 @@ class Store:
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS agent_templates (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    prompt TEXT NOT NULL DEFAULT '',
+                    skills_json TEXT NOT NULL DEFAULT '[]',
+                    owner_username TEXT NOT NULL DEFAULT '',
+                    is_builtin INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS car_agent_bindings (
+                    device_id TEXT PRIMARY KEY,
+                    template_id TEXT NOT NULL DEFAULT '',
+                    custom_prompt_override TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
                 """
             )
             self._ensure_column(conn, "receivers", "owner_username", "TEXT NOT NULL DEFAULT ''")
@@ -291,6 +310,98 @@ class Store:
                     (now, *ids),
                 )
         return [self._row_to_dict(row) for row in rows]
+
+    def upsert_agent_template(
+        self,
+        template_id: str,
+        name: str,
+        prompt: str = "",
+        skills_json: str = "[]",
+        owner_username: str = "",
+        is_builtin: bool = False,
+    ) -> dict[str, Any]:
+        now = time.time()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO agent_templates(id, name, prompt, skills_json, owner_username, is_builtin, created_at, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    name=COALESCE(NULLIF(excluded.name, ''), agent_templates.name),
+                    prompt=excluded.prompt,
+                    skills_json=excluded.skills_json,
+                    owner_username=COALESCE(NULLIF(excluded.owner_username, ''), agent_templates.owner_username),
+                    is_builtin=excluded.is_builtin,
+                    updated_at=excluded.updated_at
+                """,
+                (template_id, name, prompt, skills_json, owner_username, 1 if is_builtin else 0, now, now),
+            )
+        return self.get_agent_template(template_id) or {}
+
+    def get_agent_template(self, template_id: str) -> dict[str, Any] | None:
+        row = self._get_one("SELECT * FROM agent_templates WHERE id=?", (template_id,))
+        if row:
+            row["skills"] = json.loads(row.pop("skills_json", "[]"))
+            row["is_builtin"] = bool(row.get("is_builtin"))
+        return row
+
+    def list_agent_templates(self, owner_username: str = "") -> list[dict[str, Any]]:
+        if owner_username:
+            rows = self._get_all(
+                "SELECT * FROM agent_templates WHERE owner_username=? OR is_builtin=1 ORDER BY created_at ASC",
+                (owner_username,),
+            )
+        else:
+            rows = self._get_all("SELECT * FROM agent_templates ORDER BY created_at ASC")
+        for row in rows:
+            row["skills"] = json.loads(row.pop("skills_json", "[]"))
+            row["is_builtin"] = bool(row.get("is_builtin"))
+        return rows
+
+    def delete_agent_template(self, template_id: str, owner_username: str = "") -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT owner_username, is_builtin FROM agent_templates WHERE id=?", (template_id,)
+            ).fetchone()
+            if not row:
+                return False
+            if row["is_builtin"]:
+                raise PermissionError("cannot delete built-in template")
+            if owner_username and row["owner_username"] and row["owner_username"] != owner_username:
+                raise PermissionError("template belongs to another account")
+            conn.execute("DELETE FROM agent_templates WHERE id=?", (template_id,))
+        return True
+
+    def bind_car_agent(self, device_id: str, template_id: str, custom_prompt_override: str = "") -> dict[str, Any]:
+        now = time.time()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO car_agent_bindings(device_id, template_id, custom_prompt_override, created_at, updated_at)
+                VALUES(?, ?, ?, ?, ?)
+                ON CONFLICT(device_id) DO UPDATE SET
+                    template_id=excluded.template_id,
+                    custom_prompt_override=excluded.custom_prompt_override,
+                    updated_at=excluded.updated_at
+                """,
+                (device_id, template_id, custom_prompt_override, now, now),
+            )
+        return self.get_car_agent_binding(device_id) or {}
+
+    def get_car_agent_binding(self, device_id: str) -> dict[str, Any] | None:
+        return self._get_one("SELECT * FROM car_agent_bindings WHERE device_id=?", (device_id,))
+
+    def get_agent_config_for_car(self, device_id: str) -> dict[str, Any] | None:
+        binding = self.get_car_agent_binding(device_id)
+        if not binding:
+            return None
+        template = self.get_agent_template(binding["template_id"])
+        if not template:
+            return None
+        result = {**template, "device_id": device_id}
+        if binding.get("custom_prompt_override"):
+            result["prompt"] = binding["custom_prompt_override"]
+        return result
 
     def _get_one(self, sql: str, params: tuple[Any, ...]) -> dict[str, Any] | None:
         with self.connect() as conn:

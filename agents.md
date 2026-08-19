@@ -24,8 +24,11 @@ CruiseCar 是一个智能巡航小车项目，当前由 Android App、ESP32 固�
 ├── esp32-gamepad-hid-demo/      # ESP32 蓝牙 HID 手柄接入实验工程
 ├── server/                      # Python 远程控制服务，运行时从该目录启动
 │   ├── control_server/          # TCP 控制转发 + WebRTC 信令转发，统一启动入口
+│   │   └── xiaozhi_bridge.py    # xiaozhi WebSocket 客户端桥梁（每车一个连接）
 │   ├── manager_api/             # 账号 HTTP API + 配置/协议/SQLite 存储
 │   │   ├── config/              # 环境变量配置
+│   │   ├── mcp_server.py        # MCP Server（JSON-RPC 2.0 over HTTP）
+│   │   ├── mcp_tools.py         # MCP 工具定义（car_move 等 5 个工具）
 │   │   ├── protocol/            # 10 字节控制协议解析/生成
 │   │   └── storage/             # SQLite 持久化
 │   └── manager_web/             # 账号 Web 管理页，独立于 manager_api
@@ -178,6 +181,7 @@ Docker 部署：`server/` 下已提供 `Dockerfile` 与 `docker-compose.yml`（`
 42112  TCP WebRTC 信令转发，仅转发 offer/answer/ICE，不转发媒体
 8088   HTTP manager-api
 8089   HTTP manager-web
+8090   HTTP MCP Server（xiaozhi 集成，控车工具）
 ```
 
 server 内部职责：
@@ -185,7 +189,7 @@ server 内部职责：
 - `control_server/server.py`
   - 控制转发核心。
   - 统一启动入口。
-  - 启动 `control_server` + `webrtc_signal` + `manager_api` + `manager_web`。
+  - 启动 `control_server` + `webrtc_signal` + `manager_api` + `manager_web` + `mcp_server` + `xiaozhi_bridge`。
 
 - `control_server/webrtc_signal.py`
   - WebRTC 信令 relay。
@@ -209,6 +213,105 @@ server 内部职责：
 
 - `manager_api/storage/store.py`
   - SQLite 表结构和设备/用户/事件/命令队列操作。
+  - 新增 `agent_templates` 和 `car_agent_bindings` 表，管理 agent 模板与车辆的绑定关系。
+
+- `control_server/xiaozhi_bridge.py`
+  - xiaozhi WebSocket 客户端桥梁。
+  - 为每辆在线车辆维护一个到 xiaozhi server 的 WebSocket 连接。
+  - 实现 WebSocket 握手、hello 消息、文本/音频帧收发、心跳。
+  - 纯标准库实现，不依赖第三方 WebSocket 库。
+
+- `manager_api/mcp_server.py`
+  - MCP (Model Context Protocol) Server。
+  - JSON-RPC 2.0 over HTTP，路径 `/mcp`，端口由 `CRUISECAR_XIAOZHI_MCP_PORT` 配置（默认 8090）。
+  - 支持 `initialize`、`tools/list`、`tools/call`、`ping` 方法。
+  - 支持 Bearer Token 认证（`CRUISECAR_XIAOZHI_MCP_TOKEN`）。
+
+- `manager_api/mcp_tools.py`
+  - MCP 工具定义和处理器。
+  - 暴露 5 个工具：`car_move`、`car_set_mode`、`car_set_servo`、`car_connect`、`car_get_status`。
+  - 每个工具处理器调用 `hub.send_to_receiver()` 或 `store.enqueue_command()` 下发控制命令。
+
+#### xiaozhi 集成架构
+
+cruiseCar 与 xiaozhi-esp32-server 集成，让每辆车成为 xiaozhi 的独立设备：
+
+```text
+Android App ←TCP/HTTP→ cruiseCar Server ←WebSocket→ xiaozhi Server
+   (车的UI)               (桥梁)                     (AI大脑)
+                               │
+                               └── MCP Server（端口 8090）
+                                    ↑
+                              xiaozhi MCP Client 调用控车工具
+```
+
+**核心概念**：
+
+- **Bridge**：cruiseCar Server 为每辆车维护一个 WebSocket 连接到 xiaozhi，使用 `device_id` 作为 xiaozhi 的 `device-id`。
+- **MCP 控车**：xiaozhi LLM 通过 MCP 协议调用 cruiseCar 暴露的工具来控制车辆，xiaozhi 侧零代码改动。
+- **Agent 模板与实例**：少量模板（prompt + 技能），每车一个实例（独立记忆、独立对话）。
+
+**Agent 模板模型**：
+
+```text
+agent_templates 表：
+  id, name, prompt, skills_json, owner_username, is_builtin
+
+car_agent_bindings 表：
+  device_id → template_id + custom_prompt_override
+```
+
+用户在 App 中选择内置模板或自定义创建，绑定到当前车辆。切换模板换人设，记忆保留。
+
+**新增 REST API**：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/agents/templates` | 列出 agent 模板 |
+| POST | `/api/agents/templates` | 创建/更新模板 |
+| DELETE | `/api/agents/templates/{id}` | 删除模板 |
+| POST | `/api/agents/bind` | 绑定车辆到模板 |
+| GET | `/api/agents/car/{device_id}` | 查询车辆的 agent 配置 |
+| POST | `/api/bridge/connect` | 连接 bridge 到 xiaozhi |
+| POST | `/api/bridge/disconnect` | 断开 bridge |
+| POST | `/api/bridge/send` | 发送文本到 xiaozhi |
+| GET | `/api/bridge/status` | bridge 连接状态 |
+
+**新增环境变量**：
+
+```text
+CRUISECAR_XIAOZHI_WS_URL     xiaozhi WebSocket 地址，默认 ws://127.0.0.1:8000
+CRUISECAR_XIAOZHI_MCP_PORT   MCP Server 端口，默认 8090
+CRUISECAR_XIAOZHI_MCP_TOKEN  MCP Bearer Token 认证（空则不验证）
+```
+
+**端口约定更新**：
+
+```text
+42110  TCP 控制转发
+42112  TCP WebRTC 信令转发
+8088   HTTP manager-api
+8089   HTTP manager-web
+8090   HTTP MCP Server（xiaozhi 调用控车工具）
+```
+
+**WebSocket 协议（Bridge → xiaozhi）**：
+
+```text
+1. 连接：ws://host:port/?device-id={device_id}&client-id={device_id}
+2. Hello 握手：{"type":"hello","device_id":"...","device_mac":"...","audio_params":{...}}
+3. 发送文本：{"type":"listen","state":"detect","text":"用户输入"}
+4. 接收回复：{"type":"stt","text":"..."} → {"type":"tts","state":"start"} → [binary opus] → {"type":"tts","state":"stop"} → {"type":"llm","text":"..."}
+5. 心跳：{"type":"ping"} → {"type":"pong"}
+```
+
+**MCP 协议（xiaozhi → cruiseCar）**：
+
+```text
+POST /mcp  Content-Type: application/json
+Body: {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"car_move","arguments":{"direction":"forward","speed":50}}}
+Response: {"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"Command delivered"}]},"id":1}
+```
 
 #### Server 部署边界
 

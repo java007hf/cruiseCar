@@ -20,6 +20,9 @@ class ServerConfig:
     turn_ttl_seconds: int
     database_path: Path
     heartbeat_timeout_seconds: int
+    xiaozhi_ws_url: str
+    xiaozhi_mcp_port: int
+    xiaozhi_mcp_token: str
 
 
 def load_config() -> ServerConfig:
@@ -41,6 +44,9 @@ def load_config() -> ServerConfig:
             os.getenv("CRUISECAR_DB", str(ROOT_DIR / "cruisecar.db"))
         ),
         heartbeat_timeout_seconds=int(os.getenv("CRUISECAR_HEARTBEAT_TIMEOUT", "20")),
+        xiaozhi_ws_url=os.getenv("CRUISECAR_XIAOZHI_WS_URL", "ws://127.0.0.1:8000"),
+        xiaozhi_mcp_port=int(os.getenv("CRUISECAR_XIAOZHI_MCP_PORT", "8090")),
+        xiaozhi_mcp_token=os.getenv("CRUISECAR_XIAOZHI_MCP_TOKEN", ""),
     )
 
 

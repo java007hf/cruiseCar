@@ -37,11 +37,13 @@ class ManagerApi:
         store: Store | None = None,
         hub: ConnectionHub | None = None,
         event_loop: asyncio.AbstractEventLoop | None = None,
+        bridge: Any = None,
     ):
         self.config = config or load_config()
         self.store = store or Store(self.config.database_path)
         self.hub = hub
         self.event_loop = event_loop
+        self.bridge = bridge
         self.httpd: ThreadingHTTPServer | None = None
 
     def start(self) -> None:
@@ -87,6 +89,11 @@ class ManagerApi:
                             return
                         deleted = api.store.delete_receiver(device_id, user["username"] if user else "")
                         self._send_json({"ok": True, "data": {"deleted": deleted, "device_id": device_id}})
+                    elif path.startswith("/api/agents/templates/"):
+                        template_id = path.split("/")[-1]
+                        user = self._current_user()
+                        deleted = api.store.delete_agent_template(template_id, user["username"] if user else "")
+                        self._send_json({"ok": True, "data": {"deleted": deleted, "template_id": template_id}})
                     else:
                         self._send_json({"ok": False, "error": "not found"}, HTTPStatus.NOT_FOUND)
                 except PermissionError as exc:
@@ -129,6 +136,20 @@ class ManagerApi:
                     limit = int((query.get("limit") or [100])[0])
                     device_id = (query.get("device_id") or [""])[0]
                     self._send_json({"ok": True, "data": api.store.list_events(limit=limit, device_id=device_id)})
+                elif path == "/api/agents/templates":
+                    user = self._current_user()
+                    data = api.store.list_agent_templates(user["username"] if user else "")
+                    self._send_json({"ok": True, "data": data})
+                elif path.startswith("/api/agents/car/"):
+                    device_id = path.split("/")[-1]
+                    data = api.store.get_agent_config_for_car(device_id)
+                    if data:
+                        self._send_json({"ok": True, "data": data})
+                    else:
+                        self._send_json({"ok": False, "error": "no agent binding for this car"}, HTTPStatus.NOT_FOUND)
+                elif path == "/api/bridge/status":
+                    data = api._bridge_status()
+                    self._send_json({"ok": True, "data": data})
                 else:
                     self._send_json({"ok": False, "error": "not found"}, HTTPStatus.NOT_FOUND)
 
@@ -170,6 +191,41 @@ class ManagerApi:
                     elif path.startswith("/api/receivers/") and path.endswith("/commands"):
                         device_id = path.split("/")[-2]
                         result = api.dispatch_command(device_id, body)
+                        self._send_json({"ok": True, "data": result})
+                    elif path == "/api/agents/templates":
+                        user = self._current_user()
+                        template_id = self._required(body, "id")
+                        data = api.store.upsert_agent_template(
+                            template_id,
+                            self._required(body, "name"),
+                            str(body.get("prompt", "")),
+                            json.dumps(body.get("skills", []), ensure_ascii=False),
+                            user["username"] if user else "",
+                            bool(body.get("is_builtin", False)),
+                        )
+                        self._send_json({"ok": True, "data": data})
+                    elif path == "/api/agents/bind":
+                        device_id = self._required(body, "device_id")
+                        template_id = self._required(body, "template_id")
+                        data = api.store.bind_car_agent(
+                            device_id,
+                            template_id,
+                            str(body.get("custom_prompt", "")),
+                        )
+                        self._send_json({"ok": True, "data": data})
+                    elif path == "/api/bridge/connect":
+                        device_id = self._required(body, "device_id")
+                        device_name = str(body.get("device_name", ""))
+                        result = api._bridge_connect(device_id, device_name)
+                        self._send_json({"ok": True, "data": result})
+                    elif path == "/api/bridge/disconnect":
+                        device_id = self._required(body, "device_id")
+                        result = api._bridge_disconnect(device_id)
+                        self._send_json({"ok": True, "data": result})
+                    elif path == "/api/bridge/send":
+                        device_id = self._required(body, "device_id")
+                        text = self._required(body, "text")
+                        result = api._bridge_send_text(device_id, text)
                         self._send_json({"ok": True, "data": result})
                     else:
                         self._send_json({"ok": False, "error": "not found"}, HTTPStatus.NOT_FOUND)
@@ -279,6 +335,47 @@ class ManagerApi:
             payload=parsed.payload if parsed else {},
         )
         return {"delivered": delivered, "queue_id": queue_id, "packet_hex": packet_hex}
+
+    def _bridge_connect(self, device_id: str, device_name: str = "") -> dict[str, Any]:
+        if not self.bridge:
+            raise ValueError("xiaozhi bridge not available")
+        if not self.event_loop or not self.event_loop.is_running():
+            raise ValueError("event loop not available")
+        future = asyncio.run_coroutine_threadsafe(self.bridge.connect(device_id, device_name), self.event_loop)
+        session = future.result(timeout=10)
+        return {"device_id": device_id, "session_id": session.session_id, "connected": session.connected}
+
+    def _bridge_disconnect(self, device_id: str) -> dict[str, Any]:
+        if not self.bridge:
+            raise ValueError("xiaozhi bridge not available")
+        if not self.event_loop or not self.event_loop.is_running():
+            raise ValueError("event loop not available")
+        future = asyncio.run_coroutine_threadsafe(self.bridge.disconnect(device_id), self.event_loop)
+        future.result(timeout=5)
+        return {"device_id": device_id, "connected": False}
+
+    def _bridge_send_text(self, device_id: str, text: str) -> dict[str, Any]:
+        if not self.bridge:
+            raise ValueError("xiaozhi bridge not available")
+        if not self.event_loop or not self.event_loop.is_running():
+            raise ValueError("event loop not available")
+        future = asyncio.run_coroutine_threadsafe(self.bridge.send_text(device_id, text), self.event_loop)
+        sent = bool(future.result(timeout=5))
+        return {"device_id": device_id, "sent": sent}
+
+    def _bridge_status(self) -> dict[str, Any]:
+        if not self.bridge:
+            return {"available": False, "sessions": []}
+        sessions = []
+        for device_id, session in self.bridge._sessions.items():
+            sessions.append({
+                "device_id": device_id,
+                "session_id": session.session_id,
+                "connected": session.connected,
+                "connected_at": session.connected_at,
+                "last_activity": session.last_activity,
+            })
+        return {"available": True, "sessions": sessions}
 
 
 def main() -> None:

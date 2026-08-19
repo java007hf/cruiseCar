@@ -294,6 +294,8 @@ class ControlServer:
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     from control_server.webrtc_signal import WebRtcSignalServer
+    from control_server.xiaozhi_bridge import XiaozhiBridge
+    from manager_api.mcp_server import McpServer
     from manager_api.server import ManagerApi
     from manager_web.server import ManagerWeb
 
@@ -303,11 +305,15 @@ async def main() -> None:
     webrtc_server = WebRtcSignalServer(config=config, store=store)
 
     loop = asyncio.get_running_loop()
-    manager_api = ManagerApi(config=config, store=store, hub=control_server.hub, event_loop=loop)
-    manager_api.start_in_thread()
+    bridge = XiaozhiBridge(config=config)
+    mcp_server = McpServer(config=config, store=store, hub=control_server.hub, event_loop=loop)
+    mcp_server.start_in_thread()
+
+    manager_api_bridge = ManagerApi(config=config, store=store, hub=control_server.hub, event_loop=loop, bridge=bridge)
+    manager_api_bridge.start_in_thread()
     manager_web = ManagerWeb(config=config)
     manager_web.start_in_thread()
-    logging.info("deployment=full: control_server + webrtc_signal + manager-api + manager-web")
+    logging.info("deployment=full: control_server + webrtc_signal + manager-api + manager-web + mcp-server + xiaozhi-bridge")
 
     stop_event = asyncio.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -322,10 +328,14 @@ async def main() -> None:
     done, pending = await asyncio.wait({control_task, webrtc_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
     for task in pending:
         task.cancel()
-    if manager_api:
-        manager_api.stop()
+    if manager_api_bridge:
+        manager_api_bridge.stop()
     if manager_web:
         manager_web.stop()
+    if mcp_server:
+        mcp_server.stop()
+    for device_id in list(bridge._sessions.keys()):
+        await bridge.disconnect(device_id)
     for task in done:
         if task in {control_task, webrtc_task}:
             task.result()
