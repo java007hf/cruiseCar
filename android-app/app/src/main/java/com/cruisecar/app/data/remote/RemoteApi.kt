@@ -1,5 +1,6 @@
 package com.cruisecar.app.data.remote
 
+import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
@@ -19,6 +20,16 @@ data class RemoteIceServer(
     val urls: List<String>,
     val username: String = "",
     val credential: String = ""
+)
+
+data class XiaozhiBridgeEvent(
+    val seq: Long,
+    val type: String,
+    val sessionId: String,
+    val state: String,
+    val text: String,
+    val audio: ByteArray,
+    val audioSize: Int
 )
 
 object RemoteApi {
@@ -75,12 +86,88 @@ object RemoteApi {
         }
     }
 
+    fun bridgeConnect(baseUrl: String, authToken: String, deviceId: String, deviceName: String) {
+        request(
+            baseUrl,
+            "/api/bridge/connect",
+            "POST",
+            JSONObject().put("device_id", deviceId).put("device_name", deviceName),
+            authToken
+        )
+    }
+
+    fun bridgeDisconnect(baseUrl: String, authToken: String, deviceId: String) {
+        request(
+            baseUrl,
+            "/api/bridge/disconnect",
+            "POST",
+            JSONObject().put("device_id", deviceId),
+            authToken
+        )
+    }
+
+    fun bridgeAudioStart(baseUrl: String, authToken: String, deviceId: String) {
+        request(
+            baseUrl,
+            "/api/bridge/audio/start",
+            "POST",
+            JSONObject().put("device_id", deviceId),
+            authToken
+        )
+    }
+
+    fun bridgeAudioFrame(baseUrl: String, authToken: String, deviceId: String, opusFrame: ByteArray) {
+        request(
+            baseUrl,
+            "/api/bridge/audio/frame",
+            "POST",
+            JSONObject()
+                .put("device_id", deviceId)
+                .put("audio_b64", Base64.encodeToString(opusFrame, Base64.NO_WRAP)),
+            authToken
+        )
+    }
+
+    fun bridgeAudioStop(baseUrl: String, authToken: String, deviceId: String) {
+        request(
+            baseUrl,
+            "/api/bridge/audio/stop",
+            "POST",
+            JSONObject().put("device_id", deviceId),
+            authToken
+        )
+    }
+
+    fun bridgeEvents(baseUrl: String, authToken: String, deviceId: String, afterSeq: Long): List<XiaozhiBridgeEvent> {
+        val json = request(
+            baseUrl,
+            "/api/bridge/events?device_id=${deviceId.urlEncode()}&after_seq=$afterSeq&limit=100",
+            "GET",
+            null,
+            authToken
+        )
+        val arr = json.getJSONArray("data")
+        return (0 until arr.length()).map { i ->
+            val item = arr.getJSONObject(i)
+            val audioB64 = item.optString("audio_b64", "")
+            XiaozhiBridgeEvent(
+                seq = item.optLong("seq", 0L),
+                type = item.optString("type", ""),
+                sessionId = item.optString("session_id", ""),
+                state = item.optString("state", ""),
+                text = item.optString("text", ""),
+                audio = if (audioB64.isBlank()) ByteArray(0) else Base64.decode(audioB64, Base64.DEFAULT),
+                audioSize = item.optInt("audio_size", 0)
+            )
+        }
+    }
+
     private fun request(baseUrl: String, path: String, method: String, body: JSONObject?, token: String?): JSONObject {
         val url = URL(baseUrl.trimEnd('/') + path)
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = method
-            connectTimeout = 5000
-            readTimeout = 5000
+            connectTimeout = 15000
+            readTimeout = 15000
             setRequestProperty("Content-Type", "application/json; charset=utf-8")
             token?.takeIf { it.isNotBlank() }?.let { setRequestProperty("Authorization", "Bearer $it") }
             if (body != null) {

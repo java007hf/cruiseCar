@@ -150,6 +150,12 @@ class ManagerApi:
                 elif path == "/api/bridge/status":
                     data = api._bridge_status()
                     self._send_json({"ok": True, "data": data})
+                elif path == "/api/bridge/events":
+                    device_id = (query.get("device_id") or [""])[0]
+                    after_seq = int((query.get("after_seq") or ["0"])[0])
+                    limit = int((query.get("limit") or ["100"])[0])
+                    data = api._bridge_events(device_id, after_seq, limit)
+                    self._send_json({"ok": True, "data": data})
                 else:
                     self._send_json({"ok": False, "error": "not found"}, HTTPStatus.NOT_FOUND)
 
@@ -226,6 +232,19 @@ class ManagerApi:
                         device_id = self._required(body, "device_id")
                         text = self._required(body, "text")
                         result = api._bridge_send_text(device_id, text)
+                        self._send_json({"ok": True, "data": result})
+                    elif path == "/api/bridge/audio/start":
+                        device_id = self._required(body, "device_id")
+                        result = api._bridge_audio_start(device_id)
+                        self._send_json({"ok": True, "data": result})
+                    elif path == "/api/bridge/audio/frame":
+                        device_id = self._required(body, "device_id")
+                        audio_b64 = self._required(body, "audio_b64")
+                        result = api._bridge_audio_frame(device_id, audio_b64)
+                        self._send_json({"ok": True, "data": result})
+                    elif path == "/api/bridge/audio/stop":
+                        device_id = self._required(body, "device_id")
+                        result = api._bridge_audio_stop(device_id)
                         self._send_json({"ok": True, "data": result})
                     else:
                         self._send_json({"ok": False, "error": "not found"}, HTTPStatus.NOT_FOUND)
@@ -362,6 +381,49 @@ class ManagerApi:
         future = asyncio.run_coroutine_threadsafe(self.bridge.send_text(device_id, text), self.event_loop)
         sent = bool(future.result(timeout=5))
         return {"device_id": device_id, "sent": sent}
+
+    def _bridge_audio_start(self, device_id: str) -> dict[str, Any]:
+        if not self.bridge:
+            raise ValueError("xiaozhi bridge not available")
+        if not self.event_loop or not self.event_loop.is_running():
+            raise ValueError("event loop not available")
+        future = asyncio.run_coroutine_threadsafe(self.bridge.send_audio_start(device_id), self.event_loop)
+        sent = bool(future.result(timeout=5))
+        logger.info("bridge audio start: device=%s sent=%s", device_id, sent)
+        return {"device_id": device_id, "sent": sent}
+
+    def _bridge_audio_frame(self, device_id: str, audio_b64: str) -> dict[str, Any]:
+        if not self.bridge:
+            raise ValueError("xiaozhi bridge not available")
+        if not self.event_loop or not self.event_loop.is_running():
+            raise ValueError("event loop not available")
+        try:
+            opus_data = base64.b64decode(audio_b64, validate=True)
+        except Exception as exc:
+            raise ValueError("invalid audio_b64") from exc
+        if len(opus_data) > 64 * 1024:
+            raise ValueError("audio frame too large")
+        future = asyncio.run_coroutine_threadsafe(self.bridge.send_audio_frame(device_id, opus_data), self.event_loop)
+        sent = bool(future.result(timeout=5))
+        logger.info("bridge audio frame: device=%s bytes=%s sent=%s", device_id, len(opus_data), sent)
+        return {"device_id": device_id, "sent": sent, "bytes": len(opus_data)}
+
+    def _bridge_audio_stop(self, device_id: str) -> dict[str, Any]:
+        if not self.bridge:
+            raise ValueError("xiaozhi bridge not available")
+        if not self.event_loop or not self.event_loop.is_running():
+            raise ValueError("event loop not available")
+        future = asyncio.run_coroutine_threadsafe(self.bridge.send_audio_stop(device_id), self.event_loop)
+        sent = bool(future.result(timeout=5))
+        logger.info("bridge audio stop: device=%s sent=%s", device_id, sent)
+        return {"device_id": device_id, "sent": sent}
+
+    def _bridge_events(self, device_id: str, after_seq: int, limit: int) -> list[dict[str, Any]]:
+        if not device_id:
+            raise ValueError("missing device_id")
+        if not self.bridge:
+            return []
+        return self.bridge.get_events(device_id, after_seq, limit)
 
     def _bridge_status(self) -> dict[str, Any]:
         if not self.bridge:

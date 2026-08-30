@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -186,6 +187,9 @@ class McpServer:
                 device_id = str(meta.get("device_id", ""))
 
         if not device_id:
+            device_id = self._default_device_id()
+
+        if not device_id:
             return {
                 "jsonrpc": "2.0",
                 "result": {
@@ -198,6 +202,21 @@ class McpServer:
         logger.info("MCP tool call: tool=%s device=%s args=%s", tool_name, device_id, arguments)
         result = handle_tool_call(device_id, tool_name, arguments, self.store, self.hub, self.event_loop)
         return {"jsonrpc": "2.0", "result": result, "id": req_id}
+
+    def _default_device_id(self) -> str:
+        configured = os.getenv("CRUISECAR_MCP_DEFAULT_DEVICE_ID", "").strip()
+        if configured:
+            return configured
+        if self.hub and len(self.hub.receivers) == 1:
+            device_id = next(iter(self.hub.receivers.keys()))
+            logger.info("MCP using the only online receiver as default device: %s", device_id)
+            return device_id
+        receivers = self.store.list_receivers()
+        if len(receivers) == 1:
+            device_id = str(receivers[0].get("device_id", ""))
+            logger.info("MCP using the only registered receiver as default device: %s", device_id)
+            return device_id
+        return ""
 
     @staticmethod
     def _error(req_id: Any, code: int, message: str) -> dict[str, Any]:

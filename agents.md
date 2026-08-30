@@ -488,3 +488,15 @@ cd ml
 - 如果修改端口或环境变量，必须同步 Android、server 和 README。
 - 如果修改 WebRTC 信令格式，必须同步 Android `WebRtcCall.kt` 与 Python `webrtc_signal.py`。
 - 如果修改控制帧格式，必须同步 Android、Python、ESP32 三端。
+
+## 待办事项
+
+- [x] 实现并验证 App 接收端可以通过 xiaozhi server 完成 LLM 语音对话。
+- [x] 实现 MCP 控制小车，复用现有控制小车 API。
+
+验证状态（2026-08-29）：
+
+- 本机 `C:\workspace\xiaozhi-esp32-server-benyl` Docker 部署可用，CruiseCar Bridge 已按 xiaozhi OTA/WebSocket 接入方式连接。
+- App 接收端新增 xiaozhi 语音入口，日志可观察 bridge connect、录音上行、STT、LLM、TTS 和音频下行播放事件。
+- MCP Server 暴露 `car_move`、`car_set_mode`、`car_set_servo`、`car_connect`、`car_get_status`；xiaozhi MCP client 已配置为调用 `http://host.docker.internal:8090/mcp`。
+- 当前接收端未连接 ESP32 时，MCP 控车命令会通过现有服务 API 进入离线队列；接收端在线后仍复用现有 websocket/control 通道下发。

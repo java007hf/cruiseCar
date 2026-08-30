@@ -7,6 +7,7 @@ import com.cruisecar.app.connection.control.DiscoveryScanner
 import com.cruisecar.app.connection.esp32.BluetoothSppClient
 import com.cruisecar.app.connection.esp32.Esp32BlePairing
 import com.cruisecar.app.connection.webrtc.WebRtcCall
+import com.cruisecar.app.connection.xiaozhi.XiaozhiVoiceClient
 import com.cruisecar.app.data.remote.RemoteIceServer
 import com.cruisecar.app.data.remote.RemoteApi
 import com.cruisecar.app.data.remote.RemoteReceiver
@@ -119,6 +120,9 @@ class MainActivity : Activity() {
     private var receiverVideoRenderer: SurfaceViewRenderer? = null
     private var receiverLayout: LinearLayout? = null
     private var receiverEspStatusView: TextView? = null
+    private var xiaozhiVoiceClient: XiaozhiVoiceClient? = null
+    private var xiaozhiRecording = false
+    private var xiaozhiRecordButton: Button? = null
     /* 接收端 → 发送端 状态回报定时任务句柄, stopReceiverServices 时取消 */
     private var receiverReporterTask: ScheduledFuture<*>? = null
     private var receiverServicesStarted = false
@@ -783,6 +787,9 @@ class MainActivity : Activity() {
 
         layout.addView(button("自动扫描并连接 ESP32") { connectEsp32ByScan() })
         layout.addView(button("BLE 扫描附近设备") { blePairing.start() })
+        layout.addView(button("连接 xiaozhi 语音") { connectXiaozhiVoice() })
+        xiaozhiRecordButton = button("开始 xiaozhi 语音") { toggleXiaozhiRecording() }
+        layout.addView(xiaozhiRecordButton)
 
         setContentView(withLog(layout, scroll))
         preview.start()
@@ -1033,9 +1040,57 @@ class MainActivity : Activity() {
         cameraPreview?.stop()
         cameraPreview?.visibility = View.VISIBLE
         releaseReceiverCall()
+        stopXiaozhiVoice()
         receiverLayout = null
         receiverServicesStarted = false
         esp32ReconnectScheduled.set(false)
+    }
+
+    private fun connectXiaozhiVoice() {
+        val state = viewModel.state
+        if (state.connectionMode == ConnectionMode.LAN) {
+            log("xiaozhi voice requires server account receiver mode")
+            return
+        }
+        val deviceId = state.remoteDeviceId.ifBlank { viewModel.receiverIdentity().deviceId }
+        val managerBaseUrl = state.remoteManagerBaseUrl.ifBlank { "http://${state.remoteHost}:$remoteManagerPort" }
+        xiaozhiVoiceClient?.shutdown()
+        xiaozhiVoiceClient = XiaozhiVoiceClient(
+            context = this,
+            managerBaseUrl = managerBaseUrl,
+            authToken = state.remoteToken,
+            deviceId = deviceId,
+            deviceName = viewModel.receiverIdentity().displayName,
+            onLog = { msg -> log(msg) }
+        ).also { it.connect() }
+        log("xiaozhi voice client created: api=$managerBaseUrl device=$deviceId")
+    }
+
+    private fun toggleXiaozhiRecording() {
+        val client = xiaozhiVoiceClient
+        if (client == null) {
+            connectXiaozhiVoice()
+            Handler(Looper.getMainLooper()).postDelayed({ toggleXiaozhiRecording() }, 800)
+            return
+        }
+        if (xiaozhiRecording) {
+            client.stopRecording()
+            xiaozhiRecording = false
+            xiaozhiRecordButton?.text = "开始 xiaozhi 语音"
+            log("xiaozhi voice stop requested")
+        } else {
+            client.startRecording()
+            xiaozhiRecording = true
+            xiaozhiRecordButton?.text = "停止 xiaozhi 语音"
+            log("xiaozhi voice start requested")
+        }
+    }
+
+    private fun stopXiaozhiVoice() {
+        xiaozhiRecording = false
+        xiaozhiRecordButton?.text = "开始 xiaozhi 语音"
+        xiaozhiVoiceClient?.shutdown()
+        xiaozhiVoiceClient = null
     }
 
     private fun applyReceiverDriveMode(mode: ControlMode) {
