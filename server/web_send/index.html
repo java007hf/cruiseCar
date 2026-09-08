@@ -150,6 +150,18 @@
     .metric span { display: block; color: var(--muted); font-size: 12px; }
     .metric strong { font-size: 18px; }
 
+    .command-status {
+      margin-top: 12px;
+      min-height: 44px;
+      padding: 10px 12px;
+      border: 1px solid rgba(53, 194, 255, 0.32);
+      border-radius: 12px;
+      color: #bae6fd;
+      background: rgba(53, 194, 255, 0.08);
+      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+      overflow-wrap: anywhere;
+    }
+
     .video-card {
       position: relative;
       width: 100%;
@@ -221,7 +233,7 @@
       <div class="card">
         <h2>账号与设备</h2>
         <label for="apiBase">Manager API 地址</label>
-        <input id="apiBase" value="http://116.62.32.90:8088" autocomplete="url" />
+        <input id="apiBase" value="http://192.168.3.104:8088" autocomplete="url" />
 
         <label for="username">账号</label>
         <input id="username" autocomplete="username" />
@@ -268,6 +280,7 @@
           <div class="metric"><span>RX</span><strong id="rxOut">128</strong></div>
           <div class="metric"><span>RY</span><strong id="ryOut">128</strong></div>
         </div>
+        <div id="lastCommandStatus" class="command-status">最近发送：暂无</div>
       </div>
 
       <div class="card">
@@ -302,7 +315,7 @@
   <script>
     const STORAGE_KEY = 'cruisecar.webSender.v1';
     const DEFAULT_STATE = {
-      apiBase: 'http://116.62.32.90:8088',
+      apiBase: 'http://192.168.3.104:8088',
       username: '',
       token: '',
       receiverId: '',
@@ -337,12 +350,14 @@
       lxOut: document.querySelector('#lxOut'),
       lyOut: document.querySelector('#lyOut'),
       rxOut: document.querySelector('#rxOut'),
-      ryOut: document.querySelector('#ryOut')
+      ryOut: document.querySelector('#ryOut'),
+      lastCommandStatus: document.querySelector('#lastCommandStatus')
     };
 
     let pointerId = null;
     let currentPad = { lx: 128, ly: 128, rx: 128, ry: 128, buttons: 0 };
     let lastSendAt = 0;
+    let lastGamepadLogAt = 0;
     let sendTimer = null;
     let videoSocket = null;
     let peerConnection = null;
@@ -528,7 +543,13 @@
         method: 'POST',
         body: withDebugTrace(command)
       });
-      if (!quiet) log(`${label || command.type} 已发送: ${result.delivered ? '实时送达' : '接收端离线，已入队'} ${result.packet_hex || ''}`);
+      const message = `${label || command.type} 已发送: ${result.delivered ? '实时送达' : '接收端离线，已入队'} ${result.packet_hex || ''}`;
+      els.lastCommandStatus.textContent = `最近发送：${message}`;
+      const now = Date.now();
+      if (!quiet || now - lastGamepadLogAt >= 800) {
+        log(message);
+        if (quiet) lastGamepadLogAt = now;
+      }
       return result;
     }
 

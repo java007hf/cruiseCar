@@ -11,7 +11,10 @@ import android.widget.TextView
 
 data class ScreenWithLog(
     val root: View,
-    val logView: TextView
+    val logView: TextView,
+    val logScroll: ScrollView,
+    val olderLogsButton: Button,
+    val latestLogsButton: Button
 )
 
 class MainViewFactory(private val context: Context) {
@@ -59,18 +62,42 @@ class MainViewFactory(private val context: Context) {
         LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
 
     fun withLog(content: LinearLayout): ScreenWithLog {
-        val logView = TextView(context).apply { textSize = 13f }
-        val logScroll = ScrollView(context).apply { addView(logView) }
-        content.addView(logScroll, LinearLayout.LayoutParams(-1, dp(140)))
-        val rootScroll = ScrollView(context).apply { addView(content) }
-        return ScreenWithLog(root = rootScroll, logView = logView)
+        val contentScroll = ScrollView(context).apply { addView(content) }
+        return buildSplitScreen(contentScroll)
     }
 
-    /** 用于已自带 ScrollView 根(scrollableRoot)的屏幕: 日志区改为固定高度, 避免 weight 在 ScrollView 中塌缩。 */
-    fun withLog(content: LinearLayout, rootScroll: ScrollView): ScreenWithLog {
+    /** 用于已自带 ScrollView 根(scrollableRoot)的屏幕。 */
+    fun withLog(rootScroll: ScrollView): ScreenWithLog {
+        return buildSplitScreen(rootScroll)
+    }
+
+    private fun buildSplitScreen(contentScroll: ScrollView): ScreenWithLog {
         val logView = TextView(context).apply { textSize = 13f }
-        val logScroll = ScrollView(context).apply { addView(logView) }
-        content.addView(logScroll, LinearLayout.LayoutParams(-1, dp(140)))
-        return ScreenWithLog(root = rootScroll, logView = logView)
+        val logScroll = ScrollView(context).apply {
+            isFillViewport = false
+            isVerticalScrollBarEnabled = true
+            scrollBarStyle = View.SCROLLBARS_INSIDE_INSET
+            addView(logView)
+        }
+        val olderLogsButton = button("↑ 旧日志") { logScroll.smoothScrollBy(0, -dp(140)) }
+        val latestLogsButton = button("↓ 最新") { logScroll.fullScroll(View.FOCUS_DOWN) }
+        val logHeader = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(TextView(context).apply {
+                text = "运行日志（可滚动）"
+                textSize = 14f
+                setPadding(dp(16), dp(6), dp(16), dp(4))
+            }, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(olderLogsButton)
+            addView(latestLogsButton)
+        }
+        val root = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(contentScroll, LinearLayout.LayoutParams(-1, 0, 1f))
+            addView(logHeader)
+            addView(logScroll, LinearLayout.LayoutParams(-1, dp(180)))
+        }
+        return ScreenWithLog(root, logView, logScroll, olderLogsButton, latestLogsButton)
     }
 }

@@ -73,7 +73,7 @@ CruiseCar 是一个基于 ESP32 小车底盘和两台 Android 手机的智能巡
 - **局域网发送端 / 接收端**：发送端通过 UDP 广播发现接收端，再直连接收端手机。
 - **服务器发送端 / 接收端**：发送端和接收端登录同一个账号。接收端加入账号成为设备，发送端从设备列表中选择接收端。
 
-接收端设备 ID 会根据 Android 设备信息和安装 ID 自动生成，用户不需要手动编造。Android App 内置服务器 `http://116.62.32.90/`，并会在本地保存上次填写的账号、token 和发送端 ID，避免每次重复输入。密码只用于登录请求，不会持久化保存。
+接收端设备 ID 会根据 Android 设备信息和安装 ID 自动生成，用户不需要手动编造。Android App 内置服务器 `http://192.168.3.104/`，并会在本地保存上次填写的账号、token 和发送端 ID，避免每次重复输入。密码只用于登录请求，不会持久化保存。
 
 ## Server 模式
 
@@ -126,7 +126,7 @@ flowchart LR
 
     subgraph Xiaozhi[xiaozhi Server]
         XWS[WebSocket<br/>8000 /xiaozhi/v1/]
-        OTA[OTA / Token<br/>HTTP 8003]
+        OTA[OTA / Token<br/>全量部署 8002，简单部署 8003]
         XMCP[xiaozhi MCP Client]
     end
 
@@ -147,7 +147,7 @@ flowchart LR
     MCP --> Control
 ```
 
-`8089` 只提供用户界面：包括账号/设备管理页和 `/send/` Web 发送端。它不直接处理账号数据，页面会调用 `8088` 上的 manager-api。Xiaozhi 的 `8000` 和 `8003` 是 CruiseCar Bridge 主动连接的外部服务端口；`8090` 则是 CruiseCar 对 xiaozhi MCP Client 暴露的端口。
+`8089` 只提供用户界面：包括账号/设备管理页和 `/send/` Web 发送端。它不直接处理账号数据，页面会调用 `8088` 上的 manager-api。Xiaozhi 的 `8000` 是 WebSocket 端口；OTA 在全量部署中使用 `8002`，简单部署中使用 `8003`，CruiseCar 会自动回退。`8090` 是 CruiseCar 对 xiaozhi MCP Client 暴露的端口。
 
 ## Debug Trace 延迟日志
 

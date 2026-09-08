@@ -15,7 +15,7 @@ services:
     environment:
       CRUISECAR_DEPLOYMENT: full
       # Enable TURN after coturn is deployed. Use the same secret as coturn static-auth-secret.
-      # CRUISECAR_TURN_URLS: "turn:116.62.32.90:3478?transport=udp,turn:116.62.32.90:3478?transport=tcp"
+      # CRUISECAR_TURN_URLS: "turn:192.168.3.104:3478?transport=udp,turn:192.168.3.104:3478?transport=tcp"
       # CRUISECAR_TURN_STATIC_AUTH_SECRET: "replace-with-a-long-random-secret"
       # CRUISECAR_TURN_TTL_SECONDS: "3600"
     ports:

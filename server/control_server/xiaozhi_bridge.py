@@ -575,6 +575,8 @@ def _fetch_ota_config_with_fallback(ota_url: str, device_id: str, device_name: s
     candidates = [ota_url]
     if ":8003/" in ota_url:
         candidates.append(ota_url.replace(":8003/", ":8002/"))
+    elif ":8002/" in ota_url:
+        candidates.append(ota_url.replace(":8002/", ":8003/"))
     last_error: Exception | None = None
     for candidate in candidates:
         try:

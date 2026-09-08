@@ -92,8 +92,8 @@ Android 侧按轻量 MVI 方式组织：
 #### 服务器账号保存
 
 - `ReceiverIdentityStore` 同时使用 `SharedPreferences("remote_account")` 保存内置服务器地址、账号、token、manager-api 地址和发送端 ID，并会清理旧版本遗留的本地密码字段。
-- `MainViewModel` 初始化时加载本地账号信息；服务器地址为空时默认使用 `116.62.32.90`。
-- `MainActivity` 不再要求用户输入服务器地址，服务器账号登录页只展示内置服务器 `http://116.62.32.90/`。
+- `MainViewModel` 初始化时加载本地账号信息；服务器地址为空时默认使用 `192.168.3.104`。
+- `MainActivity` 不再要求用户输入服务器地址，服务器账号登录页只展示内置服务器 `http://192.168.3.104/`。
 - 账号登录成功后立即回写本地配置，后续打开服务器发送端/接收端页面会自动回填，不需要每次重新输入。
 
 支持两类网络模式：
@@ -282,6 +282,7 @@ car_agent_bindings 表：
 
 ```text
 CRUISECAR_XIAOZHI_WS_URL     xiaozhi WebSocket 地址，默认 ws://127.0.0.1:8000
+CRUISECAR_XIAOZHI_OTA_URL    xiaozhi OTA 地址，默认全量部署 http://127.0.0.1:8002/xiaozhi/ota/，失败时回退 8003
 CRUISECAR_XIAOZHI_MCP_PORT   MCP Server 端口，默认 8090
 CRUISECAR_XIAOZHI_MCP_TOKEN  MCP Bearer Token 认证（空则不验证）
 ```

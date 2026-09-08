@@ -47,7 +47,7 @@ def load_config() -> ServerConfig:
         ),
         heartbeat_timeout_seconds=int(os.getenv("CRUISECAR_HEARTBEAT_TIMEOUT", "20")),
         xiaozhi_ws_url=os.getenv("CRUISECAR_XIAOZHI_WS_URL", "ws://127.0.0.1:8000/xiaozhi/v1/"),
-        xiaozhi_ota_url=os.getenv("CRUISECAR_XIAOZHI_OTA_URL", "http://127.0.0.1:8003/xiaozhi/ota/"),
+        xiaozhi_ota_url=os.getenv("CRUISECAR_XIAOZHI_OTA_URL", "http://127.0.0.1:8002/xiaozhi/ota/"),
         xiaozhi_ws_token=os.getenv("CRUISECAR_XIAOZHI_WS_TOKEN", ""),
         xiaozhi_mcp_port=int(os.getenv("CRUISECAR_XIAOZHI_MCP_PORT", "8090")),
         xiaozhi_mcp_token=os.getenv("CRUISECAR_XIAOZHI_MCP_TOKEN", ""),

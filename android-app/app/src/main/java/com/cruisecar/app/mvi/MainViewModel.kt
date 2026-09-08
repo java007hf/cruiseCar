@@ -86,6 +86,6 @@ class MainViewModel(
     }
 
     private companion object {
-        const val DEFAULT_REMOTE_HOST = "116.62.32.90"
+        const val DEFAULT_REMOTE_HOST = "192.168.3.104"
     }
 }

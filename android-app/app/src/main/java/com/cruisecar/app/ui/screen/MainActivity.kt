@@ -39,6 +39,7 @@ import android.text.InputType
 import android.util.Log
 import android.view.Gravity
 import android.view.LayoutInflater
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
@@ -98,7 +99,7 @@ class MainActivity : Activity() {
     private val remoteControlPort = 42110
     private val remoteWebRtcPort = 42112
     private val remoteManagerPort = 8088
-    private val defaultRemoteHost = "116.62.32.90"
+    private val defaultRemoteHost = "192.168.3.104"
     private val controlClient = ControlClient()
     private val bluetooth = BluetoothSppClient()
     private val senderExecutor = Executors.newSingleThreadExecutor()
@@ -120,6 +121,7 @@ class MainActivity : Activity() {
     private var receiverVideoRenderer: SurfaceViewRenderer? = null
     private var receiverLayout: LinearLayout? = null
     private var receiverEspStatusView: TextView? = null
+    private var receiverLastCommandView: TextView? = null
     private var xiaozhiVoiceClient: XiaozhiVoiceClient? = null
     private var xiaozhiRecording = false
     private var xiaozhiRecordButton: Button? = null
@@ -131,6 +133,8 @@ class MainActivity : Activity() {
     private var smartFollow: SmartFollowController? = null
     private var webRtcCall: WebRtcCall? = null
     private lateinit var logView: TextView
+    private lateinit var logScrollView: ScrollView
+    private var logAutoScrollEnabled = true
     private var connectedReceiverHost: String? = null
     private lateinit var viewModel: MainViewModel
     private var senderMode = ControlMode.MANUAL
@@ -448,16 +452,19 @@ class MainActivity : Activity() {
             showHomeScreen(RootTab.MINE)
             return
         }
+        toast("正在启动接收端…")
         Thread {
             try {
                 val managerBaseUrl = state.remoteManagerBaseUrl.ifBlank { "http://$defaultRemoteHost:$remoteManagerPort" }
                 RemoteApi.addReceiver(managerBaseUrl, state.remoteToken, identity.deviceId, identity.displayName)
                 viewModel.dispatch(AppIntent.SetLastRemoteDevice(identity.deviceId, identity.displayName, online = true, espConnected = bluetooth.isConnected(), mode = receiverMode.name.lowercase()))
                 setConnectionMode(ConnectionMode.SERVER)
-                log("接收端已加入账号: ${identity.displayName} (${identity.deviceId})")
-                runOnUiThread { showReceiverScreen() }
+                runOnUiThread {
+                    showReceiverScreen()
+                    log("接收端已加入账号: ${identity.displayName} (${identity.deviceId})")
+                }
             } catch (e: Exception) {
-                log("接收端加入账号失败: ${e.message}")
+                log("启动接收端失败: ${e.message ?: e.javaClass.simpleName}")
             }
         }.start()
     }
@@ -757,7 +764,7 @@ class MainActivity : Activity() {
         layout.addView(button("返回") {
             backAction?.invoke()
         })
-        setContentView(withLog(layout, scroll))
+        setContentView(withLog(scroll))
     }
 
     private fun showReceiverScreen() {
@@ -778,6 +785,21 @@ class MainActivity : Activity() {
         }
         layout.addView(receiverEspStatusView)
 
+        receiverLastCommandView = TextView(this).apply {
+            text = "最近收到指令：暂无"
+            textSize = 14f
+            setTextColor(Color.rgb(30, 41, 59))
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+            background = GradientDrawable().apply {
+                setColor(Color.rgb(224, 242, 254))
+                cornerRadius = dp(10).toFloat()
+            }
+        }
+        layout.addView(receiverLastCommandView, LinearLayout.LayoutParams(-1, -2).apply {
+            topMargin = dp(8)
+            bottomMargin = dp(8)
+        })
+
         val blePairing = Esp32BlePairing(
             this, bluetooth,
             onLog = { log(it) },
@@ -791,7 +813,7 @@ class MainActivity : Activity() {
         xiaozhiRecordButton = button("开始 xiaozhi 语音") { toggleXiaozhiRecording() }
         layout.addView(xiaozhiRecordButton)
 
-        setContentView(withLog(layout, scroll))
+        setContentView(withLog(scroll))
         preview.start()
         startReceiverServices()
     }
@@ -905,8 +927,12 @@ class MainActivity : Activity() {
                     logReceiverGamepad(frame.state, "ignored in ${receiverMode.label}")
                 }
             }
-            is ControlFrame.Servo -> forwardToEsp32(packet, "Forwarded servo: idx=${frame.index} angle=${frame.angle}")
+            is ControlFrame.Servo -> {
+                logReceivedCommand("舵机：idx=${frame.index} angle=${frame.angle}")
+                forwardToEsp32(packet, "Forwarded servo: idx=${frame.index} angle=${frame.angle}")
+            }
             is ControlFrame.Mode -> runOnUiThread {
+                logReceivedCommand("模式：${frame.mode.label} (${frame.mode.wireValue})")
                 when (frame.mode) {
                     ControlMode.VIDEO_CALL -> setReceiverVideoEnabled(true)
                     ControlMode.VIDEO_OFF -> setReceiverVideoEnabled(false)
@@ -916,25 +942,26 @@ class MainActivity : Activity() {
             is ControlFrame.Command -> {
                 when (frame.code) {
                     ControlProtocol.CMD_CONNECT_ESP32 -> {
-                        log("收到发送端指令：远程连接 ESP32")
+                        logReceivedCommand("远程连接 ESP32")
                         connectEsp32ByScan()
                     }
                     ControlProtocol.CMD_FIND_COLA -> runOnUiThread {
-                        log("收到 MCP 指令：寻找可乐")
+                        logReceivedCommand("MCP：寻找可乐")
                         applyReceiverDriveMode(ControlMode.SMART_FOLLOW, SmartFollowController.Behavior.FIND)
                     }
                     ControlProtocol.CMD_FOLLOW_COLA -> runOnUiThread {
-                        log("收到 MCP 指令：跟随可乐")
+                        logReceivedCommand("MCP：跟随可乐")
                         applyReceiverDriveMode(ControlMode.SMART_FOLLOW, SmartFollowController.Behavior.FOLLOW)
                     }
                     ControlProtocol.CMD_STOP_TRACKING -> runOnUiThread {
-                        log("收到 MCP 指令：停止目标跟踪")
+                        logReceivedCommand("MCP：停止目标跟踪")
                         applyReceiverDriveMode(ControlMode.MANUAL)
                     }
+                    else -> logReceivedCommand("未知指令：code=0x${frame.code.toString(16).padStart(2, '0')} packet=${packet.toHexLine()}")
                 }
             }
-            is ControlFrame.Status -> Unit
-            is ControlFrame.DebugAck -> Unit
+            is ControlFrame.Status -> log("收到状态帧：espConnected=${frame.espConnected} mode=${frame.mode.label}")
+            is ControlFrame.DebugAck -> log("收到 Debug ACK：seq=${frame.seq}")
         }
     }
 
@@ -1029,7 +1056,14 @@ class MainActivity : Activity() {
         val now = System.currentTimeMillis()
         if (now - lastReceiverGamepadLogAtMs < 800) return
         lastReceiverGamepadLogAtMs = now
-        log("Receiver gamepad $suffix: lx=${state.lx} ly=${state.ly} rx=${state.rx} ry=${state.ry} buttons=${state.buttons}")
+        logReceivedCommand("手柄 $suffix：lx=${state.lx} ly=${state.ly} rx=${state.rx} ry=${state.ry} buttons=${state.buttons}")
+    }
+
+    private fun logReceivedCommand(message: String) {
+        log("收到指令：$message")
+        runOnUiThread {
+            receiverLastCommandView?.text = "最近收到指令：$message"
+        }
     }
 
     private fun logReceiverForwardStatus(message: String) {
@@ -1056,6 +1090,7 @@ class MainActivity : Activity() {
         releaseReceiverCall()
         stopXiaozhiVoice()
         receiverLayout = null
+        receiverLastCommandView = null
         receiverServicesStarted = false
         esp32ReconnectScheduled.set(false)
     }
@@ -1486,21 +1521,44 @@ class MainActivity : Activity() {
 
     private fun withLog(content: LinearLayout): View {
         val screen = viewFactory.withLog(content)
-        logView = screen.logView
+        bindLogScreen(screen)
         return screen.root
     }
 
-    private fun withLog(content: LinearLayout, rootScroll: ScrollView): View {
-        val screen = viewFactory.withLog(content, rootScroll)
-        logView = screen.logView
+    private fun withLog(rootScroll: ScrollView): View {
+        val screen = viewFactory.withLog(rootScroll)
+        bindLogScreen(screen)
         return screen.root
+    }
+
+    private fun bindLogScreen(screen: com.cruisecar.app.ui.screen.main.ScreenWithLog) {
+        logView = screen.logView
+        logScrollView = screen.logScroll
+        logAutoScrollEnabled = true
+        logScrollView.setOnTouchListener { _, event ->
+            if (event.actionMasked == MotionEvent.ACTION_DOWN || event.actionMasked == MotionEvent.ACTION_MOVE) {
+                logAutoScrollEnabled = false
+            }
+            false
+        }
+        screen.olderLogsButton.setOnClickListener {
+            logAutoScrollEnabled = false
+            logScrollView.smoothScrollBy(0, -dp(140))
+        }
+        screen.latestLogsButton.setOnClickListener {
+            logAutoScrollEnabled = true
+            logScrollView.post { logScrollView.fullScroll(View.FOCUS_DOWN) }
+        }
     }
 
     private fun log(message: String) {
         Log.i(tag, message)
         runOnUiThread {
-            if (::logView.isInitialized) {
+            if (::logView.isInitialized && logView.isAttachedToWindow) {
                 logView.append("$message\n")
+                if (logAutoScrollEnabled && ::logScrollView.isInitialized && logScrollView.isAttachedToWindow) {
+                    logScrollView.post { logScrollView.fullScroll(View.FOCUS_DOWN) }
+                }
             } else {
                 Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
             }

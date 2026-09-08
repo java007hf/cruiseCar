@@ -73,7 +73,7 @@ The app home screen provides four entries, covering sender/receiver roles in two
 - **LAN sender / LAN receiver**: sender discovers the receiver through UDP broadcast, then connects directly to the receiver phone.
 - **Server sender / receiver**: sender and receiver log in with the same account. The receiver joins the account as a device, and the sender selects it from the device list.
 
-Receiver-side device IDs are generated automatically from Android device information plus an install ID, so users do not need to manually invent one. The Android app uses the built-in server `http://116.62.32.90/` and stores the last account, token, and sender ID locally to avoid repeated input. Passwords are only used for the login request and are not persisted.
+Receiver-side device IDs are generated automatically from Android device information plus an install ID, so users do not need to manually invent one. The Android app uses the built-in server `http://192.168.3.104/` and stores the last account, token, and sender ID locally to avoid repeated input. Passwords are only used for the login request and are not persisted.
 
 ## Server Modes
 
@@ -126,7 +126,7 @@ flowchart LR
 
     subgraph Xiaozhi[xiaozhi Server]
         XWS[WebSocket<br/>8000 /xiaozhi/v1/]
-        OTA[OTA / Token<br/>HTTP 8003]
+        OTA[OTA / Token<br/>full deployment 8002, simple deployment 8003]
         XMCP[xiaozhi MCP Client]
     end
 
@@ -147,7 +147,7 @@ flowchart LR
     MCP --> Control
 ```
 
-Port `8089` serves only the user interface, including the account/device administration pages and the `/send/` Web sender. It does not process account data directly; its pages call manager-api on port `8088`. Xiaozhi ports `8000` and `8003` belong to the external services that CruiseCar Bridge connects to, while `8090` is exposed by CruiseCar for the xiaozhi MCP Client.
+Port `8089` serves only the user interface, including the account/device administration pages and the `/send/` Web sender. It does not process account data directly; its pages call manager-api on port `8088`. Xiaozhi uses port `8000` for WebSocket traffic. Its OTA endpoint uses `8002` in a full deployment and `8003` in a simple deployment; CruiseCar falls back automatically. Port `8090` is exposed by CruiseCar for the xiaozhi MCP Client.
 
 ## Debug Trace Latency Logging
 

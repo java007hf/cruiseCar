@@ -29,6 +29,7 @@ class ReceiverIdentityStore(context: Context) {
 
     fun getRemoteAccount(): RemoteAccount {
         clearLegacySavedPassword()
+        migrateLegacyRemoteServer()
         return RemoteAccount(
             host = accountPrefs.getString(KEY_REMOTE_HOST, "").orEmpty(),
             username = accountPrefs.getString(KEY_REMOTE_USERNAME, "").orEmpty(),
@@ -99,7 +100,26 @@ class ReceiverIdentityStore(context: Context) {
         }
     }
 
+    private fun migrateLegacyRemoteServer() {
+        val savedHost = accountPrefs.getString(KEY_REMOTE_HOST, "").orEmpty()
+        val savedManagerBaseUrl = accountPrefs.getString(KEY_REMOTE_MANAGER_BASE_URL, "").orEmpty()
+        val editor = accountPrefs.edit()
+        var changed = false
+        if (savedHost == LEGACY_REMOTE_HOST) {
+            editor.putString(KEY_REMOTE_HOST, DEFAULT_REMOTE_HOST)
+            changed = true
+        }
+        if (savedManagerBaseUrl == "http://$LEGACY_REMOTE_HOST:$DEFAULT_MANAGER_PORT") {
+            editor.putString(KEY_REMOTE_MANAGER_BASE_URL, "http://$DEFAULT_REMOTE_HOST:$DEFAULT_MANAGER_PORT")
+            changed = true
+        }
+        if (changed) editor.apply()
+    }
+
     private companion object {
+        const val LEGACY_REMOTE_HOST = "116.62.32.90"
+        const val DEFAULT_REMOTE_HOST = "192.168.3.104"
+        const val DEFAULT_MANAGER_PORT = 8088
         const val KEY_INSTALL_ID = "install_id"
         const val KEY_DEVICE_ID = "device_id"
         const val KEY_DISPLAY_NAME = "display_name"
