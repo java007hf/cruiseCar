@@ -61,6 +61,13 @@
       box-shadow: 0 18px 48px rgba(0, 0, 0, 0.22);
     }
 
+    /* Keep the live log in the first viewport. It used to be the last grid
+       item, which put it below the joystick and video on mobile devices. */
+    .log-card {
+      grid-column: 1 / -1;
+      order: -1;
+    }
+
     label { display: block; margin: 10px 0 6px; color: var(--muted); font-size: 13px; }
     input, select {
       width: 100%;
@@ -199,7 +206,7 @@
     .video-placeholder.hidden { display: none; }
 
     #log {
-      min-height: 180px;
+      min-height: 120px;
       max-height: 260px;
       overflow: auto;
       white-space: pre-wrap;
@@ -230,6 +237,11 @@
     </header>
 
     <section class="grid">
+      <div class="card log-card">
+        <h2>实时操作日志</h2>
+        <div id="log" role="log" aria-live="polite"></div>
+      </div>
+
       <div class="card">
         <h2>账号与设备</h2>
         <label for="apiBase">Manager API 地址</label>
@@ -305,10 +317,6 @@
         <p id="videoStatus">视频：未连接</p>
       </div>
 
-      <div class="card">
-        <h2>日志</h2>
-        <div id="log"></div>
-      </div>
     </section>
   </main>
 
