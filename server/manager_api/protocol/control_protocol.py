@@ -41,6 +41,9 @@ class ControlMode(IntEnum):
 
 
 CMD_CONNECT_ESP32 = 0x01
+CMD_FIND_COLA = 0x02
+CMD_FOLLOW_COLA = 0x03
+CMD_STOP_TRACKING = 0x04
 
 
 @dataclass(frozen=True)

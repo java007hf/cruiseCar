@@ -28,7 +28,7 @@ CruiseCar 是一个智能巡航小车项目，当前由 Android App、ESP32 固�
 │   ├── manager_api/             # 账号 HTTP API + 配置/协议/SQLite 存储
 │   │   ├── config/              # 环境变量配置
 │   │   ├── mcp_server.py        # MCP Server（JSON-RPC 2.0 over HTTP）
-│   │   ├── mcp_tools.py         # MCP 工具定义（car_move 等 5 个工具）
+│   │   ├── mcp_tools.py         # MCP 工具定义（car_move、car_track_object 等）
 │   │   ├── protocol/            # 10 字节控制协议解析/生成
 │   │   └── storage/             # SQLite 持久化
 │   └── manager_web/             # 账号 Web 管理页，独立于 manager_api
@@ -229,7 +229,8 @@ server 内部职责：
 
 - `manager_api/mcp_tools.py`
   - MCP 工具定义和处理器。
-  - 暴露 5 个工具：`car_move`、`car_set_mode`、`car_set_servo`、`car_connect`、`car_get_status`。
+  - 暴露 6 个工具：`car_move`、`car_set_mode`、`car_track_object`、`car_set_servo`、`car_connect`、`car_get_status`。
+  - `car_track_object` 当前支持对内置 YOLO 可乐模型执行 `find`、`follow`、`stop`；通过命令帧通知 Android 接收端执行本地视觉闭环。
   - 每个工具处理器调用 `hub.send_to_receiver()` 或 `store.enqueue_command()` 下发控制命令。
 
 #### xiaozhi 集成架构
@@ -388,7 +389,7 @@ AA 55 02 MODE 00 00 00 00 00 SUM
 
 - `0x03`：舵机帧。
 - `0x04`：接收端状态帧，接收端周期性上报 ESP32 连接态和当前模式。
-- `0x05`：命令帧，例如远程触发接收端扫描并连接 ESP32。
+- `0x05`：命令帧；命令码 `0x01` 连接 ESP32、`0x02` 寻找可乐、`0x03` 跟随可乐、`0x04` 停止目标跟踪。
 
 协议实现位置：
 
@@ -498,5 +499,5 @@ cd ml
 
 - 本机 `C:\workspace\xiaozhi-esp32-server-benyl` Docker 部署可用，CruiseCar Bridge 已按 xiaozhi OTA/WebSocket 接入方式连接。
 - App 接收端新增 xiaozhi 语音入口，日志可观察 bridge connect、录音上行、STT、LLM、TTS 和音频下行播放事件。
-- MCP Server 暴露 `car_move`、`car_set_mode`、`car_set_servo`、`car_connect`、`car_get_status`；xiaozhi MCP client 已配置为调用 `http://host.docker.internal:8090/mcp`。
+- MCP Server 暴露 `car_move`、`car_set_mode`、`car_track_object`、`car_set_servo`、`car_connect`、`car_get_status`；xiaozhi MCP client 已配置为调用 `http://host.docker.internal:8090/mcp`。
 - 当前接收端未连接 ESP32 时，MCP 控车命令会通过现有服务 API 进入离线队列；接收端在线后仍复用现有 websocket/control 通道下发。

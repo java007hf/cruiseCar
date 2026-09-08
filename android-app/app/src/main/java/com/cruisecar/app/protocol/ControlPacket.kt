@@ -127,6 +127,9 @@ object ControlProtocol {
     const val TYPE_CMD = 0x05
     const val TYPE_DEBUG_ACK = 0x06
     const val CMD_CONNECT_ESP32 = 0x01
+    const val CMD_FIND_COLA = 0x02
+    const val CMD_FOLLOW_COLA = 0x03
+    const val CMD_STOP_TRACKING = 0x04
 
     fun parse(packet: ByteArray): ControlFrame? {
         if (packet.size != PACKET_SIZE) return null

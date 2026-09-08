@@ -6,6 +6,9 @@ from typing import TYPE_CHECKING, Any
 
 from manager_api.protocol.control_protocol import (
     CMD_CONNECT_ESP32,
+    CMD_FIND_COLA,
+    CMD_FOLLOW_COLA,
+    CMD_STOP_TRACKING,
     ControlMode,
     SERVO_ANGLE_MAX,
     SERVO_ANGLE_MIN,
@@ -75,6 +78,32 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "car_track_object",
+        "description": (
+            "Find or follow the cola bottle recognized by the car camera. "
+            "Use action='find' when the user asks to find/look for cola, "
+            "action='follow' when the user asks to follow/chase cola, and "
+            "action='stop' to stop object tracking."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["find", "follow", "stop"],
+                    "description": "Object tracking action",
+                },
+                "target": {
+                    "type": "string",
+                    "enum": ["cola"],
+                    "default": "cola",
+                    "description": "Target recognized by the installed YOLO model",
+                },
+            },
+            "required": ["action"],
+        },
+    },
+    {
         "name": "car_set_servo",
         "description": f"Adjust camera servo angle ({SERVO_ANGLE_MIN}-{SERVO_ANGLE_MAX} degrees).",
         "inputSchema": {
@@ -123,6 +152,8 @@ def handle_tool_call(device_id: str, tool_name: str, arguments: dict[str, Any], 
         return _handle_move(device_id, arguments, store, hub, event_loop)
     if tool_name == "car_set_mode":
         return _handle_set_mode(device_id, arguments, store, hub, event_loop)
+    if tool_name == "car_track_object":
+        return _handle_track_object(device_id, arguments, store, hub, event_loop)
     if tool_name == "car_set_servo":
         return _handle_set_servo(device_id, arguments, store, hub, event_loop)
     return {"error": f"unknown tool: {tool_name}"}
@@ -185,6 +216,30 @@ def _handle_set_servo(device_id: str, args: dict[str, Any], store: "Store", hub:
     angle = max(SERVO_ANGLE_MIN, min(SERVO_ANGLE_MAX, angle))
     command = {"type": "servo", "index": 0, "angle": angle}
     return _handle_dispatch(device_id, command, store, hub, event_loop)
+
+
+def _handle_track_object(device_id: str, args: dict[str, Any], store: "Store", hub: "ConnectionHub | None", event_loop: asyncio.AbstractEventLoop | None) -> dict[str, Any]:
+    action = str(args.get("action", "")).strip().lower()
+    target = str(args.get("target", "cola")).strip().lower()
+    if target != "cola":
+        return {"content": [{"type": "text", "text": "Unsupported target. The installed YOLO model currently supports: cola"}]}
+    command_codes = {
+        "find": CMD_FIND_COLA,
+        "follow": CMD_FOLLOW_COLA,
+        "stop": CMD_STOP_TRACKING,
+    }
+    if action not in command_codes:
+        return {"content": [{"type": "text", "text": "Invalid action. Use: find, follow, stop"}]}
+    result = _handle_dispatch(
+        device_id,
+        {"type": "command", "code": command_codes[action]},
+        store,
+        hub,
+        event_loop,
+    )
+    text = result.get("content", [{}])[0].get("text", "Command accepted")
+    result["content"][0]["text"] = f"Cola tracking action '{action}': {text.lower()}"
+    return result
 
 
 def _handle_dispatch(device_id: str, command: dict[str, Any], store: "Store", hub: "ConnectionHub | None", event_loop: asyncio.AbstractEventLoop | None) -> dict[str, Any]:

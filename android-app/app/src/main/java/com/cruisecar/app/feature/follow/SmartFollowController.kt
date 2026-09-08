@@ -1,83 +1,70 @@
 package com.cruisecar.app.feature.follow
 
+import android.content.Context
 import com.cruisecar.app.protocol.GamepadState
 import android.graphics.Bitmap
-import org.opencv.android.OpenCVLoader
-import org.opencv.android.Utils
-import org.opencv.core.Core
-import org.opencv.core.Mat
-import org.opencv.core.MatOfPoint
-import org.opencv.core.Point
-import org.opencv.core.Scalar
-import org.opencv.imgproc.Imgproc
-import java.util.concurrent.atomic.AtomicBoolean
+import com.cruisecar.app.feature.vision.ObjectDetection
+import com.cruisecar.app.feature.vision.ObjectRecognitionDemoController
 
 class SmartFollowController(
+    context: Context,
     private val frameProvider: () -> Bitmap?,
-    private val onState: (GamepadState) -> Unit
+    private val onState: (GamepadState) -> Unit,
+    private val behavior: Behavior = Behavior.FOLLOW
 ) {
-    private val running = AtomicBoolean(false)
+    enum class Behavior { FIND, FOLLOW }
+
+    private var missedFrames = 0
+    private var foundLogged = false
+    private val detector = ObjectRecognitionDemoController(
+        context = context.applicationContext,
+        frameProvider = frameProvider,
+        onDetections = ::handleDetections
+    )
+    private var onLog: (String) -> Unit = {}
 
     fun start(onLog: (String) -> Unit) {
-        if (!OpenCVLoader.initDebug()) {
-            onLog("OpenCV init failed")
-            return
-        }
-        if (!running.compareAndSet(false, true)) return
-        Thread {
-            onLog("Smart follow started")
-            while (running.get()) {
-                val state = frameProvider()?.let { analyze(it) } ?: GamepadState()
-                onState(state)
-                Thread.sleep(160)
-            }
-        }.start()
+        this.onLog = onLog
+        onLog("YOLO cola ${behavior.name.lowercase()} started")
+        detector.start(onLog)
     }
 
     fun stop() {
-        running.set(false)
+        detector.stop()
         onState(GamepadState())
     }
 
-    private fun analyze(bitmap: Bitmap): GamepadState {
-        val rgba = Mat()
-        val rgb = Mat()
-        val hsv = Mat()
-        val mask = Mat()
-        val contours = mutableListOf<MatOfPoint>()
-        return try {
-            Utils.bitmapToMat(bitmap, rgba)
-            Imgproc.cvtColor(rgba, rgb, Imgproc.COLOR_RGBA2RGB)
-            Imgproc.cvtColor(rgb, hsv, Imgproc.COLOR_RGB2HSV)
-
-            Core.inRange(hsv, Scalar(35.0, 60.0, 50.0), Scalar(90.0, 255.0, 255.0), mask)
-            Imgproc.erode(mask, mask, Mat())
-            Imgproc.dilate(mask, mask, Mat())
-            Imgproc.findContours(mask, contours, Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
-
-            val best = contours.maxByOrNull { Imgproc.contourArea(it) }
-            if (best == null) {
-                GamepadState()
-            } else {
-                val area = Imgproc.contourArea(best)
-                val moments = Imgproc.moments(best)
-                val center = if (moments.m00 != 0.0) Point(moments.m10 / moments.m00, moments.m01 / moments.m00) else Point(rgba.width() / 2.0, rgba.height() / 2.0)
-                val errorX = ((center.x / rgba.width()) - 0.5).coerceIn(-0.5, 0.5)
-                val areaRatio = area / (rgba.width() * rgba.height()).coerceAtLeast(1)
-                val steering = (128 + errorX * 170).toInt().coerceIn(0, 255)
-                val throttle = when {
-                    areaRatio < 0.035 -> 92
-                    areaRatio > 0.16 -> 164
-                    else -> 128
-                }
-                GamepadState(lx = steering, ly = throttle)
-            }
-        } finally {
-            rgba.release()
-            rgb.release()
-            hsv.release()
-            mask.release()
-            contours.forEach { it.release() }
+    private fun handleDetections(detections: List<ObjectDetection>) {
+        val target = detections.maxByOrNull { it.confidence }
+        if (target == null) {
+            missedFrames++
+            // Wait for a few frames to avoid steering on a single inference miss,
+            // then rotate slowly until the bottle is visible again.
+            onState(if (missedFrames >= 5) GamepadState(lx = 188, ly = 128) else GamepadState())
+            foundLogged = false
+            return
         }
+
+        missedFrames = 0
+        if (!foundLogged) {
+            onLog("YOLO cola found confidence=${"%.2f".format(target.confidence)}")
+            foundLogged = true
+        }
+        if (behavior == Behavior.FIND) {
+            onState(GamepadState())
+            return
+        }
+
+        val rect = target.rect
+        val centerX = (rect.left + rect.right) / 2f
+        val errorX = (centerX - 0.5f).coerceIn(-0.5f, 0.5f)
+        val areaRatio = ((rect.right - rect.left) * (rect.bottom - rect.top)).coerceAtLeast(0f)
+        val steering = (128 + errorX * 170).toInt().coerceIn(0, 255)
+        val throttle = when {
+            areaRatio < 0.035f -> 92
+            areaRatio > 0.16f -> 164
+            else -> 128
+        }
+        onState(GamepadState(lx = steering, ly = throttle))
     }
 }

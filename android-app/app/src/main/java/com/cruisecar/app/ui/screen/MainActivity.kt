@@ -914,9 +914,23 @@ class MainActivity : Activity() {
                 }
             }
             is ControlFrame.Command -> {
-                if (frame.code == ControlProtocol.CMD_CONNECT_ESP32) {
-                    log("收到发送端指令：远程连接 ESP32")
-                    connectEsp32ByScan()
+                when (frame.code) {
+                    ControlProtocol.CMD_CONNECT_ESP32 -> {
+                        log("收到发送端指令：远程连接 ESP32")
+                        connectEsp32ByScan()
+                    }
+                    ControlProtocol.CMD_FIND_COLA -> runOnUiThread {
+                        log("收到 MCP 指令：寻找可乐")
+                        applyReceiverDriveMode(ControlMode.SMART_FOLLOW, SmartFollowController.Behavior.FIND)
+                    }
+                    ControlProtocol.CMD_FOLLOW_COLA -> runOnUiThread {
+                        log("收到 MCP 指令：跟随可乐")
+                        applyReceiverDriveMode(ControlMode.SMART_FOLLOW, SmartFollowController.Behavior.FOLLOW)
+                    }
+                    ControlProtocol.CMD_STOP_TRACKING -> runOnUiThread {
+                        log("收到 MCP 指令：停止目标跟踪")
+                        applyReceiverDriveMode(ControlMode.MANUAL)
+                    }
                 }
             }
             is ControlFrame.Status -> Unit
@@ -1093,7 +1107,10 @@ class MainActivity : Activity() {
         xiaozhiVoiceClient = null
     }
 
-    private fun applyReceiverDriveMode(mode: ControlMode) {
+    private fun applyReceiverDriveMode(
+        mode: ControlMode,
+        followBehavior: SmartFollowController.Behavior = SmartFollowController.Behavior.FOLLOW
+    ) {
         receiverMode = mode
         smartFollow?.stop()
         smartFollow = null
@@ -1111,6 +1128,7 @@ class MainActivity : Activity() {
                     log("Smart follow selected while video is active; keep WebRTC video view")
                 }
                 smartFollow = SmartFollowController(
+                    context = this,
                     frameProvider = { cameraPreview?.snapshot(240, 180) },
                     onState = { state ->
                         try {
@@ -1118,7 +1136,8 @@ class MainActivity : Activity() {
                         } catch (e: Exception) {
                             log("Smart follow send failed: ${e.message}")
                         }
-                    }
+                    },
+                    behavior = followBehavior
                 ).also { it.start { msg -> log(msg) } }
             }
             ControlMode.PATROL -> {
