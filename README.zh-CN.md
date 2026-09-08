@@ -103,7 +103,51 @@ docker compose up server
 | 42110 | 服务器 TCP 控制转发 |
 | 42112 | 服务器 WebRTC 信令转发 |
 | 8088 | 账号 manager-api |
-| 8089 | 账号 manager-web |
+| 8089 | 账号 manager-web（浏览器管理页和 Web 发送端） |
+| 8090 | HTTP MCP Server（供 xiaozhi 调用控车工具） |
+
+### 整体服务关系
+
+```mermaid
+flowchart LR
+    Sender[Android / Web 发送端]
+    Receiver[Android 接收端]
+    ESP32[ESP32 小车]
+    Browser[管理员浏览器]
+
+    subgraph CruiseCar[CruiseCar Server]
+        Control[control_server<br/>TCP 42110]
+        Signal[WebRTC signaling<br/>TCP 42112]
+        API[manager-api<br/>HTTP 8088]
+        Web[manager-web<br/>HTTP 8089]
+        MCP[MCP Server<br/>HTTP 8090 /mcp]
+        Bridge[xiaozhi_bridge]
+    end
+
+    subgraph Xiaozhi[xiaozhi Server]
+        XWS[WebSocket<br/>8000 /xiaozhi/v1/]
+        OTA[OTA / Token<br/>HTTP 8003]
+        XMCP[xiaozhi MCP Client]
+    end
+
+    Browser -->|Web 页面| Web
+    Web -->|API 请求| API
+    Sender -->|登录、设备列表、Bridge 语音 API| API
+    Receiver -->|登录、注册、Bridge 语音 API| API
+    Sender <-->|10 字节控制包| Control
+    Control <-->|10 字节控制包| Receiver
+    Sender <-->|WebRTC 信令| Signal
+    Signal <-->|WebRTC 信令| Receiver
+    Sender <-.->|WebRTC P2P 媒体| Receiver
+    Receiver <-->|Bluetooth SPP| ESP32
+    API --> Bridge
+    Bridge -->|获取 Token| OTA
+    Bridge <-->|WebSocket 对话 / Opus 音频| XWS
+    XMCP -->|调用控车工具| MCP
+    MCP --> Control
+```
+
+`8089` 只提供用户界面：包括账号/设备管理页和 `/send/` Web 发送端。它不直接处理账号数据，页面会调用 `8088` 上的 manager-api。Xiaozhi 的 `8000` 和 `8003` 是 CruiseCar Bridge 主动连接的外部服务端口；`8090` 则是 CruiseCar 对 xiaozhi MCP Client 暴露的端口。
 
 ## Debug Trace 延迟日志
 

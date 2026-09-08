@@ -103,7 +103,51 @@ Default ports:
 | 42110 | Server TCP control relay |
 | 42112 | Server WebRTC signaling relay |
 | 8088 | account manager-api |
-| 8089 | account manager-web |
+| 8089 | account manager-web (browser admin UI and Web sender) |
+| 8090 | HTTP MCP Server (car-control tools for xiaozhi) |
+
+### Overall Service Architecture
+
+```mermaid
+flowchart LR
+    Sender[Android / Web sender]
+    Receiver[Android receiver]
+    ESP32[ESP32 car]
+    Browser[Admin browser]
+
+    subgraph CruiseCar[CruiseCar Server]
+        Control[control_server<br/>TCP 42110]
+        Signal[WebRTC signaling<br/>TCP 42112]
+        API[manager-api<br/>HTTP 8088]
+        Web[manager-web<br/>HTTP 8089]
+        MCP[MCP Server<br/>HTTP 8090 /mcp]
+        Bridge[xiaozhi_bridge]
+    end
+
+    subgraph Xiaozhi[xiaozhi Server]
+        XWS[WebSocket<br/>8000 /xiaozhi/v1/]
+        OTA[OTA / Token<br/>HTTP 8003]
+        XMCP[xiaozhi MCP Client]
+    end
+
+    Browser -->|Web pages| Web
+    Web -->|API requests| API
+    Sender -->|Login, device list, bridge voice API| API
+    Receiver -->|Login, registration, bridge voice API| API
+    Sender <-->|10-byte control packets| Control
+    Control <-->|10-byte control packets| Receiver
+    Sender <-->|WebRTC signaling| Signal
+    Signal <-->|WebRTC signaling| Receiver
+    Sender <-.->|WebRTC P2P media| Receiver
+    Receiver <-->|Bluetooth SPP| ESP32
+    API --> Bridge
+    Bridge -->|Fetch token| OTA
+    Bridge <-->|WebSocket dialog / Opus audio| XWS
+    XMCP -->|Invoke car-control tools| MCP
+    MCP --> Control
+```
+
+Port `8089` serves only the user interface, including the account/device administration pages and the `/send/` Web sender. It does not process account data directly; its pages call manager-api on port `8088`. Xiaozhi ports `8000` and `8003` belong to the external services that CruiseCar Bridge connects to, while `8090` is exposed by CruiseCar for the xiaozhi MCP Client.
 
 ## Debug Trace Latency Logging
 
