@@ -219,6 +219,8 @@ cd esp32-firmware
 .\scripts\build-esp32.ps1
 ```
 
+Windows 脚本使用已激活的 ESP-IDF 环境，也可通过 `IDF_PATH` 指定 ESP-IDF 安装目录。移动仓库后，请先清理或重命名 `esp32-firmware/build`，让 CMake 在下次构建时重新生成绝对路径。
+
 ML Web 训练平台：
 
 ```powershell

@@ -219,6 +219,8 @@ cd esp32-firmware
 .\scripts\build-esp32.ps1
 ```
 
+The Windows script uses the active ESP-IDF environment or loads it from `IDF_PATH` when set. After moving the checkout, remove or rename `esp32-firmware/build` before rebuilding so CMake can regenerate its absolute paths.
+
 ML web training platform:
 
 ```powershell
